@@ -1,0 +1,49 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+
+# Runtime/private data: keep directory templates, exclude real user content
+data/**
+!data/**/
+!data/**/_template.yaml
+
+# Runtime artifacts
+logs/
+*.log
+*.pid
+*.tmp
+*.temp
+
+# Local backups and ad-hoc regression payloads
+_backup*/
+backups/
+*.bak
+*.orig
+/test_*.json
+/test_*.log
+
+# Local analysis/tool output
+.codegraph/
+_review/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

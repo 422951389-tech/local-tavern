@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>本地酒馆</title>
+    <link rel="stylesheet" href="/static/style.css?v=delete-btn-20260704-5">
+</head>
+<body>
+    <!-- 顶栏 v3：世界观做主标题，下属 4 tab -->
+    <header id="topbar">
+        <!-- 左：项目（世界观） -->
+        <div class="topbar-group project-group">
+            <button id="project-btn" class="project-btn" title="切换项目（世界观）">
+                <span class="ico">📁</span>
+                <span id="project-name">加载中…</span>
+                <span class="caret">▾</span>
+            </button>
+            <span id="project-stats" class="project-stats"></span>
+        </div>
+
+        <!-- 中：4 个 tab（角色 / 世界书 / 用户 / 存档） -->
+        <div class="topbar-group tabs-group">
+            <button class="tab-btn" data-tab="chars" id="tab-chars" title="角色卡（当前世界观的演员）">
+                <span class="ico">👥</span><span class="lbl">角色</span>
+            </button>
+            <button class="tab-btn" data-tab="world" id="tab-world" title="世界书（当前世界观的设定）">
+                <span class="ico">📖</span><span class="lbl">世界书</span>
+            </button>
+            <button class="tab-btn" data-tab="user" id="tab-user" title="用户档案（当前世界的观众设定）">
+                <span class="ico">👤</span><span class="lbl">用户</span>
+            </button>
+            <div class="tab-btn tab-save-wrap" id="tab-save-wrap">
+                <button class="tab-btn save-tab" data-tab="saves" id="tab-saves" title="存档（当前世界观下的演出录像）">
+                    <span class="ico">💾</span><span class="lbl">存档</span>
+                    <span class="badge" id="save-count">0</span>
+                    <span class="caret">▾</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- 右：模型 + 工具 -->
+        <div class="topbar-group tools-group">
+            <select id="model-select" title="切换模型">
+                <option value="">加载中…</option>
+            </select>
+            <button id="reset-btn" class="icon-btn" title="重置当前存档内容">↺</button>
+            <button id="model-params-btn" class="icon-btn" title="调 AI 参数">🎛</button>
+            <button id="history-btn" class="icon-btn" title="查看历史快照">🕐</button>
+            <button id="prompts-btn" class="icon-btn" title="编辑提示词">📝</button>
+        </div>
+
+        <!-- 隐藏的旧节点（保留供回滚 / 内部使用） -->
+        <div class="legacy-hide" aria-hidden="true">
+            <select id="project-select"></select>
+            <button id="project-new"></button>
+            <select id="save-select"></select>
+            <button id="save-new"></button>
+            <button id="save-rename"></button>
+            <button id="save-delete"></button>
+            <button id="save-export"></button>
+            <button id="save-import"></button>
+            <button id="cards-btn"></button>
+        </div>
+    </header>
+
+    <!-- 项目下拉面板（点击 📁 弹出） -->
+    <div id="project-dropdown" class="dropdown-panel hidden">
+        <div id="project-list" class="dropdown-list"></div>
+        <div class="dropdown-footer">
+            <button id="project-new-inline" class="dropdown-action">➕ 新建项目</button>
+        </div>
+    </div>
+
+    <!-- 存档下拉面板（点击 💾 弹出） -->
+    <div id="save-dropdown" class="dropdown-panel hidden">
+        <div id="save-list" class="dropdown-list"></div>
+        <div class="dropdown-footer">
+            <button id="save-new-inline" class="dropdown-action">➕ 新建存档</button>
+            <button id="save-rename-inline" class="dropdown-action">✎ 重命名</button>
+            <button id="save-delete-inline" class="dropdown-action">🗑 删除</button>
+            <button id="save-export-inline" class="dropdown-action">📤 导出</button>
+            <button id="save-import-inline" class="dropdown-action">📥 导入</button>
+        </div>
+    </div>
+
+    <!-- 场景元数据条 -->
+    <div id="scene-meta" class="scene-meta">
+        <div class="scene-row">
+            <span id="meta-location">📍 等待场景初始化…</span>
+        </div>
+        <div class="scene-row sub">
+            <span id="meta-quest"></span>
+            <span id="meta-goal"></span>
+        </div>
+        <div class="scene-row sub">
+            <span id="meta-user"></span>
+        </div>
+    </div>
+
+    <!-- 主区 -->
+    <main id="main">
+        <!-- 对话流 -->
+        <section id="chat-stream" class="chat-stream">
+            <div class="welcome" id="welcome">
+                <p>👋 欢迎使用本地酒馆</p>
+                <p>选择一个项目开始冒险，点击右上角「重置」初始化场景</p>
+            </div>
+        </section>
+
+        <!-- 角色状态侧栏 -->
+        <aside id="character-panel" class="character-panel">
+            <h3>角色状态</h3>
+            <div id="character-list">
+                <p class="empty">无角色数据</p>
+            </div>
+        </aside>
+    </main>
+
+    <!-- 行动建议 -->
+    <div id="suggestions" class="suggestions"></div>
+
+    <!-- 底栏：输入 -->
+    <footer id="input-bar">
+        <textarea
+            id="user-input"
+            placeholder="输入你的行动或对话…(Shift+Enter 换行，Enter 发送)"
+            rows="2"
+        ></textarea>
+        <button id="send-btn">发送</button>
+        <button id="send-cancel-btn" class="hidden" title="取消生成">⏹ 取消</button>
+    </footer>
+
+    <!-- Thinking 折叠面板 -->
+    <div id="thinking-panel" class="thinking-panel hidden">
+        <div class="thinking-header">
+            <span>💭 AI 思考中…</span>
+            <button id="thinking-close">收起</button>
+        </div>
+        <div id="thinking-content" class="thinking-content"></div>
+    </div>
+
+    <script src="/static/app.js?v=delete-btn-20260704-5"></script>
+
+    <!-- 通用 Modal 容器 -->
+    <div id="modal-backdrop" class="modal-backdrop hidden">
+        <div id="modal" class="modal">
+            <div class="modal-header">
+                <h2 id="modal-title"></h2>
+                <button id="modal-close" class="modal-close">×</button>
+            </div>
+            <div id="modal-body" class="modal-body"></div>
+            <div id="modal-footer" class="modal-footer hidden">
+                <button id="modal-cancel" class="modal-btn">取消</button>
+                <button id="modal-confirm" class="modal-btn primary">确定</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

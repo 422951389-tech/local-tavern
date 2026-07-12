@@ -1,0 +1,31 @@
+* text=auto
+
+/.gitattributes text eol=lf
+/.gitignore text eol=lf
+
+# Repository source and documentation use LF
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+prompts/.default/*.md.v*-bak text eol=lf
+
+# Windows launchers use native CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+
+# Binary files are never line-ending normalized
+*.pyc binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.db binary
