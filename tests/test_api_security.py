@@ -17,12 +17,9 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.test_root = Path(self.tempdir.name) / "projects"
         self.old_session_root = session_manager.ROOT_DIR
         self.old_character_root = character_loader.ROOT_DIR
-        self.old_locks = session_manager._save_locks
-        self.old_guard = session_manager._locks_guard
         session_manager.ROOT_DIR = self.test_root
         character_loader.ROOT_DIR = self.test_root
-        session_manager._save_locks = {}
-        session_manager._locks_guard = asyncio.Lock()
+        session_manager.clear_session_stores_for_testing()
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         self.client = httpx.AsyncClient(transport=transport, base_url="http://test")
 
@@ -30,8 +27,7 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         session_manager.ROOT_DIR = self.old_session_root
         character_loader.ROOT_DIR = self.old_character_root
-        session_manager._save_locks = self.old_locks
-        session_manager._locks_guard = self.old_guard
+        session_manager.clear_session_stores_for_testing()
         self.tempdir.cleanup()
 
     async def test_path_and_snapshot_contract_returns_400(self):
@@ -128,6 +124,62 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("object-src 'none'", csp)
         self.assertEqual(response.headers.get("x-content-type-options"), "nosniff")
         self.assertEqual(response.headers.get("referrer-policy"), "no-referrer")
+
+    async def test_message_uuid_is_primary_and_stale_revision_returns_409(self):
+        project = "并发测试"
+        save = "消息存档"
+        initial = session_manager.new_session(project, save)
+        message = session_manager.append_history(initial, "user", "原内容")
+        created = await session_manager.create_session(project, save, initial)
+
+        for invalid_revision in (True, "1", 1.0, -1):
+            with self.subTest(expected_revision=invalid_revision):
+                invalid = await self.client.patch(
+                    "/api/session",
+                    params={"project": project, "save": save},
+                    json={
+                        "action": "edit",
+                        "message_id": message["id"],
+                        "content": "不应写入",
+                        "expected_revision": invalid_revision,
+                    },
+                )
+                self.assertEqual(invalid.status_code, 422, invalid.text)
+
+        updated = await self.client.patch(
+            "/api/session",
+            params={"project": project, "save": save},
+            json={
+                "action": "edit",
+                "message_id": message["id"],
+                "index": 999,
+                "content": "按 UUID 更新",
+                "expected_revision": created["revision"],
+            },
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["revision"], created["revision"] + 1)
+        self.assertEqual(updated.json()["message_history"][0]["content"], "按 UUID 更新")
+
+        stale = await self.client.patch(
+            "/api/session",
+            params={"project": project, "save": save},
+            json={
+                "action": "delete",
+                "message_id": message["id"],
+                "expected_revision": created["revision"],
+            },
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(stale.json()["detail"], {
+            "code": "revision_conflict",
+            "expected_revision": created["revision"],
+            "current_revision": created["revision"] + 1,
+        })
+
+        final = session_manager.load_session(project, save)
+        self.assertEqual(final["revision"], created["revision"] + 1)
+        self.assertEqual(len(final["message_history"]), 1)
 
 
 if __name__ == "__main__":

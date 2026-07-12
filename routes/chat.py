@@ -1,6 +1,7 @@
 """聊天与模型切换路由。"""
 import json
 import logging
+from copy import deepcopy
 from datetime import datetime
 from typing import Optional
 
@@ -13,16 +14,20 @@ from core.config import MAX_MESSAGES_IN_SAVE
 from core.prompt_builder import build_messages
 from core.response_parser import parse_response, check_voice_confusion
 from core.session_manager import (
+    RevisionConflict,
     aload_session,
-    save_session,
     append_history,
+    mutate_session,
     trim_history,
+    trim_snapshot_payload,
 )
 from routes.common import (
     ChatRequest,
     _norm_save,
     _norm_project,
     _initialize_session_from_profiles,
+    _expected_revision,
+    _raise_revision_conflict,
     apply_character_state,
 )
 
@@ -38,6 +43,11 @@ async def api_chat(req: ChatRequest):
     project = _norm_project(req.project)
     save = _norm_save(req.save)
     session = await aload_session(project, save)
+    current_revision = session.get("revision", 0)
+    if current_revision != req.expected_revision:
+        _raise_revision_conflict(
+            RevisionConflict(req.expected_revision, current_revision, session)
+        )
 
     if not session.get("characters_state") and not session.get("message_history"):
         await _initialize_session_from_profiles(session, project)
@@ -121,7 +131,6 @@ async def api_chat(req: ChatRequest):
     async def generate():
         full_content = ""
         full_thinking = ""
-        assistant_appended = False
         try:
             async for chunk in get_client().chat_stream(
                 model=model, messages=messages,
@@ -174,53 +183,80 @@ async def api_chat(req: ChatRequest):
                         if not matched and cname:
                             logger.info("解析到角色「%s」但 characters_state 无匹配，已跳过", cname)
 
-                    if not assistant_appended:
-                        append_history(session, "user", user_text)
-                        append_history(session, "assistant", full_content, full_thinking)
-                        assistant_appended = True
+                    append_history(session, "user", user_text)
+                    append_history(session, "assistant", full_content, full_thinking)
 
-                        new_summary_event = None
+                    new_summary_event = None
+                    dropped = trim_history(
+                        session,
+                        max_messages=MAX_MESSAGES_IN_SAVE,
+                    )
+                    if dropped:
                         try:
-                            dropped = trim_history(session, max_messages=MAX_MESSAGES_IN_SAVE, project=project)
-                            if dropped:
-                                try:
-                                    raw = await get_client().summarize_once(model, dropped)
-                                    from core.summary_parser import parse_summary
-                                    parsed_sum = parse_summary(raw)
-                                    import_index = len(session.get("summaries", []))
-                                    session.setdefault("summaries", []).append({
-                                        "text": parsed_sum["text"],
-                                        "time": parsed_sum["time"],
-                                        "facts": parsed_sum["facts"],
-                                        "relations": parsed_sum["relations"],
-                                        "created_at": datetime.now().isoformat(),
-                                    })
-                                    session["summary_error"] = ""
-                                    new_summary_event = {"ok": True, "summary": session["summaries"][-1], "index": import_index}
-                                except Exception as se:
-                                    logger.warning("短期总结失败，不影响聊天: %s", se)
-                                    session["summary_error"] = f"总结生成失败: {se}"
-                                    import_index = len(session.get("summaries", []))
-                                    session.setdefault("summaries", []).append({
-                                        "text": "（总结生成失败，原文已归档）",
-                                        "time": "",
-                                        "facts": [],
-                                        "relations": [],
-                                        "failed": True,
-                                        "created_at": datetime.now().isoformat(),
-                                        "error": str(se),
-                                    })
-                                    new_summary_event = {"ok": False, "error": str(se), "index": import_index}
-                        except Exception as se2:
-                            logger.warning("短期总结流程异常: %s", se2)
-                            session["summary_error"] = f"总结流程异常: {se2}"
+                            raw = await get_client().summarize_once(model, dropped)
+                            from core.summary_parser import parse_summary
 
-                        session["current_model"] = model
+                            parsed_sum = parse_summary(raw)
+                            import_index = len(session.get("summaries", []))
+                            session.setdefault("summaries", []).append({
+                                "text": parsed_sum["text"],
+                                "time": parsed_sum["time"],
+                                "facts": parsed_sum["facts"],
+                                "relations": parsed_sum["relations"],
+                                "created_at": datetime.now().isoformat(),
+                            })
+                            session["summary_error"] = ""
+                            new_summary_event = {
+                                "ok": True,
+                                "summary": session["summaries"][-1],
+                                "index": import_index,
+                            }
+                        except Exception as summary_error:
+                            logger.warning("短期总结失败，不影响聊天: %s", summary_error)
+                            session["summary_error"] = f"总结生成失败: {summary_error}"
+                            import_index = len(session.get("summaries", []))
+                            session.setdefault("summaries", []).append({
+                                "text": "（总结生成失败，原文已归档）",
+                                "time": "",
+                                "facts": [],
+                                "relations": [],
+                                "failed": True,
+                                "created_at": datetime.now().isoformat(),
+                                "error": str(summary_error),
+                            })
+                            new_summary_event = {
+                                "ok": False,
+                                "error": str(summary_error),
+                                "index": import_index,
+                            }
+
+                    session["current_model"] = model
+                    prepared_session = deepcopy(session)
+
+                    def commit_chat(current: dict, context) -> None:
+                        current.clear()
+                        current.update(deepcopy(prepared_session))
+                        if dropped:
+                            context.snapshot(
+                                "trim",
+                                trim_snapshot_payload(dropped),
+                            )
+
+                    try:
+                        committed = await mutate_session(
+                            project,
+                            save,
+                            req.expected_revision,
+                            commit_chat,
+                        )
+                    except RevisionConflict as conflict:
+                        yield f"data: {json.dumps({'type': 'conflict', 'expected_revision': conflict.expected, 'current_revision': conflict.current}, ensure_ascii=False)}\n\n"
+                        return
 
                     summary_payload = {
                         "type": "parsed",
                         "parsed": parsed,
-                        "session": dict(session),
+                        "session": committed.session,
                     }
                     if new_summary_event:
                         summary_payload["summary_event"] = new_summary_event
@@ -234,12 +270,6 @@ async def api_chat(req: ChatRequest):
                 yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
             except (GeneratorExit, Exception):
                 pass
-        finally:
-            try:
-                if assistant_appended:
-                    await save_session(session, project, save)
-            except Exception as save_err:
-                logger.error("最终保存失败: %s", save_err)
 
     return StreamingResponse(
         generate(), media_type="text/event-stream",
@@ -253,7 +283,18 @@ async def api_switch_model(req: Request):
     project = _norm_project(body.get("project", "默认项目"))
     save = _norm_save(body.get("save", "默认存档"))
     model = body.get("model", "")
-    session = await aload_session(project, save)
-    session["current_model"] = model
-    await save_session(session, project, save)
-    return {"current_model": model}
+    expected_revision = _expected_revision(body)
+
+    def switch_model(session: dict, context) -> None:
+        session["current_model"] = model
+
+    try:
+        mutation = await mutate_session(
+            project,
+            save,
+            expected_revision,
+            switch_model,
+        )
+    except RevisionConflict as exc:
+        _raise_revision_conflict(exc)
+    return {"current_model": model, "session": mutation.session}

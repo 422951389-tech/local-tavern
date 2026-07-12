@@ -45,10 +45,16 @@ class PathPolicyTests(unittest.TestCase):
         self.assertEqual(name, "默认存档.trim.20260712_121212.json")
         self.assertEqual(kind, "trim")
 
+        unique_name = "默认存档.20260712_121212_123456_deadbeef.json"
+        name, kind = validate_snapshot_filename("默认存档", unique_name)
+        self.assertEqual(name, unique_name)
+        self.assertEqual(kind, "snapshot")
+
         invalid = [
             "其他存档.20260712_121212.json",
             "默认存档.unknown.20260712_121212.json",
             "默认存档.2026-07-12.json",
+            "默认存档.20260712_121212_123456_NOTHEX00.json",
             "../默认存档.20260712_121212.json",
             r"C:\默认存档.20260712_121212.json",
         ]

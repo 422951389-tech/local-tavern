@@ -60,6 +60,48 @@ const state = {
 
 let activeController = null;   // 当前流式请求的 AbortController，用于中途取消
 
+function currentRevision() {
+    const revision = state.session && state.session.revision;
+    return Number.isInteger(revision) && revision >= 0 ? revision : 0;
+}
+
+function errorDetail(payload, fallback = '请求失败') {
+    if (!payload) return fallback;
+    if (typeof payload.detail === 'string') return payload.detail;
+    if (payload.detail && payload.detail.code === 'revision_conflict') {
+        return `存档版本冲突（当前 revision ${payload.detail.current_revision}）`;
+    }
+    return payload.error || fallback;
+}
+
+function applySessionResult(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const session = payload.session || (
+        payload.session_id && Number.isInteger(payload.revision) ? payload : null
+    );
+    if (session) state.session = session;
+}
+
+async function sessionWrite(url, method, payload, label = '保存') {
+    const response = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, expected_revision: currentRevision() }),
+    });
+    if (response.status === 409) {
+        const conflict = await response.json().catch(() => ({}));
+        try { await reloadCurrentSession(); } catch (e) {}
+        throw new Error(errorDetail(conflict, `${label}冲突，已重新加载`));
+    }
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(errorDetail(error, `${label}失败：HTTP ${response.status}`));
+    }
+    const result = await response.json();
+    applySessionResult(result);
+    return result;
+}
+
 // ===== 项目列表 =====
 async function loadProjects() {
     try {
@@ -358,17 +400,17 @@ async function createNewSave(name) {
 
 async function renameCurrentSave(newName) {
     if (!state.currentSave) return;
-    const res = await fetch(API.sessionRename, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project: state.currentProject, save: state.currentSave, new_name: newName }),
-    });
-    if (!res.ok) {
-        const err = await res.json();
-        alert('重命名失败：' + (err.detail || ''));
+    let updated;
+    try {
+        updated = await sessionWrite(API.sessionRename, 'POST', {
+            project: state.currentProject,
+            save: state.currentSave,
+            new_name: newName,
+        }, '重命名');
+    } catch (error) {
+        alert('重命名失败：' + error.message);
         return;
     }
-    const updated = await res.json();
     state.session = updated;
     state.currentSave = updated.session_id;
     await loadSaveList();
@@ -386,12 +428,15 @@ async function deleteCurrentSave() {
     const name = s ? s.name : state.currentSave;
     if (!confirm(`确认删除存档「${name}」？此操作不可恢复。`)) return;
 
-    const res = await fetch(API.sessionDelete, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project: state.currentProject, save: state.currentSave }),
-    });
-    if (!res.ok) { const err = await res.json(); alert('删除失败：' + (err.detail || '')); return; }
+    try {
+        await sessionWrite(API.sessionDelete, 'POST', {
+            project: state.currentProject,
+            save: state.currentSave,
+        }, '删除存档');
+    } catch (error) {
+        alert('删除失败：' + error.message);
+        return;
+    }
     await loadSaveList();
     await loadOrCreateCurrentSave();
 }
@@ -519,6 +564,7 @@ function appendUserMessage(text, index = null, msgData = null) {
     const div = document.createElement('div');
     div.className = 'msg user';
     div.dataset.index = index !== null ? index : '';
+    div.dataset.messageId = msgData && msgData.id ? msgData.id : '';
     div.innerHTML = `
         <input type="checkbox" class="msg-checkbox" ${msgData && msgData.in_prompt === false ? '' : 'checked'} title="勾选 = 进 prompt">
         <div class="msg-actions">
@@ -539,6 +585,7 @@ function appendAssistantMessage(content, thinking = '', index = null, msgData = 
     const div = document.createElement('div');
     div.className = 'msg assistant';
     div.dataset.index = index !== null ? index : '';
+    div.dataset.messageId = msgData && msgData.id ? msgData.id : '';
     // 给 assistant 节点分配唯一 id，便于 SSE/regenerate 精确锁定目标（兜底 :last-child 选择器）
     div.id = div.id || `msg-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     div.innerHTML = `
@@ -574,26 +621,36 @@ function appendStreamThinking(chunk) {
 function bindMessageActions(msgEl) {
     const idxRaw = msgEl.dataset.index;
     const idx = (idxRaw === '' || idxRaw == null) ? -1 : parseInt(idxRaw);
-    if (!Number.isFinite(idx) || idx < 0) {
-        console.warn('消息节点缺少有效 data-index，已跳过绑定:', msgEl);
+    const messageId = msgEl.dataset.messageId || '';
+    if (!messageId && (!Number.isFinite(idx) || idx < 0)) {
+        console.warn('消息节点缺少 message UUID/index，已跳过绑定:', msgEl);
         return;
     }
+    const messageRef = { message_id: messageId || undefined, index: idx >= 0 ? idx : undefined };
     const checkbox = msgEl.querySelector('.msg-checkbox');
     checkbox.addEventListener('change', async (e) => {
-        await toggleMessageInPrompt(idx, e.target.checked);
-        msgEl.classList.toggle('disabled-from-prompt', !e.target.checked);
+        try {
+            await toggleMessageInPrompt(messageRef, e.target.checked);
+            msgEl.classList.toggle('disabled-from-prompt', !e.target.checked);
+        } catch (error) {
+            e.target.checked = !e.target.checked;
+            alert('更新失败：' + error.message);
+        }
     });
     if (!checkbox.checked) msgEl.classList.add('disabled-from-prompt');
 
     msgEl.querySelector('.msg-action-btn.delete').addEventListener('click', async () => {
         if (!confirm('确认删除这条消息？')) return;
-        await deleteMessage(idx);
-        await reloadCurrentSession();
+        try {
+            await deleteMessage(messageRef);
+            await reloadCurrentSession();
+        } catch (error) { alert('删除失败：' + error.message); }
     });
-    msgEl.querySelector('.msg-action-btn.edit').addEventListener('click', () => enterEditMode(msgEl, idx));
+    msgEl.querySelector('.msg-action-btn.edit').addEventListener('click', () => enterMessageEditMode(msgEl, messageRef));
     msgEl.querySelector('.msg-action-btn.regenerate').addEventListener('click', async () => {
         if (!confirm('重新生成？将回滚到这条消息之前重新调用 AI。')) return;
-        await regenerateFrom(idx);
+        try { await regenerateFrom(messageRef); }
+        catch (error) { alert('重生成准备失败：' + error.message); }
     });
     const pinBtn = msgEl.querySelector('.msg-action-btn.pin');
     if (pinBtn) {
@@ -604,7 +661,7 @@ function bindMessageActions(msgEl) {
             // 乐观更新（若失败回滚）
             pinBtn.classList.toggle('active');
             try {
-                const res = await togglePin(idx);
+                const res = await togglePin(messageRef);
                 if (!res || res.error) {
                     // 回滚
                     pinBtn.classList.toggle('active');
@@ -612,7 +669,8 @@ function bindMessageActions(msgEl) {
                     return;
                 }
                 // 以服务端真实状态为准
-                const nowPinned = res.session && res.session.message_history && res.session.message_history[idx] && res.session.message_history[idx].pinned;
+                const nowPinned = res.session && res.session.message_history
+                    && res.session.message_history.find(message => message.id === messageId)?.pinned;
                 pinBtn.classList.toggle('active', !!nowPinned);
                 Object.assign(state.session, res.session || {});
                 // 常驻超 15 条软上限提示（非阻塞 toast）
@@ -626,23 +684,17 @@ function bindMessageActions(msgEl) {
     }
 }
 
-async function togglePin(idx) {
+async function togglePin(messageRef) {
     const url = `${API.session}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
     try {
-        const r = await fetch(url, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'toggle_pinned', index: idx }),
-        });
-        if (!r.ok) {
-            const txt = await r.text().catch(() => '');
-            return { error: `HTTP ${r.status} ${txt}` };
-        }
-        return await r.json();
+        return await sessionWrite(url, 'PATCH', {
+            action: 'toggle_pinned',
+            ...messageRef,
+        }, '钉选');
     } catch (e) { console.error('toggle_pin 失败', e); return { error: String(e) }; }
 }
 
-function enterEditMode(msgEl, idx) {
+function enterMessageEditMode(msgEl, messageRef) {
     const contentEl = msgEl.querySelector('.content');
     const original = contentEl.textContent;
     msgEl.classList.add('editing');
@@ -659,7 +711,7 @@ function enterEditMode(msgEl, idx) {
         const newContent = textarea.value;
         textarea.replaceWith(contentEl);
         if (save && newContent !== original) {
-            await editMessage(idx, newContent);
+            await editMessage(messageRef, newContent);
             contentEl.textContent = newContent;
             await reloadCurrentSession();
         } else { contentEl.textContent = original; }
@@ -671,29 +723,33 @@ function enterEditMode(msgEl, idx) {
     textarea.addEventListener('blur', () => finish(true));
 }
 
-async function toggleMessageInPrompt(idx, inPrompt) {
+async function toggleMessageInPrompt(messageRef, inPrompt) {
     const url = `${API.session}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
-    await fetch(url, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'toggle_in_prompt', index: idx, in_prompt: inPrompt }),
-    });
+    return await sessionWrite(url, 'PATCH', {
+        action: 'toggle_in_prompt',
+        ...messageRef,
+        in_prompt: inPrompt,
+    }, '更新 Prompt 选择');
 }
 
-async function deleteMessage(idx) {
+async function deleteMessage(messageRef) {
     const url = `${API.session}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
-    await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'delete', index: idx }) });
+    return await sessionWrite(url, 'PATCH', { action: 'delete', ...messageRef }, '删除消息');
 }
 
-async function editMessage(idx, newContent) {
+async function editMessage(messageRef, newContent) {
     const url = `${API.session}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
-    await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'edit', index: idx, content: newContent }) });
+    return await sessionWrite(url, 'PATCH', {
+        action: 'edit',
+        ...messageRef,
+        content: newContent,
+    }, '编辑消息');
 }
 
-async function regenerateFrom(idx) {
+async function regenerateFrom(messageRef) {
     const url = `${API.session}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
-    await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'snapshot' }) });
-    await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'truncate', index: idx }) });
+    await sessionWrite(url, 'PATCH', { action: 'snapshot' }, '创建快照');
+    await sessionWrite(url, 'PATCH', { action: 'truncate', ...messageRef }, '截断消息');
     await reloadCurrentSession();
     const history = state.session.message_history || [];
     const lastUserMsg = [...history].reverse().find(m => m.role === 'user');
@@ -818,7 +874,7 @@ function renderSummaryPanel(lastAssistant, sess) {
         editBtn.className = 'summary-edit-btn';
         editBtn.title = '编辑这段总结';
         editBtn.textContent = '✏️';
-        editBtn.addEventListener('click', () => enterEditMode(panel, newest, index));
+        editBtn.addEventListener('click', () => enterSummaryEditMode(panel, newest, index));
         btnGroup.appendChild(editBtn);
 
         const regenBtn = document.createElement('button');
@@ -900,7 +956,7 @@ function escapeHtml(str) {
     return TavernSecurity.escapeHtml(str);
 }
 
-function enterEditMode(panel, summary, index) {
+function enterSummaryEditMode(panel, summary, index) {
     const body = panel.querySelector('.summary-panel-body');
     if (!body) return;
     panel.classList.remove('collapsed');
@@ -945,26 +1001,15 @@ async function saveEdit(panel, index, body) {
     const relations = relsStr.split('\n').map(s => s.trim()).filter(Boolean);
 
     try {
-        const r = await fetch('/api/session/summary', {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                project: state.currentProject,
-                save: state.currentSave,
-                index: index,
-                text: text || '',
-                time: time || '',
-                facts: facts || [],
-                relations: relations || [],
-            }),
-        });
-        if (!r.ok) {
-            const txt = await r.text().catch(() => '');
-            alert('保存失败: HTTP ' + r.status + ' ' + txt);
-            return;
-        }
-        const res = await r.json();
-        if (res.session) Object.assign(state.session, res.session);
+        await sessionWrite('/api/session/summary', 'PATCH', {
+            project: state.currentProject,
+            save: state.currentSave,
+            index: index,
+            text: text || '',
+            time: time || '',
+            facts: facts || [],
+            relations: relations || [],
+        }, '保存总结');
         await reloadCurrentSession();
         const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
         if (lastAI) renderSummaryPanel(lastAI, state.session);
@@ -978,19 +1023,10 @@ async function regenerateLastSummary(panel, sess) {
     const btn = panel.querySelector('.summary-regen-btn');
     if (btn) btn.disabled = true;
     try {
-        const r = await fetch(API.summaryRegen, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ project: state.currentProject, save: state.currentSave }),
-        });
-        if (!r.ok) {
-            const txt = await r.text().catch(() => '');
-            const errMsg = `请求失败: HTTP ${r.status} ${txt}`;
-            alert(errMsg);
-            if (btn) btn.disabled = false;
-            return;
-        }
-        const res = await r.json();
+        const res = await sessionWrite(API.summaryRegen, 'POST', {
+            project: state.currentProject,
+            save: state.currentSave,
+        }, '重生成总结');
         if (res.error) { alert('重新生成失败: ' + res.error); if (btn) btn.disabled = false; return; }
         // 成功 → 刷新存档与对话，重新渲染面板（旧 panel 已脱离 DOM）
         if (res.session) Object.assign(state.session, res.session);
@@ -1023,6 +1059,7 @@ async function sendMessage(text = null, isRegenerate = false) {
     const input = document.getElementById('user-input');
     const userText = text !== null ? text : input.value.trim();
     if (!userText || state.isStreaming) return;
+    const expectedRevision = currentRevision();
     // 清空上一轮残留思考内容，避免跨轮累积串味
     const tc = document.getElementById('thinking-content');
     if (tc) tc.textContent = '';
@@ -1049,6 +1086,7 @@ async function sendMessage(text = null, isRegenerate = false) {
                 user_input: userText,
                 project: state.currentProject,
                 save: state.currentSave,
+                expected_revision: expectedRevision,
                 temperature: state.modelParams.temperature,
                 top_p: state.modelParams.top_p,
                 top_k: state.modelParams.top_k,
@@ -1058,8 +1096,13 @@ async function sendMessage(text = null, isRegenerate = false) {
         });
 
         if (!res.ok) {
-            const err = await res.text();
-            if (targetEl && targetEl.isConnected) targetEl.textContent = `❌ 错误: ${err}`;
+            const errorPayload = await res.json().catch(() => ({}));
+            if (res.status === 409) {
+                if (targetEl && targetEl.isConnected) targetEl.textContent = '⚠️ 存档已变化，本轮未提交';
+                showToast(errorDetail(errorPayload, '存档版本冲突'));
+            } else if (targetEl && targetEl.isConnected) {
+                targetEl.textContent = `❌ 错误: ${errorDetail(errorPayload, `HTTP ${res.status}`)}`;
+            }
             return;  // 复位由 finally 统一处理
         }
 
@@ -1089,10 +1132,17 @@ async function sendMessage(text = null, isRegenerate = false) {
                         if (targetEl && targetEl.isConnected) targetEl.textContent = `❌ ${data.content}`;
                         stopStream = true;  // 后端报错，停止读取整个流
                         break;
+                    } else if (data.type === 'conflict') {
+                        if (targetEl && targetEl.isConnected) {
+                            targetEl.textContent = `⚠️ 存档已更新（revision ${data.current_revision}），本轮未提交`;
+                        }
+                        showToast('聊天提交冲突，已重新加载最新存档');
+                        stopStream = true;
+                        break;
                     } else if (data.type === 'parsed') {
                         // 仅当 targetEl 仍挂在 DOM 时才应用，防止跨流串扰
                         if (targetEl && targetEl.isConnected) {
-                            if (data.session) Object.assign(state.session, data.session);
+                            if (data.session) state.session = data.session;
                             renderParsedResponse(data.parsed);
                             loadSaveList();
                         }
@@ -1498,7 +1548,13 @@ async function createCardEditor(config) {
                 statusEl.textContent = '删除中…';
                 try {
                     const r = await fetch(deleteUrl, { method: 'DELETE' });
-                    if (!r.ok) { const err = await r.json(); throw new Error(err.detail || '删除失败'); }
+                    const result = await r.json().catch(() => ({}));
+                    if (r.status === 409) {
+                        try { await reloadCurrentSession(); } catch (e) {}
+                        throw new Error(errorDetail(result, '删除冲突，已重新加载'));
+                    }
+                    if (!r.ok) throw new Error(errorDetail(result, '删除失败'));
+                    applySessionResult(result);
                     statusEl.textContent = '✓ 已删除';
                     if (config.allowNew) {
                         const fresh = await fetch(config.listApi).then(r => r.json()).catch(() => null);
@@ -1546,7 +1602,7 @@ async function openCharactersEditor() {
         listApi: `${API.characters}?project=${encodeURIComponent(state.currentProject)}`,
         listKey: 'characters',
         saveApi: (id) => `${API.characterSave(id)}?project=${encodeURIComponent(state.currentProject)}`,
-        deleteApi: (id) => `${API.characterDelete(id)}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`,
+        deleteApi: (id) => `${API.characterDelete(id)}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}&expected_revision=${currentRevision()}`,
         allowNew: true,
         idField: 'id',
         idLabel: '唯一 ID（文件名）',
@@ -1601,7 +1657,7 @@ async function openUserEditor() {
         allowNew: false,
         idField: null,
         saveApi: () => `${API.userSave}?project=${encodeURIComponent(state.currentProject)}`,
-        deleteApi: (id) => `${API.userDelete}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`,
+        deleteApi: (id) => `${API.userDelete}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}&expected_revision=${currentRevision()}`,
         prefix: 'user',
         extraApi: `${API.user}?project=${encodeURIComponent(state.currentProject)}`,
         buildGroups: (ud) => {
@@ -1712,12 +1768,16 @@ async function showHistoryEditor() {
             btn.addEventListener('click', async () => {
                 const fn = btn.dataset.fn;
                 if (!confirm('恢复这份快照？当前存档内容会被这份覆盖。')) return;
-                const r = await fetch(API.sessionRestore, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ project: state.currentProject, save: state.currentSave, filename: fn }),
-                });
-                if (!r.ok) { const e = await r.json().catch(() => ({})); alert('恢复失败：' + (e.detail || '')); return; }
+                try {
+                    await sessionWrite(API.sessionRestore, 'POST', {
+                        project: state.currentProject,
+                        save: state.currentSave,
+                        filename: fn,
+                    }, '恢复快照');
+                } catch (error) {
+                    alert('恢复失败：' + error.message);
+                    return;
+                }
                 await reloadCurrentSession(); hideModal(); alert('已恢复到该快照');
             });
         });
@@ -1885,23 +1945,32 @@ function bindUI() {
     document.getElementById('model-select').addEventListener('change', async (e) => {
         const model = e.target.value;
         if (!model) return;
-        await fetch(API.switchModel, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ project: state.currentProject, save: state.currentSave, model }),
-        });
+        try {
+            await sessionWrite(API.switchModel, 'POST', {
+                project: state.currentProject,
+                save: state.currentSave,
+                model,
+            }, '切换模型');
+        } catch (error) {
+            alert('切换模型失败：' + error.message);
+            if (state.session && state.session.current_model) e.target.value = state.session.current_model;
+        }
     });
 
     // 重置
     document.getElementById('reset-btn').addEventListener('click', async () => {
     if (state.isStreaming && activeController) activeController.abort();
         if (!confirm('重置当前存档？将清空对话历史和角色状态，但保留存档本身。')) return;
-        const res = await fetch(API.reset, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ project: state.currentProject, save: state.currentSave }),
-        });
-        const session = await res.json();
+        let session;
+        try {
+            session = await sessionWrite(API.reset, 'POST', {
+                project: state.currentProject,
+                save: state.currentSave,
+            }, '重置存档');
+        } catch (error) {
+            alert('重置失败：' + error.message);
+            return;
+        }
         state.session = session;
         document.getElementById('chat-stream').innerHTML = '';
         document.getElementById('suggestions').innerHTML = '';

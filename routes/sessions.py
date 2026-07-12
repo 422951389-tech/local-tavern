@@ -9,7 +9,9 @@ from core.session_manager import (
     export_session,
     import_session,
     session_exists,
-    save_session,
+    new_session,
+    reset_session,
+    RevisionConflict,
 )
 from routes.common import (
     SaveCreateRequest,
@@ -19,7 +21,9 @@ from routes.common import (
     SessionResetRequest,
     _norm_save,
     _norm_project,
+    _id_from_display_name,
     _initialize_session_from_profiles,
+    _raise_revision_conflict,
 )
 
 router = APIRouter()
@@ -35,13 +39,15 @@ async def api_list_sessions(project: str = "默认项目"):
 async def api_create_session(req: SaveCreateRequest):
     project = _norm_project(req.project)
     try:
-        s = await create_session(project, req.name)
+        save_id = _id_from_display_name(req.name, label="存档显示名")
+        initial = new_session(project, save_id)
+        initial["name"] = req.name.strip()
+        await _initialize_session_from_profiles(initial, project)
+        s = await create_session(project, req.name, initial)
     except FileExistsError as e:
         raise HTTPException(409, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
-    await _initialize_session_from_profiles(s, project)
-    await save_session(s, project, s["session_id"])
     return s
 
 
@@ -49,20 +55,35 @@ async def api_create_session(req: SaveCreateRequest):
 async def api_rename_session(req: SaveRenameRequest):
     project = _norm_project(req.project)
     try:
-        return await rename_session(project, _norm_save(req.save), req.new_name)
+        return await rename_session(
+            project,
+            _norm_save(req.save),
+            req.new_name,
+            req.expected_revision,
+        )
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except FileExistsError as e:
         raise HTTPException(409, str(e))
+    except RevisionConflict as exc:
+        _raise_revision_conflict(exc)
 
 
 @router.post("/api/sessions/delete")
 async def api_delete_session(req: SaveDeleteRequest):
     project = _norm_project(req.project)
     try:
-        return {"deleted": await delete_session(project, _norm_save(req.save))}
+        return {
+            "deleted": await delete_session(
+                project,
+                _norm_save(req.save),
+                req.expected_revision,
+            )
+        }
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except RevisionConflict as exc:
+        _raise_revision_conflict(exc)
 
 
 @router.get("/api/sessions/export")
@@ -87,10 +108,16 @@ async def api_import_session(req: SaveImportRequest):
 
 @router.post("/api/session/reset")
 async def api_reset_session(req: SessionResetRequest):
-    from core.session_manager import reset_session
     project = _norm_project(req.project)
     save = _norm_save(req.save)
-    new_session = reset_session(project, save)
-    await _initialize_session_from_profiles(new_session, project)
-    await save_session(new_session, project, save)
-    return new_session
+    replacement = new_session(project, save)
+    await _initialize_session_from_profiles(replacement, project)
+    try:
+        return await reset_session(
+            project,
+            save,
+            req.expected_revision,
+            replacement,
+        )
+    except RevisionConflict as exc:
+        _raise_revision_conflict(exc)

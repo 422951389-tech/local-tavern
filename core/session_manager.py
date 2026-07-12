@@ -1,80 +1,62 @@
-"""存档管理 — 支持多项目
+"""存档领域操作与事务化 SessionStore 适配层。"""
+from __future__ import annotations
 
-存档结构（JSON）：
-{
-  "session_id": "default",
-  "name": "显示名",
-  "project": "所属项目",
-  "created_at": "...",
-  "updated_at": "...",
-  "current_model": "...",
-  "scene_meta": { ... },
-  "user_status": { ... },
-  "characters_state": { ... },
-  "message_history": [ ... ]
-}
-
-路径：data/projects/<项目>/saves/<存档id>.json
-"""
 import json
 import logging
-import asyncio
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, TypeVar
+from uuid import uuid4
 
-from core.config import MAX_MESSAGES_IN_SAVE, HARD_LIMIT, PROJECTS_DIR, DEFAULT_SAVE
+from core.config import DEFAULT_SAVE, HARD_LIMIT, MAX_MESSAGES_IN_SAVE, PROJECTS_DIR
 from core.import_validation import validate_import_json
 from core.path_policy import (
     display_name_to_id,
-    resolve_saves_dir,
     resolve_snapshot_path as _resolve_snapshot_path,
-    resolve_under,
     validate_file_id,
 )
+from core.session_store import (
+    MutationContext,
+    MutationResult,
+    RevisionConflict,
+    SessionStore,
+    atomic_write,
+)
+
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 ROOT_DIR = PROJECTS_DIR
-
-_save_locks: dict[str, asyncio.Lock] = {}
-_locks_guard = asyncio.Lock()
+_stores: dict[str, SessionStore] = {}
 
 
-async def _get_save_lock(project: str, save_id: str) -> asyncio.Lock:
-    """获取（或惰性创建）某项目+存档对应的写锁。
+def get_session_store() -> SessionStore:
+    root = Path(ROOT_DIR).resolve(strict=False)
+    key = str(root)
+    store = _stores.get(key)
+    if store is None:
+        store = SessionStore(root)
+        _stores[key] = store
+    return store
 
-    按存档隔离并发：不同项目、不同存档互不阻塞，同一存档串行写。
-    _locks_guard 负责安全地创建新锁。
-    """
-    project = validate_file_id(project, label="项目 ID")
-    save_id = validate_file_id(save_id, label="存档 ID")
-    key = f"{project}/{save_id}"
-    lock = _save_locks.get(key)
-    if lock is not None:
-        return lock
-    async with _locks_guard:
-        lock = _save_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _save_locks[key] = lock
-        return lock
+
+def clear_session_stores_for_testing() -> None:
+    _stores.clear()
 
 
 def _saves_dir(project: str) -> Path:
-    """获取已通过 resolve 边界检查的项目存档目录。"""
-    d = resolve_saves_dir(ROOT_DIR, project)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    """纯路径解析；读取路径不得创建目录。"""
+    return get_session_store().saves_dir(project)
 
 
 def _session_path(project: str, save_id: str) -> Path:
-    save_id = validate_file_id(save_id, label="存档 ID")
-    return resolve_under(_saves_dir(project), f"{save_id}.json")
+    return get_session_store().session_path(project, save_id)
 
 
 def _history_dir(project: str) -> Path:
-    return resolve_under(_saves_dir(project), ".history")
+    return get_session_store().history_dir(project)
 
 
 def resolve_snapshot_path(
@@ -84,9 +66,8 @@ def resolve_snapshot_path(
     *,
     allowed_types: tuple[str, ...] = ("snapshot", "reset", "trim"),
 ) -> tuple[Path, str]:
-    """按当前可注入 ROOT_DIR 解析并校验外部快照文件名。"""
     return _resolve_snapshot_path(
-        ROOT_DIR,
+        Path(ROOT_DIR),
         project,
         save_id,
         filename,
@@ -94,19 +75,15 @@ def resolve_snapshot_path(
     )
 
 
-def atomic_write(path: Path, data: str):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    tmp.replace(path)
-
-
 def _empty_session(save_id: str = DEFAULT_SAVE, project: str = "默认项目") -> dict:
+    now = datetime.now().isoformat()
     return {
         "session_id": save_id,
         "name": save_id,
         "project": project,
-        "created_at": datetime.now().isoformat(),
-        "updated_at": datetime.now().isoformat(),
+        "revision": 0,
+        "created_at": now,
+        "updated_at": now,
         "current_model": "",
         "scene_meta": {
             "location": "", "time": "", "weather": "",
@@ -122,219 +99,195 @@ def _empty_session(save_id: str = DEFAULT_SAVE, project: str = "默认项目") -
     }
 
 
+def new_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
+    return _empty_session(save_id, project)
+
+
 def load_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
-    path = _session_path(project, save_id)
-    if not path.exists():
-        return _empty_session(save_id, project)
+    """纯读取：不创建目录、不 trim、不迁移磁盘内容。"""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            s = json.load(f)
-        s.setdefault("project", project)
-        s.setdefault("summaries", [])
-        s.setdefault("summary_error", "")
-        for m in s.get("message_history", []):
-            m.setdefault("pinned", False)
-        # 惰性迁移：旧存档非 pinned 条数超过存档窗口时，截断并把被截原文写 trim 快照留底。
-        # 避免导入/历史遗留的超长存档在第一次 chat 前就已超标却无人收敛。
-        _migrate_trim_if_needed(s, project)
-        return s
-    except (json.JSONDecodeError, OSError) as e:
-        logger.error("存档加载失败，使用空存档: %s", e)
+        session = get_session_store().read_sync(project, save_id)
+        return session if session is not None else _empty_session(save_id, project)
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        logger.error("存档加载失败，使用只读空视图: %s", exc)
         return _empty_session(save_id, project)
 
 
 async def aload_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
-    """异步版本 load_session：用 asyncio.to_thread 把阻塞 IO 放到线程池。
-
-    避免 event loop 在大存档读取时被卡住。语义与同步版一致。
-    """
-    return await asyncio.to_thread(load_session, project, save_id)
-
-
-async def save_session(session: dict, project: str, save_id: str):
-    lock = await _get_save_lock(project, save_id)
-    async with lock:
-        # ponytail: 轻量 CAS。记录 session 加载时的版本号，与磁盘当前版本比较；
-        # 若被并发修改过则合并 message_history 而非简单覆盖。单用户桌面应用极少触发。
-        old_version = session.get("updated_at", "")
-        session["updated_at"] = datetime.now().isoformat()
-        session["session_id"] = save_id
-        session["project"] = project
-        path = _session_path(project, save_id)
-        if path.exists() and old_version:
-            try:
-                current = json.loads(path.read_text(encoding="utf-8"))
-                current_ver = current.get("updated_at", "")
-                if current_ver and current_ver > old_version:
-                    # 文件已被并发修改：合并 message_history（保留新条目的同时不丢当前 session 的修改）
-                    existing_ids = {id(m) for m in current.get("message_history", [])}
-                    for m in session.get("message_history", []):
-                        if id(m) not in existing_ids:
-                            current.setdefault("message_history", []).append(m)
-                    # 场景元数据非空字段合并
-                    for k, v in session.get("scene_meta", {}).items():
-                        if v and not current.get("scene_meta", {}).get(k):
-                            current.setdefault("scene_meta", {})[k] = v
-                    # characters_state 合并
-                    for cid, state in session.get("characters_state", {}).items():
-                        if cid not in current.get("characters_state", {}):
-                            current.setdefault("characters_state", {})[cid] = state
-                    current["updated_at"] = datetime.now().isoformat()
-                    session = current
-                    logger.info("save_session: 检测到并发修改，已合并（CAS）")
-            except (json.JSONDecodeError, OSError):
-                pass
-        atomic_write(path, json.dumps(session, ensure_ascii=False, indent=2))
+    try:
+        session = await get_session_store().read(project, save_id)
+        return session if session is not None else _empty_session(save_id, project)
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        logger.error("存档加载失败，使用只读空视图: %s", exc)
+        return _empty_session(save_id, project)
 
 
-def append_history(session: dict, role: str, content: str, thinking: str = ""):
-    msg = {"role": role, "content": content}
+async def mutate_session(
+    project: str,
+    save_id: str,
+    expected_revision: int,
+    command: Callable[[dict, MutationContext], T],
+) -> MutationResult[T]:
+    return await get_session_store().mutate(
+        project,
+        save_id,
+        expected_revision,
+        command,
+        initial_factory=lambda: _empty_session(save_id, project),
+    )
+
+
+async def save_session(
+    session: dict,
+    project: str,
+    save_id: str,
+    expected_revision: int | None = None,
+) -> dict:
+    """兼容替换入口；不再做字段猜测合并。"""
+    expected = session.get("revision", 0) if expected_revision is None else expected_revision
+    replacement = deepcopy(session)
+
+    def replace(current: dict, context: MutationContext) -> None:
+        current.clear()
+        current.update(deepcopy(replacement))
+
+    result = await mutate_session(project, save_id, expected, replace)
+    session.clear()
+    session.update(deepcopy(result.session))
+    return result.session
+
+
+def append_history(session: dict, role: str, content: str, thinking: str = "") -> dict:
+    message = {
+        "id": str(uuid4()),
+        "role": role,
+        "content": content,
+        "pinned": False,
+        "in_prompt": True,
+    }
     if thinking:
-        msg["thinking"] = thinking
-    session.setdefault("message_history", []).append(msg)
+        message["thinking"] = thinking
+    session.setdefault("message_history", []).append(message)
+    return message
 
 
-def trim_history(session: dict, max_messages: int = MAX_MESSAGES_IN_SAVE, project: Optional[str] = None):
-    """截断消息历史到最近 max_messages 条非 pinned 消息，保留全部 pinned，被截部分自动写 trim 快照。
+def resolve_message(
+    session: dict,
+    *,
+    message_id: str | None = None,
+    index: int | None = None,
+) -> tuple[int, dict]:
+    history = session.setdefault("message_history", [])
+    if message_id:
+        for position, message in enumerate(history):
+            if message.get("id") == message_id:
+                return position, message
+        raise IndexError("消息 ID 不存在")
+    if index is None or index < 0 or index >= len(history):
+        raise IndexError("无效的 index")
+    return index, history[index]
 
-    - pinned: true 的消息永不截断、常驻。
-    - 当 project 传入时，被截掉的非 pinned 消息整体落盘 .history/{sid}.trim.{ts}.json 留底。
-    - 硬上限：单存档 history > HARD_LIMIT 时，即使未达 max_messages 也强制 trim 一次，防止异常情况下 history 无限增长。
 
-    注意：max_messages 是"存档窗口"（非 pinned 条数），不同于 prompt_builder 的"prompt 窗口"。
-    存档窗口 ≥ prompt 窗口，差额给快照/导出/重生成留原文回溯余量。两者均由 core/config.py 集中定义。
-    """
-    max_msgs = max_messages
+def trim_history(
+    session: dict,
+    max_messages: int = MAX_MESSAGES_IN_SAVE,
+    project: Optional[str] = None,
+) -> list[dict]:
+    """纯内存 trim；快照由调用方在同一事务的 MutationContext 中写入。"""
+    del project  # 兼容旧调用签名；读取/纯函数路径不再写盘。
+    max_messages = HARD_LIMIT if len(session.get("message_history", [])) > HARD_LIMIT else max_messages
     history = session.get("message_history", [])
-    if len(history) <= max_msgs and len(history) <= HARD_LIMIT:
-        return
-    if len(history) > HARD_LIMIT:
-        max_msgs = HARD_LIMIT
-
-    # 分离 pinned（保留）与非 pinned（参与截断）
-    pinned = [m for m in history if m.get("pinned")]
-    non_pinned = [m for m in history if not m.get("pinned")]
-
-    # 对非 pinned 部分取最近 max_msgs 条；pinned 全部保留
-    keep_non = non_pinned[-max_msgs:]
-    dropped = non_pinned[:-max_msgs] if len(non_pinned) > max_msgs else []
-
-    # 被截掉的部分写 trim 快照留底
-    if dropped and project:
-        _save_trim_snapshot(session, project, dropped)
-
-    # 合并并保持原有相对顺序：保留所有 pinned + keep_non（最近非pinned）
-    keep_ids = {id(m) for m in keep_non}
-    new_history = [m for m in history if m.get("pinned") or id(m) in keep_ids]
-    session["message_history"] = new_history
-
+    non_pinned = [message for message in history if not message.get("pinned")]
+    if len(non_pinned) <= max_messages:
+        return []
+    keep_non = non_pinned[-max_messages:]
+    dropped = non_pinned[:-max_messages]
+    keep_ids = {message.get("id") for message in keep_non}
+    session["message_history"] = [
+        message
+        for message in history
+        if message.get("pinned") or message.get("id") in keep_ids
+    ]
     return dropped
 
 
-def _save_trim_snapshot(session: dict, project: str, dropped: list):
-    """把截断掉的消息整体存为 trim 快照（区别于 regenerate 的全量快照）。"""
-    d = _history_dir(project)
-    d.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sid = validate_file_id(session.get("session_id", DEFAULT_SAVE) or DEFAULT_SAVE, label="存档 ID")
-    path = resolve_under(d, f"{sid}.trim.{ts}.json")
-    payload = {
-        "_snapshot_at": datetime.now().isoformat(),
-        "_snapshot_type": "trim",
-        "session_id": sid,
-        "project": project,
+def trim_snapshot_payload(dropped: list[dict]) -> dict:
+    return {
         "dropped_count": len(dropped),
-        "dropped_messages": dropped,
+        "dropped_messages": deepcopy(dropped),
     }
-    atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
-
-
-def _migrate_trim_if_needed(session: dict, project: Optional[str]):
-    """惰性迁移：若非 pinned 历史条数超过存档窗口，做一次 trim 并写原文留底快照。
-
-    与 trim_history 的差别：这里只在 load 时对"明显超标"的旧存档兜底，
-    不触发短期总结（总结由 chat 流程驱动，load 不做副作用 AI 调用）。
-    """
-    history = session.get("message_history", [])
-    non_pinned = [m for m in history if not m.get("pinned")]
-    if len(non_pinned) <= MAX_MESSAGES_IN_SAVE:
-        return
-    if project:
-        trim_history(session, max_messages=MAX_MESSAGES_IN_SAVE, project=project)
-    else:
-        # 无 project 时只做内存截断，不写快照（load 路径总会带 project，这是兜底）
-        trim_history(session, max_messages=MAX_MESSAGES_IN_SAVE)
-    logger.info("惰性迁移截断超长存档 history→%d 条", len(session.get("message_history", [])))
 
 
 def list_trim_snapshots(project: str, save_id: str = DEFAULT_SAVE) -> list[dict]:
-    """列出某存档的所有 trim 快照（按时间倒序）。
-
-    用于前端调试面板，让用户看到"哪些原文被总结覆盖了"。
-    """
     save_id = validate_file_id(save_id, label="存档 ID")
-    d = _history_dir(project)
-    if not d.exists():
+    history_dir = _history_dir(project)
+    if not history_dir.exists():
         return []
-    out = []
-    for p in sorted(d.glob(f"{save_id}.trim.*.json"), reverse=True):
+    snapshots: list[dict] = []
+    for path in sorted(history_dir.glob(f"{save_id}.trim.*.json"), reverse=True):
         try:
-            ts_str = p.stem.split(".trim.", 1)[1] if ".trim." in p.stem else ""
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            out.append({
-                "filename": p.name,
-                "timestamp": ts_str,
-                "modified_at": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
+            data = json.loads(path.read_text(encoding="utf-8"))
+            snapshots.append({
+                "filename": path.name,
+                "timestamp": path.stem.split(".trim.", 1)[-1],
+                "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
                 "dropped_count": data.get("dropped_count", 0),
                 "snapshot_at": data.get("_snapshot_at", ""),
             })
         except (json.JSONDecodeError, OSError):
             continue
-    return out
+    return snapshots
 
 
-def reset_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
-    """重置存档：归档（不删除）历史快照后清空主存档。
-
-    - 旧存档文件 → .history/{sid}.reset.{ts}.json（仅在文件存在时归档）
-    - .history/{sid}.trim.*.json（trim 快照）保留不动
-    - .history/{sid}.{ts}.json（regenerate 全量快照）保留不动
-    """
-    save_id = validate_file_id(save_id, label="存档 ID")
-    path = _session_path(project, save_id)
-    if path.exists():
-        archive_dir = _history_dir(project)
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_path = resolve_under(archive_dir, f"{save_id}.reset.{ts}.json")
-        try:
-            atomic_write(archive_path, path.read_text(encoding="utf-8"))
-        except OSError as e:
-            logger.warning("归档旧存档失败: %s", e)
-        path.unlink()
-    return _empty_session(save_id, project)
+async def snapshot_session(
+    project: str,
+    save_id: str,
+    expected_revision: int,
+    kind: str = "snapshot",
+) -> tuple[dict, Path]:
+    return await get_session_store().snapshot(
+        project,
+        save_id,
+        expected_revision,
+        kind,
+    )
 
 
-# ============ 多存档管理 ============
+async def reset_session(
+    project: str,
+    save_id: str,
+    expected_revision: int,
+    replacement: dict | None = None,
+) -> dict:
+    reset_value = deepcopy(replacement or _empty_session(save_id, project))
+
+    def reset(current: dict, context: MutationContext) -> None:
+        if context.existed:
+            context.snapshot("reset", current)
+        current.clear()
+        current.update(deepcopy(reset_value))
+
+    return (await mutate_session(project, save_id, expected_revision, reset)).session
+
 
 def _safe_filename(name: str) -> str:
-    """兼容旧调用名：仅用于把新资源显示名转换为磁盘 ID。"""
     return display_name_to_id(name, label="存档显示名")
 
 
 def list_sessions(project: str) -> list[dict]:
-    d = _saves_dir(project)
-    sessions = []
-    for p in d.glob("*.json"):
-        if p.stem.startswith("."):
+    saves_dir = _saves_dir(project)
+    if not saves_dir.exists():
+        return []
+    sessions: list[dict] = []
+    for path in saves_dir.glob("*.json"):
+        if path.stem.startswith("."):
             continue
         try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = json.loads(path.read_text(encoding="utf-8"))
             sessions.append({
-                "session_id": data.get("session_id", p.stem),
-                "name": data.get("name", p.stem),
+                "session_id": data.get("session_id", path.stem),
+                "name": data.get("name", path.stem),
+                "revision": data.get("revision", 0),
                 "updated_at": data.get("updated_at", ""),
                 "created_at": data.get("created_at", ""),
                 "message_count": len(data.get("message_history", [])),
@@ -342,59 +295,47 @@ def list_sessions(project: str) -> list[dict]:
             })
         except (json.JSONDecodeError, OSError):
             continue
-    sessions.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    sessions.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
     return sessions
 
 
 def session_exists(project: str, save_id: str) -> bool:
-    return _session_path(project, save_id).exists()
+    return _session_path(project, save_id).is_file()
 
 
-async def create_session(project: str, name: str) -> dict:
-    safe = _safe_filename(name)
-    if session_exists(project, safe):
-        raise FileExistsError(f"存档 ID {safe} 已存在；请使用不会产生规范化碰撞的名称")
-    s = _empty_session(safe, project)
-    s["name"] = name.strip()
-    await save_session(s, project, safe)
-    return s
+async def create_session(project: str, name: str, initial: dict | None = None) -> dict:
+    save_id = _safe_filename(name)
+    session = deepcopy(initial or _empty_session(save_id, project))
+    session["name"] = name.strip()
+    return await get_session_store().create(project, save_id, session)
 
 
-async def rename_session(project: str, old_id: str, new_name: str) -> dict:
-    if not session_exists(project, old_id):
-        raise FileNotFoundError(f"存档 {old_id} 不存在")
-    session = load_session(project, old_id)
-    new_safe = _safe_filename(new_name)
-    session["name"] = new_name.strip()
-    if new_safe != old_id:
-        if session_exists(project, new_safe):
-            raise FileExistsError(f"存档 {new_safe} 已存在")
-        # 迁移历史快照 → 先写新文件再删旧文件，防止磁盘故障导致数据丢失
-        hist_dir = _history_dir(project)
-        if hist_dir.exists():
-            for p in hist_dir.iterdir():
-                if p.name.startswith(old_id + "."):
-                    new_filename = new_safe + p.name[len(old_id):]
-                    try:
-                        p.rename(resolve_under(hist_dir, new_filename))
-                    except OSError:
-                        pass
-        await save_session(session, project, new_safe)
-        _session_path(project, old_id).unlink()
-    else:
-        await save_session(session, project, old_id)
-    return session
+async def rename_session(
+    project: str,
+    old_id: str,
+    new_name: str,
+    expected_revision: int,
+) -> dict:
+    new_id = _safe_filename(new_name)
+    return await get_session_store().rename(
+        project,
+        old_id,
+        new_id,
+        new_name.strip(),
+        expected_revision,
+    )
 
 
-async def delete_session(project: str, save_id: str) -> bool:
-    sessions = list_sessions(project)
-    if len(sessions) <= 1 and session_exists(project, save_id):
-        raise ValueError("至少保留 1 个存档")
-    path = _session_path(project, save_id)
-    if path.exists():
-        path.unlink()
-        return True
-    return False
+async def delete_session(
+    project: str,
+    save_id: str,
+    expected_revision: int,
+) -> bool:
+    return await get_session_store().delete(
+        project,
+        save_id,
+        expected_revision,
+    )
 
 
 def export_session(project: str, save_id: str) -> str:
@@ -404,38 +345,24 @@ def export_session(project: str, save_id: str) -> str:
 async def import_session(project: str, json_str: str, name: str = None) -> dict:
     data = validate_import_json(json_str)
     target_name = name or data.get("name") or data["session_id"]
-    safe = _safe_filename(target_name)
-    if session_exists(project, safe):
-        raise FileExistsError(f"存档 ID {safe} 已存在；导入未写入任何文件")
-    data["session_id"] = safe
+    save_id = _safe_filename(target_name)
+    data["session_id"] = save_id
     data["name"] = target_name.strip()
     data["project"] = project
-    await save_session(data, project, safe)
-    return data
+    data["revision"] = 0
+    return await get_session_store().create(project, save_id, data)
 
 
-def toggle_pinned(project: str, save_id: str, index: int) -> dict:
-    """翻转某条消息的 pinned 标记，返回更新后的 session（同步 IO）。"""
-    session = load_session(project, save_id)
-    history = session.setdefault("message_history", [])
-    if index < 0 or index >= len(history):
-        raise IndexError("无效的 index")
-    msg = history[index]
-    msg["pinned"] = not msg.get("pinned", False)
-    return session
-
-
-async def atoggle_pinned(project: str, save_id: str, index: int) -> dict:
-    """异步翻转 pinned：先读 → 翻转 → 写盘（原子操作，避免 PATCH 路由漏 save）。"""
-    session = await aload_session(project, save_id)
-    history = session.setdefault("message_history", [])
-    if index < 0 or index >= len(history):
-        raise IndexError("无效的 index")
-    history[index]["pinned"] = not history[index].get("pinned", False)
-    await save_session(session, project, save_id)
-    return session
+def toggle_pinned(
+    session: dict,
+    *,
+    message_id: str | None = None,
+    index: int | None = None,
+) -> dict:
+    _, message = resolve_message(session, message_id=message_id, index=index)
+    message["pinned"] = not message.get("pinned", False)
+    return message
 
 
 def count_pinned(session: dict) -> int:
-    """统计 pinned 消息数。包含 user、assistant、system 等所有角色。"""
-    return sum(1 for m in session.get("message_history", []) if m.get("pinned"))
+    return sum(1 for message in session.get("message_history", []) if message.get("pinned"))

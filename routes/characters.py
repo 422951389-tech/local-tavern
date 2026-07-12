@@ -8,8 +8,8 @@ from core.character_loader import (
     CHARACTER_SCHEMA,
 )
 
-from core.session_manager import aload_session, save_session
-from routes.common import _norm_save, _norm_project
+from core.session_manager import RevisionConflict, mutate_session
+from routes.common import _norm_save, _norm_project, _raise_revision_conflict
 
 router = APIRouter()
 
@@ -40,15 +40,29 @@ async def api_save_character(char_id: str, req: Request, project: str = Query("�
 
 
 @router.delete("/api/characters/{char_id}")
-async def api_delete_character(char_id: str, project: str = Query("默认项目"), save: str = Query(None)):
+async def api_delete_character(
+    char_id: str,
+    project: str = Query("默认项目"),
+    save: str = Query(None),
+    expected_revision: int = Query(..., ge=0),
+):
     project = _norm_project(project)
     save_id = _norm_save(save) if save else "默认存档"
-    session = await aload_session(project, save_id)
-    try:
+
+    def remove_character(session: dict, context) -> None:
         deleted = delete_character(project, char_id, session)
+        if not deleted:
+            raise HTTPException(404, f"角色卡不存在: {char_id}")
+
+    try:
+        mutation = await mutate_session(
+            project,
+            save_id,
+            expected_revision,
+            remove_character,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
-    if not deleted:
-        raise HTTPException(404, f"角色卡不存在: {char_id}")
-    await save_session(session, project, save_id)
-    return {"deleted": True, "id": char_id}
+    except RevisionConflict as exc:
+        _raise_revision_conflict(exc)
+    return {"deleted": True, "id": char_id, "session": mutation.session}

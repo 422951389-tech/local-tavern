@@ -82,6 +82,12 @@ class ProcessGuardTests(unittest.TestCase):
         self.assertNotIn("findstr \"listening\"", text)
         self.assertIn("core.process_guard stop", text)
 
+    def test_server_is_explicitly_single_worker(self):
+        start_text = (BASE_DIR / "start.bat").read_text(encoding="utf-8").lower()
+        server_text = (BASE_DIR / "server.py").read_text(encoding="utf-8").lower()
+        self.assertIn("--workers 1", start_text)
+        self.assertIn("workers=1", server_text)
+
 
 class StopRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_matching_token_triggers_callback(self):

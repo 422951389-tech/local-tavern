@@ -50,6 +50,6 @@ echo.
 REM 后台异步开浏览器：等 3 秒让 uvicorn 起来再开
 start "" /b cmd /c "timeout /t 3 /nobreak >nul && start http://localhost:8765"
 
-python -X utf8 -m uvicorn server:app --host 127.0.0.1 --port 8765
+python -X utf8 -m uvicorn server:app --host 127.0.0.1 --port 8765 --workers 1
 
 pause

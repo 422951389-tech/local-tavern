@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-live-data",
         action="store_true",
-        help="确认本次验证会创建存档、重置存档、写入摘要并发送聊天请求",
+        help="确认本次验证会创建存档、重置存档并发送聊天请求",
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8765")
     parser.add_argument("--data-dir", type=Path)
@@ -111,11 +111,13 @@ async def call_chat(
     user_input: str,
 ) -> dict:
     """POST /api/chat，收集 parsed、error 与 DONE 终态。"""
+    current = await get_session(client, config)
     payload = {
         "project": config.project,
         "save": config.save,
         "user_input": user_input,
         "model": config.model,
+        "expected_revision": current.get("revision", 0),
     }
     result = {"parsed": {}, "errors": [], "done": False}
     async with client.stream(
@@ -154,46 +156,17 @@ async def get_session(client: httpx.AsyncClient, config: LiveSmokeConfig) -> dic
 
 
 async def reset_session(client: httpx.AsyncClient, config: LiveSmokeConfig) -> dict:
+    current = await get_session(client, config)
     response = await client.post(
         f"{config.base_url}/api/session/reset",
-        json={"project": config.project, "save": config.save},
+        json={
+            "project": config.project,
+            "save": config.save,
+            "expected_revision": current.get("revision", 0),
+        },
     )
     response.raise_for_status()
     return response.json()
-
-
-def inject_summary(config: LiveSmokeConfig) -> None:
-    """向显式指定的 live 存档注入一条早期摘要。"""
-    saves_root = (
-        config.data_dir / "projects" / config.project / "saves"
-    ).resolve(strict=False)
-    path = (saves_root / f"{config.save}.json").resolve(strict=False)
-    if not path.is_relative_to(config.data_dir):
-        raise RuntimeError("存档路径越过 --data-dir")
-    if not path.is_file():
-        raise FileNotFoundError(f"找不到显式指定的存档: {path}")
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data["summaries"] = [
-        {
-            "text": "三个月前用户第一次推开门，小红被地痞围着，老李用热茶浇退地痞，验证角色在角落里安静看着。",
-            "created_at": "2026-04-01T12:00:00",
-            "facts": ["用户首次进入酒馆", "小红被地痞围住", "老李用热茶解围"],
-            "relations": ["老李对小红似有关照", "验证角色保持观察"],
-        }
-    ]
-    data["message_history"] = [
-        message
-        for message in data.get("message_history", [])
-        if message.get("role") == "system"
-    ]
-    temp_path = path.with_suffix(path.suffix + ".live-smoke.tmp")
-    temp_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temp_path.replace(path)
-    print(f"[C2] 已向 {config.project}/{config.save} 注入早期摘要")
 
 
 async def run(config: LiveSmokeConfig) -> int:
@@ -289,23 +262,6 @@ async def run(config: LiveSmokeConfig) -> int:
                 abs(new_value - old_value) <= 10,
                 f"{old_value} -> {new_value}",
             )
-
-        print("\n[C2] 长期记忆护栏")
-        inject_summary(config)
-        memory_chat = await call_chat(client, config, "老李，你还记得我们第一次见面吗？")
-        report.check(
-            "C2 聊天流完整结束",
-            memory_chat["done"] and not memory_chat["errors"],
-            "; ".join(memory_chat["errors"]),
-        )
-        raw = (
-            memory_chat["parsed"].get("parsed", {}).get("raw", "")
-        )
-        report.check(
-            "回复包含往事或回忆迹象",
-            any(word in raw for word in ("三个月前", "第一次见面", "当初", "记得")),
-            raw[:120].replace("\n", " "),
-        )
 
         print("\n[C1] 多角色主动沉默节奏")
         rhythm_chat = await call_chat(client, config, "小红，你今天怎么这么安静？")

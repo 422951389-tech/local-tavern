@@ -39,3 +39,15 @@ test('security module loads before app and app has one escaping entry point', ()
     assert.match(app, /aria-live/);
     assert.doesNotMatch(app, /\$\{c\.affinity\}/);
 });
+
+test('session writes carry revisions and message actions prefer UUIDs', () => {
+    const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.js'), 'utf8');
+    assert.match(app, /expected_revision:\s*currentRevision\(\)/);
+    assert.match(app, /expected_revision:\s*expectedRevision/);
+    assert.match(app, /dataset\.messageId/);
+    assert.match(app, /message_id:\s*messageId\s*\|\|\s*undefined/);
+    assert.match(app, /data\.type === 'conflict'/);
+    assert.equal((app.match(/function enterMessageEditMode\s*\(/g) || []).length, 1);
+    assert.equal((app.match(/function enterSummaryEditMode\s*\(/g) || []).length, 1);
+    assert.doesNotMatch(app, /function enterEditMode\s*\(/);
+});

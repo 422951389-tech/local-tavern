@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from uuid import UUID
 
 from core import session_manager
 from core.import_validation import MAX_IMPORT_BYTES, validate_import_json
@@ -39,27 +40,41 @@ class ImportValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "affinity"):
             validate_import_json(json.dumps(fixture, ensure_ascii=False))
 
+    def test_revision_and_message_uuid_are_strictly_validated(self):
+        fixture = valid_session()
+        fixture["revision"] = -1
+        with self.assertRaisesRegex(ValueError, "revision"):
+            validate_import_json(json.dumps(fixture, ensure_ascii=False))
+
+        fixture = valid_session()
+        fixture["revision"] = "2"
+        with self.assertRaisesRegex(ValueError, "revision"):
+            validate_import_json(json.dumps(fixture, ensure_ascii=False))
+
+        fixture = valid_session()
+        fixture["message_history"][0]["id"] = "not-a-uuid"
+        with self.assertRaisesRegex(ValueError, "消息 id 必须是 UUID"):
+            validate_import_json(json.dumps(fixture, ensure_ascii=False))
+
 
 class IsolatedImportWriteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.old_root = session_manager.ROOT_DIR
-        self.old_locks = session_manager._save_locks
-        self.old_guard = session_manager._locks_guard
         session_manager.ROOT_DIR = Path(self.tempdir.name) / "projects"
-        session_manager._save_locks = {}
-        session_manager._locks_guard = asyncio.Lock()
+        session_manager.clear_session_stores_for_testing()
 
     async def asyncTearDown(self):
         session_manager.ROOT_DIR = self.old_root
-        session_manager._save_locks = self.old_locks
-        session_manager._locks_guard = self.old_guard
+        session_manager.clear_session_stores_for_testing()
         self.tempdir.cleanup()
 
     async def test_valid_html_like_text_is_saved_as_literal_text(self):
+        fixture = valid_session()
+        fixture["revision"] = 99
         data = await session_manager.import_session(
             "测试项目",
-            json.dumps(valid_session(), ensure_ascii=False),
+            json.dumps(fixture, ensure_ascii=False),
             "导入 剧情",
         )
         target = session_manager.ROOT_DIR / "测试项目" / "saves" / "导入_剧情.json"
@@ -67,6 +82,9 @@ class IsolatedImportWriteTests(unittest.IsolatedAsyncioTestCase):
         saved = json.loads(target.read_text(encoding="utf-8"))
         self.assertEqual(saved["message_history"][0]["content"], "<script>alert('literal')</script>")
         self.assertEqual(data["session_id"], "导入_剧情")
+        self.assertEqual(saved["revision"], 1)
+        self.assertEqual(data["revision"], 1)
+        UUID(saved["message_history"][0]["id"])
 
     async def test_missing_display_name_falls_back_to_session_id(self):
         fixture = valid_session()

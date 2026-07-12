@@ -20,7 +20,8 @@ _WINDOWS_RESERVED = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
-_SNAPSHOT_TIMESTAMP_RE = r"\d{8}_\d{6}"
+# 兼容旧秒级名称，并允许 DATA-1 的“微秒 + 随机后缀”防碰撞名称。
+_SNAPSHOT_TIMESTAMP_RE = r"\d{8}_\d{6}(?:_\d{6}(?:_[0-9a-f]{8})?)?"
 
 
 class PathPolicyError(ValueError):

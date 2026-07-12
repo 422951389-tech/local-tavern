@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import (
     BaseModel,
@@ -29,6 +30,7 @@ MAX_SUMMARIES = 2_000
 ShortText = Annotated[StrictStr, Field(max_length=MAX_SHORT_TEXT)]
 MessageText = Annotated[StrictStr, Field(max_length=MAX_MESSAGE_TEXT)]
 Affinity = Annotated[StrictInt | StrictFloat, Field(ge=0, le=100)]
+Revision = Annotated[StrictInt, Field(ge=0)]
 
 
 class ImportModel(BaseModel):
@@ -36,11 +38,22 @@ class ImportModel(BaseModel):
 
 
 class ImportedMessage(ImportModel):
+    id: StrictStr = ""
     role: Literal["user", "assistant"]
     content: MessageText
     thinking: MessageText = ""
     pinned: StrictBool = False
     in_prompt: StrictBool = True
+
+    @field_validator("id")
+    @classmethod
+    def validate_message_id(cls, value: str) -> str:
+        if not value:
+            return value
+        try:
+            return str(UUID(value))
+        except ValueError as exc:
+            raise ValueError("消息 id 必须是 UUID") from exc
 
 
 class ImportedSceneMeta(ImportModel):
@@ -82,6 +95,7 @@ class ImportedSession(ImportModel):
     session_id: StrictStr
     name: ShortText = ""
     project: ShortText = ""
+    revision: Revision = 0
     created_at: ShortText = ""
     updated_at: ShortText = ""
     current_model: ShortText = ""

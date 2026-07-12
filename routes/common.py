@@ -1,30 +1,25 @@
 """server.py 与路由模块共享的依赖与工具函数。"""
-import json
-import logging
-from datetime import datetime
-from typing import Optional
+from typing import Annotated, Optional
 
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictInt
 
 from core.ollama_client import get_client
 from core.character_loader import list_characters, load_user_profile
 from core.config import DEFAULT_SAVE
 from core.session_manager import (
-    atomic_write,
-    _saves_dir,
+    RevisionConflict,
     DEFAULT_SAVE as _SESSION_DEFAULT_SAVE,
 )
 from core.path_policy import (
     PathPolicyError,
     display_name_to_id,
-    resolve_under,
     validate_file_id,
 )
 # 单一事实源：DEFAULT_SAVE 从 config 导入，session_manager 中的同名常量 _SESSION_DEFAULT_SAVE 仅作内部用
 del _SESSION_DEFAULT_SAVE
 
-logger = logging.getLogger(__name__)
+ExpectedRevision = Annotated[StrictInt, Field(ge=0)]
 
 
 class ChatRequest(BaseModel):
@@ -32,6 +27,7 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
     project: str = "默认项目"
     save: str = DEFAULT_SAVE
+    expected_revision: ExpectedRevision
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
@@ -42,6 +38,7 @@ class ChatRequest(BaseModel):
 class SessionResetRequest(BaseModel):
     project: str = "默认项目"
     save: str = DEFAULT_SAVE
+    expected_revision: ExpectedRevision
 
 
 class SaveCreateRequest(BaseModel):
@@ -53,11 +50,13 @@ class SaveRenameRequest(BaseModel):
     project: str = "默认项目"
     save: str
     new_name: str
+    expected_revision: ExpectedRevision
 
 
 class SaveDeleteRequest(BaseModel):
     project: str = "默认项目"
     save: str
+    expected_revision: ExpectedRevision
 
 
 class SaveImportRequest(BaseModel):
@@ -69,11 +68,28 @@ class SaveImportRequest(BaseModel):
 class MessageAction(BaseModel):
     action: str
     index: Optional[int] = None
+    message_id: Optional[str] = None
     content: Optional[str] = None
     in_prompt: Optional[bool] = None
+    expected_revision: ExpectedRevision
 
 
-# _saves_dir 已从 session_manager 导入，删除本模块重复定义（P1-6）
+def _expected_revision(body: dict) -> int:
+    value = body.get("expected_revision")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HTTPException(400, "缺少或无效 expected_revision")
+    return value
+
+
+def _raise_revision_conflict(exc: RevisionConflict) -> None:
+    raise HTTPException(
+        409,
+        detail={
+            "code": "revision_conflict",
+            "expected_revision": exc.expected,
+            "current_revision": exc.current,
+        },
+    ) from exc
 
 
 def _norm_save(save: Optional[str]) -> str:
@@ -133,20 +149,6 @@ async def _initialize_session_from_profiles(session: dict, project: str):
                     break
             else:
                 session["current_model"] = models[0]
-
-
-async def _save_snapshot(session: dict, project: str):
-    d = resolve_under(_saves_dir(project), ".history")
-    d.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    try:
-        sid = validate_file_id(session.get("session_id", DEFAULT_SAVE), label="存档 ID")
-        path = resolve_under(d, f"{sid}.{ts}.json")
-    except PathPolicyError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    session_copy = dict(session)
-    session_copy["_snapshot_at"] = datetime.now().isoformat()
-    atomic_write(path, json.dumps(session_copy, ensure_ascii=False, indent=2))
 
 
 def apply_character_state(state: dict, parsed_char: dict):
