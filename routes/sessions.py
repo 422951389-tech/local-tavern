@@ -34,7 +34,12 @@ async def api_list_sessions(project: str = "默认项目"):
 @router.post("/api/sessions")
 async def api_create_session(req: SaveCreateRequest):
     project = _norm_project(req.project)
-    s = await create_session(project, req.name)
+    try:
+        s = await create_session(project, req.name)
+    except FileExistsError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     await _initialize_session_from_profiles(s, project)
     await save_session(s, project, s["session_id"])
     return s
@@ -74,6 +79,8 @@ async def api_import_session(req: SaveImportRequest):
     project = _norm_project(req.project)
     try:
         return await import_session(project, req.json_str, req.name)
+    except FileExistsError as e:
+        raise HTTPException(409, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
 

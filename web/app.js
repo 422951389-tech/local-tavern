@@ -1,6 +1,8 @@
 // 本地酒馆 — 前端逻辑 v2（项目+存档双层架构）
 // 流式对话、角色卡渲染、行动建议、会话管理、提示词编辑
 
+if (!globalThis.TavernSecurity) throw new Error('安全渲染模块未加载');
+
 const API = {
     models: '/api/models',
     characters: '/api/characters',
@@ -339,6 +341,11 @@ async function createNewSave(name) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ project: state.currentProject, name }),
     });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        showToast('创建失败：' + (err.detail || `HTTP ${res.status}`));
+        return null;
+    }
     const session = await res.json();
     await loadSaveList();
     state.currentSave = session.session_id;
@@ -403,15 +410,20 @@ async function exportCurrentSave() {
 }
 
 async function importSave(file) {
+    const validationError = TavernSecurity.validateImportFile(file);
+    if (validationError) throw new Error(validationError);
     const text = await file.text();
     const res = await fetch(API.sessionImport, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ project: state.currentProject, json_str: text, name: file.name.replace(/\.json$/i, '') }),
     });
-    if (!res.ok) { const err = await res.json(); alert('导入失败：' + (err.detail || '')); return; }
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+    }
     await loadSaveList();
-    alert('导入成功');
+    return true;
 }
 
 async function switchProject(newProject) {
@@ -446,8 +458,9 @@ async function createNewProject(name) {
         body: JSON.stringify({ name }),
     });
     if (!res.ok) { const err = await res.json(); alert('创建失败：' + (err.detail || '')); return; }
+    const created = await res.json();
     await loadProjects();
-    await switchProject(name);
+    await switchProject(created.name);
 }
 
 // ===== 渲染 =====
@@ -471,17 +484,18 @@ function renderCharacterPanel(charactersState) {
     if (ids.length === 0) { list.innerHTML = '<p class="empty">无角色数据</p>'; return; }
     list.innerHTML = ids.map(cid => {
         const c = charactersState[cid];
-        const bar = renderAffinityBar(c.affinity || 0);
+        const affinity = TavernSecurity.normalizeAffinity(c.affinity);
+        const bar = renderAffinityBar(affinity);
         return `<div class="panel-char">
             <div class="name">${escapeHtml(c.name || cid)}</div>
-            <div class="affinity-bar">${bar} ${c.affinity || 0}%</div>
+            <div class="affinity-bar">${bar} ${affinity}%</div>
             ${c.mood ? `<div style="color:var(--text-dim);font-size:11px">心情: ${escapeHtml(c.mood)}</div>` : ''}
         </div>`;
     }).join('');
 }
 
 function renderAffinityBar(percent) {
-    const filled = Math.round(percent / 10);
+    const filled = Math.round(TavernSecurity.normalizeAffinity(percent) / 10);
     return '█'.repeat(filled) + '░'.repeat(10 - filled);
 }
 
@@ -735,13 +749,14 @@ function renderParsedResponse(parsed) {
         contentEl.appendChild(metaDiv);
     }
 
-    parsed.characters.forEach(c => {
+    (parsed.characters || []).forEach(c => {
         const card = document.createElement('div');
         card.className = 'character-card';
+        const affinity = TavernSecurity.normalizeAffinity(c.affinity);
         card.innerHTML = `
             <div class="char-header">
                 <span class="char-name">🎭 ${escapeHtml(c.name)}</span>
-                <span class="char-affinity">${renderAffinityBar(c.affinity)} ${c.affinity}%</span>
+                <span class="char-affinity">${renderAffinityBar(affinity)} ${affinity}%</span>
             </div>
             ${c.inner_thought ? `<div class="char-row"><strong>💭 内心:</strong> ${escapeHtml(c.inner_thought)}</div>` : ''}
             ${c.outfit ? `<div class="char-row"><strong>👗 穿着:</strong> ${escapeHtml(c.outfit)}</div>` : ''}
@@ -882,9 +897,7 @@ function makeSummaryLine(label, val) {
 }
 
 function escapeHtml(str) {
-    const d = document.createElement('div');
-    d.textContent = str;
-    return d.innerHTML;
+    return TavernSecurity.escapeHtml(str);
 }
 
 function enterEditMode(panel, summary, index) {
@@ -1962,22 +1975,36 @@ function promptForRenameSave() {
 }
 
 function promptForImportSave() {
+    const body = document.createElement('div');
     const inp = document.createElement('input');
     inp.type = 'file'; inp.accept = '.json';
+    inp.setAttribute('aria-describedby', 'save-import-status');
+    const status = document.createElement('p');
+    status.id = 'save-import-status';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    status.style.cssText = 'min-height:20px;margin-top:8px;color:var(--text-dim)';
+    body.appendChild(inp);
+    body.appendChild(status);
     inp.addEventListener('change', async (e) => {
         const file = e.target.files[0];
-        if (file) { await importSave(file); hideModal(); }
+        if (!file) return;
+        inp.disabled = true;
+        status.textContent = '正在验证并导入…';
+        try {
+            await importSave(file);
+            status.textContent = '导入成功';
+            showToast('存档导入成功');
+            hideModal();
+        } catch (error) {
+            status.textContent = '导入失败：' + error.message;
+            inp.disabled = false;
+            inp.value = '';
+            inp.focus();
+        }
     });
-    showModal({ title: '导入存档', body: inp });
+    showModal({ title: '导入存档', body });
     inp.click();
-}
-
-// ===== 工具 =====
-function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
 }
 
 function scrollToBottom() {

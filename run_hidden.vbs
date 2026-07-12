@@ -1,6 +1,6 @@
 ' run_hidden.vbs - Local Tavern silent launcher
 ' Launches uvicorn in a hidden window, waits for the port, then opens the browser.
-' Stop the server: stop_tavern.bat  or  end python.exe in Task Manager.
+' Stop the server: stop_tavern.bat (only the PID registered by this project).
 Option Explicit
 
 Dim fso, shell, port, url, appDir

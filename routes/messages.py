@@ -11,6 +11,7 @@ from core.session_manager import (
     toggle_pinned,
     count_pinned,
     _saves_dir,
+    resolve_snapshot_path,
 )
 from routes.common import (
     MessageAction,
@@ -20,6 +21,18 @@ from routes.common import (
 )
 
 router = APIRouter()
+
+
+def _validate_snapshot_owner(snapshot: dict, project: str, save: str, snapshot_type: str) -> None:
+    session_id = snapshot.get("session_id")
+    if session_id is not None and session_id != save:
+        raise HTTPException(400, "快照内容不属于当前存档")
+    snapshot_project = snapshot.get("project")
+    if snapshot_project is not None and snapshot_project != project:
+        raise HTTPException(400, "快照内容不属于当前项目")
+    declared_type = snapshot.get("_snapshot_type")
+    if declared_type and declared_type != snapshot_type:
+        raise HTTPException(400, "快照内容类型与文件名不一致")
 
 
 @router.get("/api/session")
@@ -111,7 +124,10 @@ async def api_get_snapshot(project: str = Query("默认项目"), save: str = Que
         raise HTTPException(400, "缺少 filename")
     save = _norm_save(save)
     project = _norm_project(project)
-    path = _saves_dir(project) / ".history" / filename
+    try:
+        path, snap_type = resolve_snapshot_path(project, save, filename)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not path.exists():
         raise HTTPException(404, "快照不存在")
     try:
@@ -120,11 +136,7 @@ async def api_get_snapshot(project: str = Query("默认项目"), save: str = Que
     except (json.JSONDecodeError, OSError) as e:
         raise HTTPException(400, f"快照读取失败: {e}")
 
-    snap_type = snapshot.get("_snapshot_type", "")
-    if ".trim." in filename:
-        snap_type = "trim"
-    elif not snap_type:
-        snap_type = "reset" if ".reset." in filename else "snapshot"
+    _validate_snapshot_owner(snapshot, project, save, snap_type)
 
     messages = snapshot.get("message_history", [])
     if snap_type == "trim":
@@ -147,9 +159,15 @@ async def api_restore_snapshot(req: Request):
     filename = body.get("filename")
     if not filename:
         raise HTTPException(400, "缺少 filename")
-    if ".trim." in filename:
-        raise HTTPException(400, "不能恢复 trim 快照（仅含被截消息，非完整存档）")
-    path = _saves_dir(project) / ".history" / filename
+    try:
+        path, snap_type = resolve_snapshot_path(
+            project,
+            save,
+            filename,
+            allowed_types=("snapshot", "reset"),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not path.exists():
         raise HTTPException(404, "快照不存在")
     try:
@@ -157,6 +175,9 @@ async def api_restore_snapshot(req: Request):
             snapshot = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         raise HTTPException(400, f"快照读取失败: {e}")
+    _validate_snapshot_owner(snapshot, project, save, snap_type)
+    snapshot["session_id"] = save
+    snapshot["project"] = project
     snapshot["updated_at"] = datetime.now().isoformat()
     await save_session(snapshot, project, save)
     return snapshot

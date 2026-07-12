@@ -19,12 +19,19 @@
 import json
 import logging
 import asyncio
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from core.config import MAX_MESSAGES_IN_SAVE, HARD_LIMIT, PROJECTS_DIR, DEFAULT_SAVE
+from core.import_validation import validate_import_json
+from core.path_policy import (
+    display_name_to_id,
+    resolve_saves_dir,
+    resolve_snapshot_path as _resolve_snapshot_path,
+    resolve_under,
+    validate_file_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,8 @@ async def _get_save_lock(project: str, save_id: str) -> asyncio.Lock:
     按存档隔离并发：不同项目、不同存档互不阻塞，同一存档串行写。
     _locks_guard 负责安全地创建新锁。
     """
+    project = validate_file_id(project, label="项目 ID")
+    save_id = validate_file_id(save_id, label="存档 ID")
     key = f"{project}/{save_id}"
     lock = _save_locks.get(key)
     if lock is not None:
@@ -53,10 +62,36 @@ async def _get_save_lock(project: str, save_id: str) -> asyncio.Lock:
 
 
 def _saves_dir(project: str) -> Path:
-    """获取项目的存档目录"""
-    d = ROOT_DIR / project / "saves"
+    """获取已通过 resolve 边界检查的项目存档目录。"""
+    d = resolve_saves_dir(ROOT_DIR, project)
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _session_path(project: str, save_id: str) -> Path:
+    save_id = validate_file_id(save_id, label="存档 ID")
+    return resolve_under(_saves_dir(project), f"{save_id}.json")
+
+
+def _history_dir(project: str) -> Path:
+    return resolve_under(_saves_dir(project), ".history")
+
+
+def resolve_snapshot_path(
+    project: str,
+    save_id: str,
+    filename: str,
+    *,
+    allowed_types: tuple[str, ...] = ("snapshot", "reset", "trim"),
+) -> tuple[Path, str]:
+    """按当前可注入 ROOT_DIR 解析并校验外部快照文件名。"""
+    return _resolve_snapshot_path(
+        ROOT_DIR,
+        project,
+        save_id,
+        filename,
+        allowed_types=allowed_types,
+    )
 
 
 def atomic_write(path: Path, data: str):
@@ -88,7 +123,7 @@ def _empty_session(save_id: str = DEFAULT_SAVE, project: str = "默认项目") -
 
 
 def load_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
-    path = _saves_dir(project) / f"{save_id}.json"
+    path = _session_path(project, save_id)
     if not path.exists():
         return _empty_session(save_id, project)
     try:
@@ -125,7 +160,7 @@ async def save_session(session: dict, project: str, save_id: str):
         session["updated_at"] = datetime.now().isoformat()
         session["session_id"] = save_id
         session["project"] = project
-        path = _saves_dir(project) / f"{save_id}.json"
+        path = _session_path(project, save_id)
         if path.exists() and old_version:
             try:
                 current = json.loads(path.read_text(encoding="utf-8"))
@@ -198,11 +233,11 @@ def trim_history(session: dict, max_messages: int = MAX_MESSAGES_IN_SAVE, projec
 
 def _save_trim_snapshot(session: dict, project: str, dropped: list):
     """把截断掉的消息整体存为 trim 快照（区别于 regenerate 的全量快照）。"""
-    d = _saves_dir(project) / ".history"
+    d = _history_dir(project)
     d.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sid = session.get("session_id", DEFAULT_SAVE) or DEFAULT_SAVE
-    path = d / f"{sid}.trim.{ts}.json"
+    sid = validate_file_id(session.get("session_id", DEFAULT_SAVE) or DEFAULT_SAVE, label="存档 ID")
+    path = resolve_under(d, f"{sid}.trim.{ts}.json")
     payload = {
         "_snapshot_at": datetime.now().isoformat(),
         "_snapshot_type": "trim",
@@ -237,7 +272,8 @@ def list_trim_snapshots(project: str, save_id: str = DEFAULT_SAVE) -> list[dict]
 
     用于前端调试面板，让用户看到"哪些原文被总结覆盖了"。
     """
-    d = _saves_dir(project) / ".history"
+    save_id = validate_file_id(save_id, label="存档 ID")
+    d = _history_dir(project)
     if not d.exists():
         return []
     out = []
@@ -265,12 +301,13 @@ def reset_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
     - .history/{sid}.trim.*.json（trim 快照）保留不动
     - .history/{sid}.{ts}.json（regenerate 全量快照）保留不动
     """
-    path = _saves_dir(project) / f"{save_id}.json"
+    save_id = validate_file_id(save_id, label="存档 ID")
+    path = _session_path(project, save_id)
     if path.exists():
-        archive_dir = _saves_dir(project) / ".history"
+        archive_dir = _history_dir(project)
         archive_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_path = archive_dir / f"{save_id}.reset.{ts}.json"
+        archive_path = resolve_under(archive_dir, f"{save_id}.reset.{ts}.json")
         try:
             atomic_write(archive_path, path.read_text(encoding="utf-8"))
         except OSError as e:
@@ -282,10 +319,8 @@ def reset_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
 # ============ 多存档管理 ============
 
 def _safe_filename(name: str) -> str:
-    name = re.sub(r'\.(json|tmp)$', '', name, flags=re.IGNORECASE)
-    name = re.sub(r'[\\/:*?"<>|\s]', '_', name)
-    name = name.strip('_')
-    return name[:80] if name else "save"
+    """兼容旧调用名：仅用于把新资源显示名转换为磁盘 ID。"""
+    return display_name_to_id(name, label="存档显示名")
 
 
 def list_sessions(project: str) -> list[dict]:
@@ -312,20 +347,16 @@ def list_sessions(project: str) -> list[dict]:
 
 
 def session_exists(project: str, save_id: str) -> bool:
-    """save_id 应是已 safe 的文件名 stem（路由入口 _norm_save 把关）。"""
-    return (_saves_dir(project) / f"{save_id}.json").exists()
+    return _session_path(project, save_id).exists()
 
 
 async def create_session(project: str, name: str) -> dict:
     safe = _safe_filename(name)
-    final = safe
-    i = 2
-    while session_exists(project, final):
-        final = f"{safe}_{i}"
-        i += 1
-    s = _empty_session(final, project)
-    s["name"] = name
-    await save_session(s, project, final)
+    if session_exists(project, safe):
+        raise FileExistsError(f"存档 ID {safe} 已存在；请使用不会产生规范化碰撞的名称")
+    s = _empty_session(safe, project)
+    s["name"] = name.strip()
+    await save_session(s, project, safe)
     return s
 
 
@@ -333,23 +364,23 @@ async def rename_session(project: str, old_id: str, new_name: str) -> dict:
     if not session_exists(project, old_id):
         raise FileNotFoundError(f"存档 {old_id} 不存在")
     session = load_session(project, old_id)
-    session["name"] = new_name
     new_safe = _safe_filename(new_name)
+    session["name"] = new_name.strip()
     if new_safe != old_id:
         if session_exists(project, new_safe):
             raise FileExistsError(f"存档 {new_safe} 已存在")
         # 迁移历史快照 → 先写新文件再删旧文件，防止磁盘故障导致数据丢失
-        hist_dir = _saves_dir(project) / ".history"
+        hist_dir = _history_dir(project)
         if hist_dir.exists():
             for p in hist_dir.iterdir():
                 if p.name.startswith(old_id + "."):
                     new_filename = new_safe + p.name[len(old_id):]
                     try:
-                        p.rename(hist_dir / new_filename)
+                        p.rename(resolve_under(hist_dir, new_filename))
                     except OSError:
                         pass
         await save_session(session, project, new_safe)
-        (_saves_dir(project) / f"{old_id}.json").unlink()
+        _session_path(project, old_id).unlink()
     else:
         await save_session(session, project, old_id)
     return session
@@ -359,7 +390,7 @@ async def delete_session(project: str, save_id: str) -> bool:
     sessions = list_sessions(project)
     if len(sessions) <= 1 and session_exists(project, save_id):
         raise ValueError("至少保留 1 个存档")
-    path = _saves_dir(project) / f"{save_id}.json"
+    path = _session_path(project, save_id)
     if path.exists():
         path.unlink()
         return True
@@ -371,26 +402,14 @@ def export_session(project: str, save_id: str) -> str:
 
 
 async def import_session(project: str, json_str: str, name: str = None) -> dict:
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"JSON 解析失败: {e}")
-    if "session_id" not in data:
-        raise ValueError("缺少 session_id 字段")
-    target_name = name or data.get("name", data["session_id"])
+    data = validate_import_json(json_str)
+    target_name = name or data.get("name") or data["session_id"]
     safe = _safe_filename(target_name)
     if session_exists(project, safe):
-        safe = f"{safe}_imported"
+        raise FileExistsError(f"存档 ID {safe} 已存在；导入未写入任何文件")
     data["session_id"] = safe
-    data["name"] = target_name
+    data["name"] = target_name.strip()
     data["project"] = project
-    # 校验 history 条目 schema，仅保留合法角色
-    history = data.get("message_history")
-    if isinstance(history, list):
-        original_len = len(history)
-        data["message_history"] = [m for m in history if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
-        if len(data["message_history"]) < original_len:
-            logger.warning("导入时剔除了 %d 条非法 role 的 history 条目", original_len - len(data["message_history"]))
     await save_session(data, project, safe)
     return data
 

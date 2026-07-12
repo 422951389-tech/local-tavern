@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 import yaml
 
 from core.config import PROJECTS_DIR
+from core.path_policy import (
+    PathPolicyError,
+    resolve_project_dir,
+    resolve_under,
+    validate_file_id,
+)
 
 ROOT_DIR = PROJECTS_DIR
 
@@ -93,11 +99,21 @@ def list_projects() -> list[str]:
     """列出所有项目目录"""
     if not ROOT_DIR.exists():
         return []
-    return sorted([p.name for p in ROOT_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")])
+    projects = []
+    for path in ROOT_DIR.iterdir():
+        if not path.is_dir() or path.name.startswith("."):
+            continue
+        try:
+            project_id = validate_file_id(path.name, label="项目 ID")
+            resolve_project_dir(ROOT_DIR, project_id)
+            projects.append(project_id)
+        except PathPolicyError:
+            logger.warning("忽略不符合路径策略的项目目录: %s", path.name)
+    return sorted(projects)
 
 
 def get_project_dir(name: str) -> Path:
-    return ROOT_DIR / name
+    return resolve_project_dir(ROOT_DIR, name)
 
 
 def ensure_project(name: str) -> Path:
@@ -109,11 +125,11 @@ def ensure_project(name: str) -> Path:
     """
     from core.session_manager import _empty_session, atomic_write, DEFAULT_SAVE
     d = get_project_dir(name)
-    (d / "characters").mkdir(parents=True, exist_ok=True)
-    (d / "worldbook").mkdir(parents=True, exist_ok=True)
-    saves_dir = d / "saves"
+    resolve_under(d, "characters").mkdir(parents=True, exist_ok=True)
+    resolve_under(d, "worldbook").mkdir(parents=True, exist_ok=True)
+    saves_dir = resolve_under(d, "saves")
     saves_dir.mkdir(parents=True, exist_ok=True)
-    default_save_path = saves_dir / f"{DEFAULT_SAVE}.json"
+    default_save_path = resolve_under(saves_dir, f"{DEFAULT_SAVE}.json")
     if not default_save_path.exists():
         atomic_write(default_save_path, json.dumps(_empty_session(DEFAULT_SAVE, name), ensure_ascii=False, indent=2))
     return d
@@ -129,25 +145,22 @@ def load_yaml(path: Path) -> dict:
 
 
 def _safe_id(char_id: str) -> str:
-    if not char_id:
-        raise ValueError("id 不能为空")
+    char_id = validate_file_id(char_id, label="条目 ID")
     if char_id.startswith("_"):
         raise ValueError("id 不能以下划线开头")
-    for ch in char_id:
-        if ch in "\\/:*?\"<>|":
-            raise ValueError(f"id 包含非法字符: {ch}")
     return char_id
 
 
 # ========== 角色卡 ==========
 
 def load_character(project: str, char_id: str) -> dict:
-    path = get_project_dir(project) / "characters" / f"{char_id}.yaml"
+    char_id = _safe_id(char_id)
+    path = resolve_under(get_project_dir(project), "characters", f"{char_id}.yaml")
     return load_yaml(path)
 
 
 def list_characters(project: str) -> list[dict]:
-    d = get_project_dir(project) / "characters"
+    d = resolve_under(get_project_dir(project), "characters")
     if not d.exists():
         return []
     chars = []
@@ -165,8 +178,8 @@ def save_character(project: str, char_id: str, data: dict) -> Path:
     if data.get("id") and data["id"] != char_id:
         raise ValueError(f"文件 id({char_id}) 与内容 id({data['id']}) 不一致")
     data["id"] = char_id
-    d = ensure_project(project) / "characters"
-    path = d / f"{char_id}.yaml"
+    d = resolve_under(ensure_project(project), "characters")
+    path = resolve_under(d, f"{char_id}.yaml")
     _atomic_dump(path, data)
     return path
 
@@ -180,7 +193,7 @@ def delete_character(project: str, char_id: str, session: dict = None) -> bool:
     import logging
     logger = logging.getLogger(__name__)
     char_id = _safe_id(char_id)
-    path = get_project_dir(project) / "characters" / f"{char_id}.yaml"
+    path = resolve_under(get_project_dir(project), "characters", f"{char_id}.yaml")
     deleted = False
     if path.exists():
         path.unlink()
@@ -198,7 +211,7 @@ def delete_character(project: str, char_id: str, session: dict = None) -> bool:
 # ========== 世界书 ==========
 
 def load_worldbook(project: str) -> list[dict]:
-    d = get_project_dir(project) / "worldbook"
+    d = resolve_under(get_project_dir(project), "worldbook")
     if not d.exists():
         return []
     entries = []
@@ -216,8 +229,8 @@ def save_worldbook(project: str, entry_id: str, data: dict) -> Path:
     if data.get("id") and data["id"] != entry_id:
         raise ValueError(f"文件 id({entry_id}) 与内容 id({data['id']}) 不一致")
     data["id"] = entry_id
-    d = ensure_project(project) / "worldbook"
-    path = d / f"{entry_id}.yaml"
+    d = resolve_under(ensure_project(project), "worldbook")
+    path = resolve_under(d, f"{entry_id}.yaml")
     _atomic_dump(path, data)
     return path
 
@@ -225,7 +238,7 @@ def save_worldbook(project: str, entry_id: str, data: dict) -> Path:
 def delete_worldbook_entry(project: str, entry_id: str) -> bool:
     """删除世界书条目 YAML。"""
     entry_id = _safe_id(entry_id)
-    path = get_project_dir(project) / "worldbook" / f"{entry_id}.yaml"
+    path = resolve_under(get_project_dir(project), "worldbook", f"{entry_id}.yaml")
     if not path.exists():
         return False
     path.unlink()
@@ -235,13 +248,13 @@ def delete_worldbook_entry(project: str, entry_id: str) -> bool:
 # ========== 用户档案 ==========
 
 def load_user_profile(project: str) -> dict:
-    path = get_project_dir(project) / "user.yaml"
+    path = resolve_under(get_project_dir(project), "user.yaml")
     return load_yaml(path)
 
 
 def save_user_profile(project: str, data: dict) -> Path:
     d = ensure_project(project)
-    path = d / "user.yaml"
+    path = resolve_under(d, "user.yaml")
     _atomic_dump(path, data)
     return path
 
@@ -253,7 +266,7 @@ def delete_user_profile(project: str, session: dict = None) -> bool:
     """
     import logging
     logger = logging.getLogger(__name__)
-    path = get_project_dir(project) / "user.yaml"
+    path = resolve_under(get_project_dir(project), "user.yaml")
     deleted = False
     if path.exists():
         path.unlink()

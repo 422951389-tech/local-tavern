@@ -2,29 +2,29 @@
 import json
 import logging
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
-from fastapi import HTTPException, Request, Query
+from fastapi import HTTPException
 from pydantic import BaseModel
 
 from core.ollama_client import get_client
 from core.character_loader import list_characters, load_user_profile
-from core.config import PROJECTS_DIR, DEFAULT_SAVE
+from core.config import DEFAULT_SAVE
 from core.session_manager import (
-    load_session,
-    save_session,
     atomic_write,
-    _safe_filename,
     _saves_dir,
     DEFAULT_SAVE as _SESSION_DEFAULT_SAVE,
+)
+from core.path_policy import (
+    PathPolicyError,
+    display_name_to_id,
+    resolve_under,
+    validate_file_id,
 )
 # 单一事实源：DEFAULT_SAVE 从 config 导入，session_manager 中的同名常量 _SESSION_DEFAULT_SAVE 仅作内部用
 del _SESSION_DEFAULT_SAVE
 
 logger = logging.getLogger(__name__)
-
-ROOT_DIR = PROJECTS_DIR
 
 
 class ChatRequest(BaseModel):
@@ -77,13 +77,27 @@ class MessageAction(BaseModel):
 
 
 def _norm_save(save: Optional[str]) -> str:
-    """路由入口归一化 save_id：确保进 session_manager 的一定是已 safe 的文件名 stem。"""
-    return _safe_filename(save) if save else DEFAULT_SAVE
+    """严格校验引用既有存档时使用的稳定 ID。"""
+    try:
+        return validate_file_id(save if save is not None else DEFAULT_SAVE, label="存档 ID")
+    except PathPolicyError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _norm_project(project: Optional[str]) -> str:
-    """路由入口归一化 project 名，阻止路径遍历攻击。"""
-    return _safe_filename(project) if project else "默认项目"
+    """严格校验引用既有项目时使用的稳定 ID。"""
+    try:
+        return validate_file_id(project if project is not None else "默认项目", label="项目 ID")
+    except PathPolicyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _id_from_display_name(name: str, *, label: str) -> str:
+    """新建/重命名入口专用：显示名生成 ID，引用入口不得调用。"""
+    try:
+        return display_name_to_id(name, label=label)
+    except PathPolicyError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 async def _initialize_session_from_profiles(session: dict, project: str):
@@ -122,11 +136,14 @@ async def _initialize_session_from_profiles(session: dict, project: str):
 
 
 async def _save_snapshot(session: dict, project: str):
-    d = _saves_dir(project) / ".history"
+    d = resolve_under(_saves_dir(project), ".history")
     d.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sid = session.get("session_id", DEFAULT_SAVE)
-    path = d / f"{sid}.{ts}.json"
+    try:
+        sid = validate_file_id(session.get("session_id", DEFAULT_SAVE), label="存档 ID")
+        path = resolve_under(d, f"{sid}.{ts}.json")
+    except PathPolicyError as exc:
+        raise HTTPException(400, str(exc)) from exc
     session_copy = dict(session)
     session_copy["_snapshot_at"] = datetime.now().isoformat()
     atomic_write(path, json.dumps(session_copy, ensure_ascii=False, indent=2))
