@@ -1,13 +1,14 @@
 """Prompt 编辑器 — 读/写/恢复提示词文件
 
 设计：
-- 主文件: C:/local-tavern/prompts/{name}.md
-- 默认备份: C:/local-tavern/prompts/.default/{name}.md（首次启动时拷贝）
+- 主文件: PROMPTS_DIR/{name}.md
+- 默认备份: PROMPTS_DIR/.default/{name}.md（首次启动时拷贝）
 """
 import shutil
-from pathlib import Path
 
-PROMPTS_DIR = Path("C:/local-tavern/prompts")
+from core.config import PROMPTS_DIR
+
+
 DEFAULT_DIR = PROMPTS_DIR / ".default"
 
 VALID_NAMES = ("system", "group_chat")

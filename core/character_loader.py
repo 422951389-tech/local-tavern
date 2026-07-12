@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 import yaml
 
-from core.config import PROJECTS_DIR
+from core.config import DATA_DIR, PROJECTS_DIR
 from core.path_policy import (
     PathPolicyError,
     resolve_project_dir,
@@ -286,7 +286,7 @@ def get_active_character_ids(project: str) -> list[str]:
 
 # ========== 兼容旧数据迁移 ==========
 
-OLD_DATA_DIR = Path("C:/local-tavern/data")
+OLD_DATA_DIR = DATA_DIR
 
 def needs_migration() -> bool:
     """检测是否有旧数据需要迁移"""

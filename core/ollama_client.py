@@ -13,9 +13,10 @@ from typing import AsyncIterator, Optional
 
 import httpx
 
+from core.config import OLLAMA_HOST
+
 logger = logging.getLogger(__name__)
 
-OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_TIMEOUT = 300.0  # 35B 首字可能慢
 
 
