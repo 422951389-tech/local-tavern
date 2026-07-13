@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Callable, Optional, TypeVar
 from uuid import uuid4
 
-from core.config import DEFAULT_SAVE, HARD_LIMIT, MAX_MESSAGES_IN_SAVE, PROJECTS_DIR
+from core.config import (
+    DEFAULT_SAVE,
+    HARD_LIMIT,
+    MAX_MESSAGES_IN_SAVE,
+    PROJECTS_DIR,
+    RECOVERY_DIR,
+    TRASH_RETENTION_DAYS,
+)
 from core.import_validation import validate_import_json
 from core.path_policy import (
     display_name_to_id,
@@ -23,6 +30,7 @@ from core.session_store import (
     SessionStore,
     atomic_write,
 )
+from core.recovery_store import RecoveryStore
 
 
 logger = logging.getLogger(__name__)
@@ -34,10 +42,18 @@ _stores: dict[str, SessionStore] = {}
 
 def get_session_store() -> SessionStore:
     root = Path(ROOT_DIR).resolve(strict=False)
-    key = str(root)
+    recovery_root = Path(RECOVERY_DIR).resolve(strict=False)
+    key = f"{root}|{recovery_root}"
     store = _stores.get(key)
     if store is None:
-        store = SessionStore(root)
+        store = SessionStore(
+            root,
+            RecoveryStore(
+                recovery_root,
+                projects_root=root,
+                retention_days=TRASH_RETENTION_DAYS,
+            ),
+        )
         _stores[key] = store
     return store
 
@@ -105,21 +121,13 @@ def new_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
 
 def load_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
     """纯读取：不创建目录、不 trim、不迁移磁盘内容。"""
-    try:
-        session = get_session_store().read_sync(project, save_id)
-        return session if session is not None else _empty_session(save_id, project)
-    except (json.JSONDecodeError, OSError, ValueError) as exc:
-        logger.error("存档加载失败，使用只读空视图: %s", exc)
-        return _empty_session(save_id, project)
+    session = get_session_store().read_sync(project, save_id)
+    return session if session is not None else _empty_session(save_id, project)
 
 
 async def aload_session(project: str, save_id: str = DEFAULT_SAVE) -> dict:
-    try:
-        session = await get_session_store().read(project, save_id)
-        return session if session is not None else _empty_session(save_id, project)
-    except (json.JSONDecodeError, OSError, ValueError) as exc:
-        logger.error("存档加载失败，使用只读空视图: %s", exc)
-        return _empty_session(save_id, project)
+    session = await get_session_store().read(project, save_id)
+    return session if session is not None else _empty_session(save_id, project)
 
 
 async def mutate_session(
@@ -263,11 +271,16 @@ async def reset_session(
 
     def reset(current: dict, context: MutationContext) -> None:
         if context.existed:
+            context.checkpoint("reset")
             context.snapshot("reset", current)
         current.clear()
         current.update(deepcopy(reset_value))
 
-    return (await mutate_session(project, save_id, expected_revision, reset)).session
+    mutation = await mutate_session(project, save_id, expected_revision, reset)
+    return {
+        "session": mutation.session,
+        "recovery_id": mutation.recovery_ids[-1] if mutation.recovery_ids else None,
+    }
 
 
 def _safe_filename(name: str) -> str:
@@ -275,28 +288,7 @@ def _safe_filename(name: str) -> str:
 
 
 def list_sessions(project: str) -> list[dict]:
-    saves_dir = _saves_dir(project)
-    if not saves_dir.exists():
-        return []
-    sessions: list[dict] = []
-    for path in saves_dir.glob("*.json"):
-        if path.stem.startswith("."):
-            continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            sessions.append({
-                "session_id": data.get("session_id", path.stem),
-                "name": data.get("name", path.stem),
-                "revision": data.get("revision", 0),
-                "updated_at": data.get("updated_at", ""),
-                "created_at": data.get("created_at", ""),
-                "message_count": len(data.get("message_history", [])),
-                "current_model": data.get("current_model", ""),
-            })
-        except (json.JSONDecodeError, OSError):
-            continue
-    sessions.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
-    return sessions
+    return get_session_store().list_sessions_sync(project)
 
 
 def session_exists(project: str, save_id: str) -> bool:
@@ -317,24 +309,74 @@ async def rename_session(
     expected_revision: int,
 ) -> dict:
     new_id = _safe_filename(new_name)
-    return await get_session_store().rename(
+    renamed = await get_session_store().rename(
         project,
         old_id,
         new_id,
         new_name.strip(),
         expected_revision,
     )
+    return {
+        "session": dict(renamed),
+        "recovery_id": renamed.recovery_id,
+    }
 
 
 async def delete_session(
     project: str,
     save_id: str,
     expected_revision: int,
-) -> bool:
-    return await get_session_store().delete(
+) -> dict:
+    deleted = await get_session_store().delete(
         project,
         save_id,
         expected_revision,
+    )
+    return {
+        "deleted": deleted is not None,
+        "recovery_id": deleted.recovery_id if deleted is not None else None,
+    }
+
+
+async def list_recovery_items(
+    *,
+    category: str | None = None,
+    project: str | None = None,
+    entity_type: str | None = None,
+) -> list[dict]:
+    return await get_session_store().list_recoveries(
+        category=category,
+        project=project,
+        entity_type=entity_type,
+    )
+
+
+async def quarantine_session(
+    project: str,
+    save_id: str,
+    fingerprint: str,
+) -> dict:
+    recovery, deduplicated = await get_session_store().quarantine_corrupt(
+        project,
+        save_id,
+        fingerprint,
+    )
+    return {
+        "recovery": recovery,
+        "deduplicated": deduplicated,
+    }
+
+
+async def restore_recovery_item(
+    recovery_id: str,
+    *,
+    expected_revision: int | None = None,
+    overwrite: bool = False,
+) -> dict:
+    return await get_session_store().restore_recovery(
+        recovery_id,
+        expected_revision=expected_revision,
+        overwrite=overwrite,
     )
 
 

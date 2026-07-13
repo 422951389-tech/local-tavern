@@ -245,20 +245,32 @@ async def api_restore_snapshot(req: Request):
         raise HTTPException(400, f"快照读取失败: {exc}") from exc
     _validate_snapshot_owner(snapshot, project, save, snapshot_type)
     replacement = deepcopy(snapshot)
+    replacement.pop("_snapshot_at", None)
+    replacement.pop("_snapshot_type", None)
 
     def restore(session: dict, context) -> None:
+        context.checkpoint(
+            "restore",
+            metadata={"snapshot_filename": filename},
+        )
         session.clear()
         session.update(deepcopy(replacement))
 
     try:
-        return (
-            await mutate_session(
-                project,
-                save,
-                expected_revision,
-                restore,
-            )
-        ).session
+        mutation = await mutate_session(
+            project,
+            save,
+            expected_revision,
+            restore,
+        )
+        return {
+            "session": mutation.session,
+            "recovery_id": (
+                mutation.recovery_ids[-1]
+                if mutation.recovery_ids
+                else None
+            ),
+        }
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
 

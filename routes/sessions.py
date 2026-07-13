@@ -73,13 +73,11 @@ async def api_rename_session(req: SaveRenameRequest):
 async def api_delete_session(req: SaveDeleteRequest):
     project = _norm_project(req.project)
     try:
-        return {
-            "deleted": await delete_session(
-                project,
-                _norm_save(req.save),
-                req.expected_revision,
-            )
-        }
+        return await delete_session(
+            project,
+            _norm_save(req.save),
+            req.expected_revision,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
     except RevisionConflict as exc:

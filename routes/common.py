@@ -2,7 +2,7 @@
 from typing import Annotated, Optional
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictBool, StrictInt
 
 from core.ollama_client import get_client
 from core.character_loader import list_characters, load_user_profile
@@ -63,6 +63,18 @@ class SaveImportRequest(BaseModel):
     project: str = "默认项目"
     json_str: str
     name: Optional[str] = None
+
+
+class QuarantineRequest(BaseModel):
+    entity_type: str
+    project: str
+    entity_id: str
+    fingerprint: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+
+
+class RecoveryRestoreRequest(BaseModel):
+    expected_revision: Optional[ExpectedRevision] = None
+    overwrite: StrictBool = False
 
 
 class MessageAction(BaseModel):

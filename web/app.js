@@ -74,15 +74,42 @@ function errorDetail(payload, fallback = '请求失败') {
     return payload.error || fallback;
 }
 
-function applySessionResult(payload) {
-    if (!payload || typeof payload !== 'object') return;
-    const session = payload.session || (
-        payload.session_id && Number.isInteger(payload.revision) ? payload : null
-    );
-    if (session) state.session = session;
+function captureSessionRef(project = state.currentProject, save = state.currentSave) {
+    return { project, save };
 }
 
-async function sessionWrite(url, method, payload, label = '保存') {
+function isCurrentSessionRef(ref) {
+    return Boolean(ref)
+        && state.currentProject === ref.project
+        && state.currentSave === ref.save;
+}
+
+function sessionFromResult(body) {
+    if (!body || typeof body !== 'object') return null;
+    const session = body.session || body;
+    if (!session || typeof session !== 'object') return null;
+    if (!session.session_id || !Number.isInteger(session.revision)) return null;
+    return session;
+}
+
+function sessionBelongsToRef(session, ref) {
+    if (!session || !ref || session.session_id !== ref.save) return false;
+    return !session.project || session.project === ref.project;
+}
+
+function applySessionResult(payload, ref = null) {
+    if (ref && !isCurrentSessionRef(ref)) return null;
+    const session = sessionFromResult(payload);
+    if (!session || (ref && !sessionBelongsToRef(session, ref))) return null;
+    state.session = session;
+    return session;
+}
+
+async function sessionWrite(url, method, payload, label = '保存', options = {}) {
+    const requestRef = captureSessionRef(
+        payload && payload.project !== undefined ? payload.project : state.currentProject,
+        payload && payload.save !== undefined ? payload.save : state.currentSave,
+    );
     const response = await fetch(url, {
         method,
         headers: { 'Content-Type': 'application/json' },
@@ -90,7 +117,9 @@ async function sessionWrite(url, method, payload, label = '保存') {
     });
     if (response.status === 409) {
         const conflict = await response.json().catch(() => ({}));
-        try { await reloadCurrentSession(); } catch (e) {}
+        if (isCurrentSessionRef(requestRef)) {
+            try { await reloadCurrentSession(); } catch (e) {}
+        }
         throw new Error(errorDetail(conflict, `${label}冲突，已重新加载`));
     }
     if (!response.ok) {
@@ -98,7 +127,7 @@ async function sessionWrite(url, method, payload, label = '保存') {
         throw new Error(errorDetail(error, `${label}失败：HTTP ${response.status}`));
     }
     const result = await response.json();
-    applySessionResult(result);
+    if (options.applyResult !== false) applySessionResult(result, requestRef);
     return result;
 }
 
@@ -400,20 +429,29 @@ async function createNewSave(name) {
 
 async function renameCurrentSave(newName) {
     if (!state.currentSave) return;
-    let updated;
+    const requestRef = captureSessionRef();
+    let body;
     try {
-        updated = await sessionWrite(API.sessionRename, 'POST', {
-            project: state.currentProject,
-            save: state.currentSave,
+        body = await sessionWrite(API.sessionRename, 'POST', {
+            project: requestRef.project,
+            save: requestRef.save,
             new_name: newName,
-        }, '重命名');
+        }, '重命名', { applyResult: false });
     } catch (error) {
         alert('重命名失败：' + error.message);
         return;
     }
-    state.session = updated;
-    state.currentSave = updated.session_id;
+    if (!isCurrentSessionRef(requestRef)) return;
+    const session = sessionFromResult(body);
+    if (!session || (session.project && session.project !== requestRef.project)) {
+        alert('重命名失败：响应缺少有效存档');
+        return;
+    }
+    state.session = session;
+    state.currentSave = session.session_id;
+    const renamedRef = captureSessionRef();
     await loadSaveList();
+    if (!isCurrentSessionRef(renamedRef)) return;
     document.getElementById('save-select').value = state.currentSave;
 }
 
@@ -424,20 +462,28 @@ async function deleteCurrentSave() {
         return;
     }
     if (state.isStreaming && activeController) activeController.abort();
+    const requestRef = captureSessionRef();
     const s = state.saveList.find(x => x.session_id === state.currentSave);
     const name = s ? s.name : state.currentSave;
-    if (!confirm(`确认删除存档「${name}」？此操作不可恢复。`)) return;
+    if (!confirm(`确认删除存档「${name}」？删除后将移入回收区，可以恢复。`)) return;
 
+    let body;
     try {
-        await sessionWrite(API.sessionDelete, 'POST', {
-            project: state.currentProject,
-            save: state.currentSave,
-        }, '删除存档');
+        body = await sessionWrite(API.sessionDelete, 'POST', {
+            project: requestRef.project,
+            save: requestRef.save,
+        }, '删除存档', { applyResult: false });
+        if (body && Object.prototype.hasOwnProperty.call(body, 'deleted') && body.deleted !== true) {
+            throw new Error('服务端未删除该存档');
+        }
     } catch (error) {
         alert('删除失败：' + error.message);
         return;
     }
+    if (!isCurrentSessionRef(requestRef)) return;
+    showToast('存档已移入回收区，可恢复');
     await loadSaveList();
+    if (!isCurrentSessionRef(requestRef)) return;
     await loadOrCreateCurrentSave();
 }
 
@@ -1738,6 +1784,7 @@ function showModelParamsEditor() {
 // ===== 存档历史 =====
 
 async function showHistoryEditor() {
+    const historyRef = captureSessionRef();
     const body = document.createElement('div');
     body.innerHTML = `<div class="param-intro">这里存着之前几次的存档快照（每次"重新生成"前会自动存一份）。点某个版本的「恢复」就回到那一次；点「预览」只读查看快照内容，不会覆盖当前存档。</div>
         <div id="history-list" class="history-list"><p style="color:var(--text-dim)">加载中…</p></div>`;
@@ -1745,9 +1792,13 @@ async function showHistoryEditor() {
 
     const listEl = body.querySelector('#history-list');
     try {
-        const url = `${API.sessionHistory}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
+        const url = `${API.sessionHistory}?project=${encodeURIComponent(historyRef.project)}&save=${encodeURIComponent(historyRef.save)}`;
         const res = await fetch(url);
         const data = await res.json();
+        if (!isCurrentSessionRef(historyRef)) {
+            listEl.innerHTML = '<p class="empty">当前存档已切换，请重新打开历史存档。</p>';
+            return;
+        }
         const snaps = data.snapshots || [];
         if (snaps.length === 0) { listEl.innerHTML = `<p class="empty">还没有历史快照。点一轮对话的「🔄」重新生成，或先聊一会再回来看。</p>`; return; }
         listEl.innerHTML = snaps.map(s => {
@@ -1768,17 +1819,33 @@ async function showHistoryEditor() {
             btn.addEventListener('click', async () => {
                 const fn = btn.dataset.fn;
                 if (!confirm('恢复这份快照？当前存档内容会被这份覆盖。')) return;
+                if (!isCurrentSessionRef(historyRef)) {
+                    hideModal();
+                    alert('当前存档已切换，请重新打开历史存档');
+                    return;
+                }
+                let result;
                 try {
-                    await sessionWrite(API.sessionRestore, 'POST', {
-                        project: state.currentProject,
-                        save: state.currentSave,
+                    result = await sessionWrite(API.sessionRestore, 'POST', {
+                        project: historyRef.project,
+                        save: historyRef.save,
                         filename: fn,
-                    }, '恢复快照');
+                    }, '恢复快照', { applyResult: false });
                 } catch (error) {
                     alert('恢复失败：' + error.message);
                     return;
                 }
-                await reloadCurrentSession(); hideModal(); alert('已恢复到该快照');
+                if (!isCurrentSessionRef(historyRef)) return;
+                const session = sessionFromResult(result);
+                if (!sessionBelongsToRef(session, historyRef)) {
+                    alert('恢复失败：响应存档与当前存档不一致');
+                    return;
+                }
+                state.session = session;
+                renderSession(session);
+                renderHistory(session.message_history || []);
+                hideModal();
+                alert('已恢复到该快照');
             });
         });
     } catch (e) { listEl.innerHTML = `<p class="empty">读取历史失败：${escapeHtml(e.message)}</p>`; }
@@ -1961,14 +2028,21 @@ function bindUI() {
     document.getElementById('reset-btn').addEventListener('click', async () => {
     if (state.isStreaming && activeController) activeController.abort();
         if (!confirm('重置当前存档？将清空对话历史和角色状态，但保留存档本身。')) return;
-        let session;
+        const requestRef = captureSessionRef();
+        let result;
         try {
-            session = await sessionWrite(API.reset, 'POST', {
-                project: state.currentProject,
-                save: state.currentSave,
-            }, '重置存档');
+            result = await sessionWrite(API.reset, 'POST', {
+                project: requestRef.project,
+                save: requestRef.save,
+            }, '重置存档', { applyResult: false });
         } catch (error) {
             alert('重置失败：' + error.message);
+            return;
+        }
+        if (!isCurrentSessionRef(requestRef)) return;
+        const session = sessionFromResult(result);
+        if (!sessionBelongsToRef(session, requestRef)) {
+            alert('重置失败：响应存档与当前存档不一致');
             return;
         }
         state.session = session;

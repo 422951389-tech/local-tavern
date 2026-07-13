@@ -15,11 +15,13 @@ import asyncio
 from contextlib import asynccontextmanager
 from contextlib import suppress
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from core.character_loader import needs_migration, migrate_old_data
 from core.ollama_client import get_client
 from core.process_guard import claim_pid_file, release_pid_file, wait_for_stop_request
+from core.recovery_store import DataCorruptionError
 from routes import (
     models,
     projects,
@@ -31,6 +33,7 @@ from routes import (
     chat,
     messages,
     prompts,
+    recovery,
     static,
 )
 
@@ -69,6 +72,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Local Tavern", lifespan=lifespan)
 
 
+@app.exception_handler(DataCorruptionError)
+async def handle_data_corruption(_request: Request, exc: DataCorruptionError):
+    """以稳定、脱敏的错误契约报告坏档，读取路径不执行隔离写入。"""
+    detail = exc.as_detail()
+    detail["message"] = "存档数据损坏，请先隔离原件后再恢复"
+    detail.pop("reason", None)
+    return JSONResponse(status_code=422, content={"error": detail})
+
+
 @app.middleware("http")
 async def add_security_headers(request, call_next):
     response = await call_next(request)
@@ -103,6 +115,7 @@ app.include_router(sessions.router)
 app.include_router(chat.router)
 app.include_router(messages.router)
 app.include_router(prompts.router)
+app.include_router(recovery.router)
 app.include_router(static.router)
 
 
