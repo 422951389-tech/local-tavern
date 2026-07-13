@@ -71,6 +71,10 @@ function errorDetail(payload, fallback = '请求失败') {
     if (payload.detail && payload.detail.code === 'revision_conflict') {
         return `存档版本冲突（当前 revision ${payload.detail.current_revision}）`;
     }
+    if (payload.detail && typeof payload.detail.message === 'string') return payload.detail.message;
+    if (payload.error && typeof payload.error === 'object') {
+        return payload.error.message || payload.error.code || fallback;
+    }
     return payload.error || fallback;
 }
 
@@ -1285,6 +1289,9 @@ function collectTextareaLines(id) {
 //   buildGroups: (item) => groups[]，定义该类型的字段
 //   postSave:    可选，保存成功后的额外处理
 //   postDelete:  可选，删除成功后的额外处理
+//   project:     编辑器打开时的项目 ID
+//   sessionRef:  角色/用户删除绑定的 SessionRef
+//   returnsSession: 删除成功时是否接受 active session
 //   prefix:      CSS class 前缀（cf/wf/uf）— 防止冲突
 // ============================================================
 
@@ -1588,7 +1595,16 @@ async function createCardEditor(config) {
                 const deleteId = config.idField ? (currentItem && currentItem[config.idField]) : 'user';
                 const displayName = config.idField ? (currentItem && (currentItem.name || currentItem[config.idField])) : '用户档案';
                 if (!deleteId) return;
-                if (!confirm(`确定要删除「${displayName}」吗？此操作不可恢复。`)) return;
+                const requestRef = config.sessionRef || captureSessionRef();
+                if (config.sessionRef && !isCurrentSessionRef(requestRef)) {
+                    statusEl.textContent = '✗ 当前存档已切换，请重新打开编辑器';
+                    return;
+                }
+                if (config.project && state.currentProject !== config.project) {
+                    statusEl.textContent = '✗ 当前项目已切换，请重新打开编辑器';
+                    return;
+                }
+                if (!confirm(`确定要删除「${displayName}」吗？删除后将移入回收区，可以恢复。`)) return;
 
                 const deleteUrl = config.deleteApi(deleteId);
                 statusEl.textContent = '删除中…';
@@ -1596,33 +1612,82 @@ async function createCardEditor(config) {
                     const r = await fetch(deleteUrl, { method: 'DELETE' });
                     const result = await r.json().catch(() => ({}));
                     if (r.status === 409) {
-                        try { await reloadCurrentSession(); } catch (e) {}
+                        if (config.sessionRef && isCurrentSessionRef(requestRef)) {
+                            try { await reloadCurrentSession(); } catch (e) {}
+                        }
                         throw new Error(errorDetail(result, '删除冲突，已重新加载'));
                     }
                     if (!r.ok) throw new Error(errorDetail(result, '删除失败'));
-                    applySessionResult(result);
-                    statusEl.textContent = '✓ 已删除';
+                    if (result.deleted !== true) throw new Error('删除响应无效：deleted 必须为 true');
+
+                    const recoveryId = typeof result.recovery_id === 'string'
+                        ? result.recovery_id
+                        : '';
+                    const affectedCount = Array.isArray(result.affected_saves)
+                        ? result.affected_saves.length
+                        : (Number.isInteger(result.affected_saves) ? result.affected_saves : 0);
+                    const impactText = affectedCount > 0 ? `（影响 ${affectedCount} 个存档）` : '';
+
+                    if (config.returnsSession) {
+                        const activeSession = sessionFromResult(result);
+                        if (
+                            activeSession
+                            && isCurrentSessionRef(requestRef)
+                            && sessionBelongsToRef(activeSession, requestRef)
+                        ) {
+                            state.session = activeSession;
+                            renderSession(activeSession);
+                        }
+                    }
+
+                    let refreshedItems = null;
+                    let refreshedExtra = null;
+                    try {
+                        if (config.allowNew && config.listApi) {
+                            const freshResponse = await fetch(config.listApi);
+                            const fresh = await freshResponse.json();
+                            if (!freshResponse.ok) {
+                                throw new Error(errorDetail(fresh, `HTTP ${freshResponse.status}`));
+                            }
+                            const freshItems = fresh[config.listKey] || fresh.data;
+                            if (!Array.isArray(freshItems)) throw new Error('列表响应格式无效');
+                            refreshedItems = freshItems;
+                        } else if (!config.allowNew && config.extraApi) {
+                            const freshResponse = await fetch(config.extraApi);
+                            refreshedExtra = await freshResponse.json();
+                            if (!freshResponse.ok) {
+                                throw new Error(errorDetail(refreshedExtra, `HTTP ${freshResponse.status}`));
+                            }
+                            if (!refreshedExtra || typeof refreshedExtra !== 'object' || Array.isArray(refreshedExtra)) {
+                                throw new Error('档案响应格式无效');
+                            }
+                        }
+                    } catch (refreshError) {
+                        statusEl.textContent = `✓ 已移入回收区，可恢复${impactText}；列表刷新失败：${refreshError.message}`;
+                        if (recoveryId) statusEl.title = `恢复记录：${recoveryId}`;
+                        showToast('已移入回收区，可恢复');
+                        return;
+                    }
+
                     if (config.allowNew) {
-                        const fresh = await fetch(config.listApi).then(r => r.json()).catch(() => null);
-                        if (fresh) items = fresh[config.listKey] || fresh.data || [];
+                        if (refreshedItems !== null) items = refreshedItems;
                         currentItem = null;
                         renderList(); renderForm();
                     } else {
                         currentItem = null;
-                        extraData = null;
+                        extraData = refreshedExtra || {};
                         renderForm();
                     }
-                    // 本地立即清理 state 并刷新 UI，不依赖 reload
-                    try {
-                        if (config.idField && state.session && state.session.characters_state) {
-                            delete state.session.characters_state[deleteId];
-                        } else if (!config.idField && state.session) {
-                            state.session.user_status = { name: '', identity: '', condition: '', abilities: [] };
-                        }
-                        renderSession(state.session);
-                    } catch (e) { console.warn('删除后刷新 UI 失败', e); }
-                    try { await reloadCurrentSession(); } catch (e) {}
-                    if (config.postDelete) await config.postDelete(deleteId);
+                    const nextStatusEl = formEl.querySelector('.ce-status');
+                    if (nextStatusEl) {
+                        nextStatusEl.textContent = `✓ 已移入回收区，可恢复${impactText}`;
+                        if (recoveryId) nextStatusEl.title = `恢复记录：${recoveryId}`;
+                    }
+                    showToast('已移入回收区，可恢复');
+                    if (config.postDelete) {
+                        try { await config.postDelete(deleteId, result); }
+                        catch (postDeleteError) { console.warn('删除后刷新失败', postDeleteError); }
+                    }
                 } catch (e) { statusEl.textContent = '✗ ' + e.message; }
             });
         }
@@ -1637,18 +1702,23 @@ async function createCardEditor(config) {
 // ============================================================
 
 async function openCharactersEditor() {
+    const editorRef = captureSessionRef();
     // D2：角色卡字段由后端 schema 单一来源驱动
     const schema = await fetch(API.characterSchema).then(r => r.json()).catch(() => null);
     if (!schema || !schema.groups) {
         showToast('角色卡 schema 加载失败，请刷新重试');
         return;
     }
+    if (!isCurrentSessionRef(editorRef)) return;
     await createCardEditor({
         title: '👥 角色卡 — 当前世界观的演员',
-        listApi: `${API.characters}?project=${encodeURIComponent(state.currentProject)}`,
+        listApi: `${API.characters}?project=${encodeURIComponent(editorRef.project)}`,
         listKey: 'characters',
-        saveApi: (id) => `${API.characterSave(id)}?project=${encodeURIComponent(state.currentProject)}`,
-        deleteApi: (id) => `${API.characterDelete(id)}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}&expected_revision=${currentRevision()}`,
+        saveApi: (id) => `${API.characterSave(id)}?project=${encodeURIComponent(editorRef.project)}`,
+        deleteApi: (id) => `${API.characterDelete(id)}?project=${encodeURIComponent(editorRef.project)}&save=${encodeURIComponent(editorRef.save)}&expected_revision=${currentRevision()}`,
+        project: editorRef.project,
+        sessionRef: editorRef,
+        returnsSession: true,
         allowNew: true,
         idField: 'id',
         idLabel: '唯一 ID（文件名）',
@@ -1673,12 +1743,14 @@ async function openCharactersEditor() {
 }
 
 async function openWorldbookEditor() {
+    const editorRef = captureSessionRef();
     await createCardEditor({
         title: '📖 世界书 — 当前世界观的设定',
-        listApi: `${API.worldbook}?project=${encodeURIComponent(state.currentProject)}`,
+        listApi: `${API.worldbook}?project=${encodeURIComponent(editorRef.project)}`,
         listKey: 'entries',
-        saveApi: (id) => `${API.worldbookSave(id)}?project=${encodeURIComponent(state.currentProject)}`,
-        deleteApi: (id) => `${API.worldbookDelete(id)}?project=${encodeURIComponent(state.currentProject)}`,
+        saveApi: (id) => `${API.worldbookSave(id)}?project=${encodeURIComponent(editorRef.project)}`,
+        deleteApi: (id) => `${API.worldbookDelete(id)}?project=${encodeURIComponent(editorRef.project)}`,
+        project: editorRef.project,
         allowNew: true,
         idField: 'id',
         idLabel: '条目名（英文）',
@@ -1697,15 +1769,19 @@ async function openWorldbookEditor() {
 }
 
 async function openUserEditor() {
+    const editorRef = captureSessionRef();
     await createCardEditor({
         title: '👤 用户档案 — 当前世界的观众设定',
         listApi: null,
         allowNew: false,
         idField: null,
-        saveApi: () => `${API.userSave}?project=${encodeURIComponent(state.currentProject)}`,
-        deleteApi: (id) => `${API.userDelete}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}&expected_revision=${currentRevision()}`,
+        saveApi: () => `${API.userSave}?project=${encodeURIComponent(editorRef.project)}`,
+        deleteApi: (id) => `${API.userDelete}?project=${encodeURIComponent(editorRef.project)}&save=${encodeURIComponent(editorRef.save)}&expected_revision=${currentRevision()}`,
+        project: editorRef.project,
+        sessionRef: editorRef,
+        returnsSession: true,
         prefix: 'user',
-        extraApi: `${API.user}?project=${encodeURIComponent(state.currentProject)}`,
+        extraApi: `${API.user}?project=${encodeURIComponent(editorRef.project)}`,
         buildGroups: (ud) => {
             ud = ud || {};
             return [

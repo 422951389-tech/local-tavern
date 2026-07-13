@@ -9,12 +9,15 @@ from core.session_manager import (
     quarantine_session,
     restore_recovery_item,
 )
-from core.recovery_store import RecoveryConflict
+from core.destructive_service import DestructiveOperationError
+from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
 from routes.common import (
     QuarantineRequest,
     RecoveryRestoreRequest,
     _norm_project,
     _norm_save,
+    _raise_destructive_error,
+    _raise_recovery_integrity,
     _raise_revision_conflict,
 )
 
@@ -55,6 +58,10 @@ async def api_quarantine_corrupt(req: QuarantineRequest):
         )
     except RecoveryConflict as exc:
         raise HTTPException(409, detail=exc.as_detail()) from exc
+    except RecoveryIntegrityError as exc:
+        _raise_recovery_integrity(exc)
+    except DestructiveOperationError as exc:
+        _raise_destructive_error(exc)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
@@ -76,6 +83,10 @@ async def api_restore_recovery(
         _raise_revision_conflict(exc)
     except RecoveryConflict as exc:
         raise HTTPException(409, detail=exc.as_detail()) from exc
+    except RecoveryIntegrityError as exc:
+        _raise_recovery_integrity(exc)
+    except DestructiveOperationError as exc:
+        _raise_destructive_error(exc)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:

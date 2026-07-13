@@ -4,12 +4,19 @@ from fastapi import APIRouter, HTTPException, Request, Query
 from core.character_loader import (
     list_characters,
     save_character,
-    delete_character,
     CHARACTER_SCHEMA,
 )
 
-from core.session_manager import RevisionConflict, mutate_session
-from routes.common import _norm_save, _norm_project, _raise_revision_conflict
+from core.destructive_service import DestructiveOperationError
+from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
+from core.session_manager import RevisionConflict, delete_character_data
+from routes.common import (
+    _norm_save,
+    _norm_project,
+    _raise_destructive_error,
+    _raise_recovery_integrity,
+    _raise_revision_conflict,
+)
 
 router = APIRouter()
 
@@ -48,21 +55,22 @@ async def api_delete_character(
 ):
     project = _norm_project(project)
     save_id = _norm_save(save) if save else "默认存档"
-
-    def remove_character(session: dict, context) -> None:
-        deleted = delete_character(project, char_id, session)
-        if not deleted:
-            raise HTTPException(404, f"角色卡不存在: {char_id}")
-
     try:
-        mutation = await mutate_session(
+        return await delete_character_data(
             project,
+            char_id,
             save_id,
             expected_revision,
-            remove_character,
         )
-    except ValueError as e:
-        raise HTTPException(400, str(e))
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
-    return {"deleted": True, "id": char_id, "session": mutation.session}
+    except RecoveryConflict as exc:
+        raise HTTPException(409, detail=exc.as_detail()) from exc
+    except RecoveryIntegrityError as exc:
+        _raise_recovery_integrity(exc)
+    except DestructiveOperationError as exc:
+        _raise_destructive_error(exc)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc

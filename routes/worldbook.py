@@ -1,8 +1,15 @@
 """世界书路由。"""
 from fastapi import APIRouter, HTTPException, Request, Query
 
-from core.character_loader import load_worldbook, save_worldbook, delete_worldbook_entry
-from routes.common import _norm_project
+from core.character_loader import load_worldbook, save_worldbook
+from core.destructive_service import DestructiveOperationError
+from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
+from core.session_manager import delete_worldbook_data
+from routes.common import (
+    _norm_project,
+    _raise_destructive_error,
+    _raise_recovery_integrity,
+)
 
 router = APIRouter()
 
@@ -29,9 +36,14 @@ async def api_save_worldbook(entry_id: str, req: Request, project: str = Query("
 async def api_delete_worldbook(entry_id: str, project: str = Query("默认项目")):
     project = _norm_project(project)
     try:
-        deleted = delete_worldbook_entry(project, entry_id)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    if not deleted:
-        raise HTTPException(404, f"世界书条目不存在: {entry_id}")
-    return {"deleted": True, "id": entry_id}
+        return await delete_worldbook_data(project, entry_id)
+    except RecoveryConflict as exc:
+        raise HTTPException(409, detail=exc.as_detail()) from exc
+    except RecoveryIntegrityError as exc:
+        _raise_recovery_integrity(exc)
+    except DestructiveOperationError as exc:
+        _raise_destructive_error(exc)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc

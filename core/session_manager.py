@@ -1,6 +1,7 @@
 """存档领域操作与事务化 SessionStore 适配层。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from copy import deepcopy
@@ -373,10 +374,68 @@ async def restore_recovery_item(
     expected_revision: int | None = None,
     overwrite: bool = False,
 ) -> dict:
-    return await get_session_store().restore_recovery(
+    store = get_session_store()
+    inspected = await asyncio.to_thread(
+        store.recovery_store.get_verified,
         recovery_id,
-        expected_revision=expected_revision,
-        overwrite=overwrite,
+    )
+    if inspected.manifest.get("entity_type") == "session":
+        return await store.restore_recovery(
+            recovery_id,
+            expected_revision=expected_revision,
+            overwrite=overwrite,
+        )
+    if overwrite:
+        raise ValueError("破坏性实体恢复禁止覆盖")
+    if expected_revision is not None:
+        raise ValueError("破坏性实体恢复不接受 expected_revision")
+    from core.destructive_service import DestructiveService
+
+    return await DestructiveService(store).restore_trash(recovery_id)
+
+
+async def delete_project_data(project: str) -> dict:
+    from core.destructive_service import DestructiveService
+
+    return await DestructiveService(get_session_store()).delete_project(project)
+
+
+async def delete_character_data(
+    project: str,
+    char_id: str,
+    save_id: str,
+    expected_revision: int,
+) -> dict:
+    from core.destructive_service import DestructiveService
+
+    return await DestructiveService(get_session_store()).delete_character(
+        project,
+        char_id,
+        save_id,
+        expected_revision,
+    )
+
+
+async def delete_user_data(
+    project: str,
+    save_id: str,
+    expected_revision: int,
+) -> dict:
+    from core.destructive_service import DestructiveService
+
+    return await DestructiveService(get_session_store()).delete_user(
+        project,
+        save_id,
+        expected_revision,
+    )
+
+
+async def delete_worldbook_data(project: str, entry_id: str) -> dict:
+    from core.destructive_service import DestructiveService
+
+    return await DestructiveService(get_session_store()).delete_worldbook(
+        project,
+        entry_id,
     )
 
 

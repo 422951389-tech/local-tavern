@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field, StrictBool, StrictInt
 from core.ollama_client import get_client
 from core.character_loader import list_characters, load_user_profile
 from core.config import DEFAULT_SAVE
+from core.destructive_service import DestructiveOperationError
+from core.recovery_store import RecoveryIntegrityError
 from core.session_manager import (
     RevisionConflict,
     DEFAULT_SAVE as _SESSION_DEFAULT_SAVE,
@@ -102,6 +104,14 @@ def _raise_revision_conflict(exc: RevisionConflict) -> None:
             "current_revision": exc.current,
         },
     ) from exc
+
+
+def _raise_destructive_error(exc: DestructiveOperationError) -> None:
+    raise HTTPException(500, detail=exc.as_detail()) from exc
+
+
+def _raise_recovery_integrity(exc: RecoveryIntegrityError) -> None:
+    raise HTTPException(409, detail=exc.as_detail()) from exc
 
 
 def _norm_save(save: Optional[str]) -> str:

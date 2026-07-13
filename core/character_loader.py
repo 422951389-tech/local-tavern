@@ -116,6 +116,20 @@ def get_project_dir(name: str) -> Path:
     return resolve_project_dir(ROOT_DIR, name)
 
 
+def get_character_path(project: str, char_id: str) -> Path:
+    char_id = _safe_id(char_id)
+    return resolve_under(get_project_dir(project), "characters", f"{char_id}.yaml")
+
+
+def get_worldbook_path(project: str, entry_id: str) -> Path:
+    entry_id = _safe_id(entry_id)
+    return resolve_under(get_project_dir(project), "worldbook", f"{entry_id}.yaml")
+
+
+def get_user_profile_path(project: str) -> Path:
+    return resolve_under(get_project_dir(project), "user.yaml")
+
+
 def ensure_project(name: str) -> Path:
     """确保项目目录存在（含子目录），并保证有一个默认存档。
 
@@ -154,9 +168,7 @@ def _safe_id(char_id: str) -> str:
 # ========== 角色卡 ==========
 
 def load_character(project: str, char_id: str) -> dict:
-    char_id = _safe_id(char_id)
-    path = resolve_under(get_project_dir(project), "characters", f"{char_id}.yaml")
-    return load_yaml(path)
+    return load_yaml(get_character_path(project, char_id))
 
 
 def list_characters(project: str) -> list[dict]:
@@ -185,27 +197,9 @@ def save_character(project: str, char_id: str, data: dict) -> Path:
 
 
 def delete_character(project: str, char_id: str, session: dict = None) -> bool:
-    """删除角色卡 YAML，并同步清理 session 中的角色状态。
-
-    session 由调用方通过 aload_session 获取并在操作后通过 save_session 持久化。
-    这确保与 chat 等写入路径共用 per-save 锁，防止并发覆盖。
-    """
-    import logging
-    logger = logging.getLogger(__name__)
-    char_id = _safe_id(char_id)
-    path = resolve_under(get_project_dir(project), "characters", f"{char_id}.yaml")
-    deleted = False
-    if path.exists():
-        path.unlink()
-        deleted = True
-    # 同步清理会话中的角色状态
-    if session is not None:
-        states = session.get("characters_state", {})
-        if char_id in states:
-            del states[char_id]
-    else:
-        logger.warning("delete_character: 未传入 session，角色状态不会从存档中清理")
-    return deleted
+    """禁止绕过统一 trash 事务直接删除。"""
+    del project, char_id, session
+    raise RuntimeError("角色删除必须通过破坏性操作服务执行")
 
 
 # ========== 世界书 ==========
@@ -236,20 +230,15 @@ def save_worldbook(project: str, entry_id: str, data: dict) -> Path:
 
 
 def delete_worldbook_entry(project: str, entry_id: str) -> bool:
-    """删除世界书条目 YAML。"""
-    entry_id = _safe_id(entry_id)
-    path = resolve_under(get_project_dir(project), "worldbook", f"{entry_id}.yaml")
-    if not path.exists():
-        return False
-    path.unlink()
-    return True
+    """禁止绕过统一 trash 事务直接删除。"""
+    del project, entry_id
+    raise RuntimeError("世界书删除必须通过破坏性操作服务执行")
 
 
 # ========== 用户档案 ==========
 
 def load_user_profile(project: str) -> dict:
-    path = resolve_under(get_project_dir(project), "user.yaml")
-    return load_yaml(path)
+    return load_yaml(get_user_profile_path(project))
 
 
 def save_user_profile(project: str, data: dict) -> Path:
@@ -260,22 +249,9 @@ def save_user_profile(project: str, data: dict) -> Path:
 
 
 def delete_user_profile(project: str, session: dict = None) -> bool:
-    """删除用户档案 YAML，并同步清空 session 中的 user_status。
-
-    session 由调用方通过 aload_session 获取并在操作后通过 save_session 持久化。
-    """
-    import logging
-    logger = logging.getLogger(__name__)
-    path = resolve_under(get_project_dir(project), "user.yaml")
-    deleted = False
-    if path.exists():
-        path.unlink()
-        deleted = True
-    if session is not None:
-        session["user_status"] = {"name": "", "identity": "", "condition": "", "abilities": []}
-    else:
-        logger.warning("delete_user_profile: 未传入 session，user_status 不会从存档中清理")
-    return deleted
+    """禁止绕过统一 trash 事务直接删除。"""
+    del project, session
+    raise RuntimeError("用户删除必须通过破坏性操作服务执行")
 
 
 # ========== 辅助 ==========

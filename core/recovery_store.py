@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 MANIFEST_VERSION = 1
 RECOVERY_CATEGORIES = frozenset({"checkpoint", "quarantine", "trash"})
 RECOVERY_STATUSES = frozenset({"complete", "restoring", "restored"})
+DESTRUCTIVE_ENTITY_TYPES = frozenset({"project", "character", "user", "worldbook"})
 _TOKEN_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
@@ -442,6 +443,69 @@ class RecoveryStore:
                     or not name.endswith(".json")
                 ):
                     raise RecoveryIntegrityError("session 恢复项包含跨归属文件")
+        elif entity_type in DESTRUCTIVE_ENTITY_TYPES:
+            if category != "trash":
+                raise RecoveryIntegrityError("破坏性恢复项必须属于 trash")
+            if entity_type == "project":
+                if entity_id != project:
+                    raise RecoveryIntegrityError("project 恢复项归属不一致")
+                project_prefix = PurePosixPath(project).as_posix() + "/"
+                if any(
+                    not item["source_relpath"].startswith(project_prefix)
+                    for item in items
+                ):
+                    raise RecoveryIntegrityError("project 恢复项包含跨项目文件")
+            else:
+                if entity_type == "character":
+                    primary = PurePosixPath(
+                        project,
+                        "characters",
+                        f"{entity_id}.yaml",
+                    ).as_posix()
+                elif entity_type == "user":
+                    if entity_id != "user":
+                        raise RecoveryIntegrityError("user 恢复项归属不一致")
+                    primary = PurePosixPath(project, "user.yaml").as_posix()
+                else:
+                    primary = PurePosixPath(
+                        project,
+                        "worldbook",
+                        f"{entity_id}.yaml",
+                    ).as_posix()
+                if manifest.get("source_relpath") != primary:
+                    raise RecoveryIntegrityError("恢复项主路径与实体归属不一致")
+                session_prefix = PurePosixPath(project, "saves").as_posix() + "/"
+                for item in items[1:]:
+                    source_relpath = item["source_relpath"]
+                    relative = PurePosixPath(source_relpath)
+                    if (
+                        entity_type == "worldbook"
+                        or not source_relpath.startswith(session_prefix)
+                        or len(relative.parts) != 3
+                        or not relative.name.endswith(".json")
+                    ):
+                        raise RecoveryIntegrityError("恢复项包含跨归属文件")
+
+            metadata = manifest["metadata"]
+            tombstone_relpath = self._safe_relative(
+                metadata.get("tombstone_relpath", "")
+            ).as_posix()
+            if not tombstone_relpath.startswith("tombstone/"):
+                raise RecoveryIntegrityError("恢复项 tombstone 路径无效")
+            source_relpath = metadata.get("tombstone_source_relpath")
+            if not isinstance(source_relpath, str):
+                raise RecoveryIntegrityError("恢复项 tombstone 源路径无效")
+            source_path = self._safe_relative(source_relpath).as_posix()
+            if entity_type == "project":
+                if source_path != PurePosixPath(project).as_posix():
+                    raise RecoveryIntegrityError("project tombstone 归属不一致")
+                if metadata.get("tombstone_kind") != "directory":
+                    raise RecoveryIntegrityError("project tombstone 类型无效")
+            else:
+                if source_path != manifest.get("source_relpath"):
+                    raise RecoveryIntegrityError("tombstone 与主路径不一致")
+                if metadata.get("tombstone_kind") != "file":
+                    raise RecoveryIntegrityError("实体 tombstone 类型无效")
 
     def _verify_manifest(
         self,
@@ -597,6 +661,55 @@ class RecoveryStore:
         if not path.is_relative_to(verified.entry_dir.resolve(strict=False)):
             raise RecoveryIntegrityError("恢复 payload 路径越界")
         return path
+
+    @staticmethod
+    def item_for_source(verified: VerifiedRecovery, source_relpath: str) -> dict:
+        for item in verified.manifest["items"]:
+            if item["source_relpath"] == source_relpath:
+                return item
+        raise RecoveryIntegrityError("恢复项缺少指定源文件")
+
+    def tombstone_path(self, verified: VerifiedRecovery) -> Path:
+        metadata = verified.manifest.get("metadata", {})
+        relative = self._safe_relative(metadata.get("tombstone_relpath", ""))
+        if not relative.as_posix().startswith("tombstone/"):
+            raise RecoveryIntegrityError("恢复项 tombstone 路径无效")
+        path = verified.entry_dir.joinpath(*relative.parts).resolve(strict=False)
+        if not path.is_relative_to(verified.entry_dir.resolve(strict=False)):
+            raise RecoveryIntegrityError("恢复项 tombstone 路径越界")
+        return path
+
+    def restore_item_exact(
+        self,
+        verified: VerifiedRecovery,
+        source_relpath: str,
+    ) -> Path:
+        item = self.item_for_source(verified, source_relpath)
+        payload = self.payload_path(verified, item)
+        target = self.target_path(source_relpath)
+        size, digest = _copy_verified(payload, target)
+        if size != item["size"] or digest != item["sha256"]:
+            raise RecoveryIntegrityError("恢复文件精确校验失败")
+        return target
+
+    def record_needs_recovery(
+        self,
+        recovery_id: str,
+        *,
+        stage: str,
+        error_code: str,
+    ) -> dict:
+        """仅记录可公开的故障分类，不把异常正文或绝对路径写入清单。"""
+        stage = self._validate_token(stage, label=" recovery stage")
+        error_code = self._validate_token(error_code, label=" recovery error")
+        verified = self.get_verified(recovery_id)
+        manifest = deepcopy(verified.manifest)
+        metadata = manifest.setdefault("metadata", {})
+        metadata["needs_recovery"] = True
+        metadata["recovery_stage"] = stage
+        metadata["recovery_error"] = error_code
+        replacement = self.replace_manifest(verified, manifest)
+        return deepcopy(replacement.manifest)
 
     def restore_primary_exact(self, verified: VerifiedRecovery) -> Path:
         primary_relpath = verified.manifest["source_relpath"]

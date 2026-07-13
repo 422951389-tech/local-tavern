@@ -1,9 +1,17 @@
 """用户档案路由。"""
 from fastapi import APIRouter, HTTPException, Request, Query
 
-from core.character_loader import load_user_profile, save_user_profile, delete_user_profile
-from core.session_manager import RevisionConflict, mutate_session
-from routes.common import _norm_save, _norm_project, _raise_revision_conflict
+from core.character_loader import load_user_profile, save_user_profile
+from core.destructive_service import DestructiveOperationError
+from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
+from core.session_manager import RevisionConflict, delete_user_data
+from routes.common import (
+    _norm_save,
+    _norm_project,
+    _raise_destructive_error,
+    _raise_recovery_integrity,
+    _raise_revision_conflict,
+)
 
 router = APIRouter()
 
@@ -34,18 +42,21 @@ async def api_delete_user(
 ):
     project = _norm_project(project)
     save_id = _norm_save(save) if save else "默认存档"
-
-    def remove_user(session: dict, context) -> None:
-        if not delete_user_profile(project, session):
-            raise HTTPException(404, "用户档案不存在")
-
     try:
-        mutation = await mutate_session(
+        return await delete_user_data(
             project,
             save_id,
             expected_revision,
-            remove_user,
         )
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
-    return {"deleted": True, "session": mutation.session}
+    except RecoveryConflict as exc:
+        raise HTTPException(409, detail=exc.as_detail()) from exc
+    except RecoveryIntegrityError as exc:
+        _raise_recovery_integrity(exc)
+    except DestructiveOperationError as exc:
+        _raise_destructive_error(exc)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
