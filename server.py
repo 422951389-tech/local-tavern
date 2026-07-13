@@ -23,6 +23,7 @@ from core.ollama_client import get_client
 from core.process_guard import claim_pid_file, release_pid_file, wait_for_stop_request
 from core.recovery_store import DataCorruptionError
 from routes import (
+    backups,
     models,
     projects,
     characters,
@@ -116,6 +117,7 @@ app.include_router(chat.router)
 app.include_router(messages.router)
 app.include_router(prompts.router)
 app.include_router(recovery.router)
+app.include_router(backups.router)
 app.include_router(static.router)
 
 
