@@ -12,18 +12,26 @@ from tests.data_guard import file_manifest, manifest_diff, manifest_digest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_DATA_DIR = (REPO_ROOT / "data").resolve(strict=False)
 REAL_PROMPTS_DIR = (REPO_ROOT / "prompts").resolve(strict=False)
+REAL_BACKUPS_DIR = (REPO_ROOT / "backups").resolve(strict=False)
+REAL_LOG_DIR = (REPO_ROOT / "logs").resolve(strict=False)
 
 _TEMP_DIR = tempfile.TemporaryDirectory(prefix="local-tavern-pytest-")
 TEST_ROOT = Path(_TEMP_DIR.name).resolve(strict=False)
 TEST_DATA_DIR = TEST_ROOT / "data"
 TEST_PROMPTS_DIR = TEST_ROOT / "prompts"
 TEST_SETTINGS_PATH = TEST_DATA_DIR / "settings.json"
+TEST_BACKUPS_DIR = TEST_ROOT / "backups"
+TEST_LOG_DIR = TEST_ROOT / "logs"
 
 # 必须先配置环境，再导入任何 core/routes/server 模块。
 os.environ["TAVERN_DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["TAVERN_PROJECTS_DIR"] = str(TEST_DATA_DIR / "projects")
 os.environ["TAVERN_PROMPTS_DIR"] = str(TEST_PROMPTS_DIR)
 os.environ["TAVERN_SETTINGS_PATH"] = str(TEST_SETTINGS_PATH)
+os.environ["TAVERN_RECOVERY_DIR"] = str(TEST_DATA_DIR / ".recovery")
+os.environ["TAVERN_MIGRATIONS_DIR"] = str(TEST_DATA_DIR / ".migrations")
+os.environ["TAVERN_BACKUP_DIR"] = str(TEST_BACKUPS_DIR)
+os.environ["TAVERN_LOG_DIR"] = str(TEST_LOG_DIR)
 os.environ["TAVERN_OLLAMA_HOST"] = "http://127.0.0.1:1"
 
 TEST_PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,7 +45,13 @@ for filename, content in {
 
 REAL_DATA_BEFORE = file_manifest(REAL_DATA_DIR)
 REAL_DATA_BEFORE_DIGEST = manifest_digest(REAL_DATA_BEFORE)
+REAL_BACKUPS_BEFORE = file_manifest(REAL_BACKUPS_DIR)
+REAL_BACKUPS_BEFORE_DIGEST = manifest_digest(REAL_BACKUPS_BEFORE)
+REAL_LOGS_BEFORE = file_manifest(REAL_LOG_DIR)
+REAL_LOGS_BEFORE_DIGEST = manifest_digest(REAL_LOGS_BEFORE)
 _real_data_after: dict[str, str] | None = None
+_real_backups_after: dict[str, str] | None = None
+_real_logs_after: dict[str, str] | None = None
 _cleanup_error = ""
 
 
@@ -56,8 +70,14 @@ def isolated_paths() -> dict[str, Path]:
         "projects": TEST_DATA_DIR / "projects",
         "prompts": TEST_PROMPTS_DIR,
         "settings": TEST_SETTINGS_PATH,
+        "recovery": TEST_DATA_DIR / ".recovery",
+        "migrations": TEST_DATA_DIR / ".migrations",
+        "backups": TEST_BACKUPS_DIR,
+        "logs": TEST_LOG_DIR,
         "real_data": REAL_DATA_DIR,
         "real_prompts": REAL_PROMPTS_DIR,
+        "real_backups": REAL_BACKUPS_DIR,
+        "real_logs": REAL_LOG_DIR,
     }
 
 
@@ -106,21 +126,30 @@ def pytest_report_header() -> list[str]:
     return [
         f"isolated data root: {TEST_DATA_DIR}",
         f"real data guard: {len(REAL_DATA_BEFORE)} files / {REAL_DATA_BEFORE_DIGEST}",
+        f"real backups guard: {len(REAL_BACKUPS_BEFORE)} files / {REAL_BACKUPS_BEFORE_DIGEST}",
+        f"real logs guard: {len(REAL_LOGS_BEFORE)} files / {REAL_LOGS_BEFORE_DIGEST}",
     ]
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    global _real_data_after, _cleanup_error
+    global _real_data_after, _real_backups_after, _real_logs_after, _cleanup_error
 
     _real_data_after = file_manifest(REAL_DATA_DIR)
-    if _real_data_after != REAL_DATA_BEFORE:
-        added, removed, changed = manifest_diff(REAL_DATA_BEFORE, _real_data_after)
-        print(
-            f"\n真实 data 保护失败：新增={added}，删除={removed}，修改={changed}",
-            file=sys.stderr,
-        )
-        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    _real_backups_after = file_manifest(REAL_BACKUPS_DIR)
+    _real_logs_after = file_manifest(REAL_LOG_DIR)
+    for label, before, after in (
+        ("data", REAL_DATA_BEFORE, _real_data_after),
+        ("backups", REAL_BACKUPS_BEFORE, _real_backups_after),
+        ("logs", REAL_LOGS_BEFORE, _real_logs_after),
+    ):
+        if after != before:
+            added, removed, changed = manifest_diff(before, after)
+            print(
+                f"\n真实 {label} 保护失败：新增={added}，删除={removed}，修改={changed}",
+                file=sys.stderr,
+            )
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
     try:
         _TEMP_DIR.cleanup()
@@ -131,12 +160,16 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
-    if _real_data_after is None:
+    if _real_data_after is None or _real_backups_after is None or _real_logs_after is None:
         return
-    after_digest = manifest_digest(_real_data_after)
-    if _real_data_after == REAL_DATA_BEFORE:
-        terminalreporter.write_line(
-            f"真实 data 保护通过：{len(_real_data_after)} files / {after_digest}"
-        )
+    for label, before, after in (
+        ("data", REAL_DATA_BEFORE, _real_data_after),
+        ("backups", REAL_BACKUPS_BEFORE, _real_backups_after),
+        ("logs", REAL_LOGS_BEFORE, _real_logs_after),
+    ):
+        if after == before:
+            terminalreporter.write_line(
+                f"真实 {label} 保护通过：{len(after)} files / {manifest_digest(after)}"
+            )
     if not _cleanup_error:
         terminalreporter.write_line("pytest 临时数据目录已清理")

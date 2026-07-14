@@ -252,7 +252,7 @@ def test_apply_creates_verified_backup_copies_exactly_and_preserves_legacy(tmp_p
     }
     assert result["skipped"] == []
     verified = seeded["backup_manager"].get_verified(result["backup_id"])
-    assert verified.manifest["kind"] == "manual"
+    assert verified.manifest["kind"] == "pre_migration"
     for item in plan["items"]:
         target = seeded["projects_root"] / Path(item["target"])
         assert target.read_bytes() == (seeded["data_root"] / item["source"]).read_bytes()

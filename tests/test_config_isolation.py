@@ -10,12 +10,18 @@ def test_all_mutable_paths_use_the_pytest_sandbox(isolated_paths):
     assert config.PROJECTS_DIR == isolated_paths["projects"]
     assert config.PROMPTS_DIR == isolated_paths["prompts"]
     assert config.SETTINGS_PATH == isolated_paths["settings"]
+    assert config.RECOVERY_DIR == isolated_paths["recovery"]
+    assert config.MIGRATIONS_DIR == isolated_paths["migrations"]
+    assert config.BACKUPS_DIR == isolated_paths["backups"]
+    assert config.LOG_DIR == isolated_paths["logs"]
     assert character_loader.OLD_DATA_DIR == isolated_paths["data"]
     assert prompt_editor.PROMPTS_DIR == isolated_paths["prompts"]
     assert config.OLLAMA_HOST == "http://127.0.0.1:1"
     assert ollama_client.OLLAMA_HOST == config.OLLAMA_HOST
     assert config.DATA_DIR != isolated_paths["real_data"]
     assert config.PROMPTS_DIR != isolated_paths["real_prompts"]
+    assert config.BACKUPS_DIR != isolated_paths["real_backups"]
+    assert config.LOG_DIR != isolated_paths["real_logs"]
 
 
 @pytest.mark.asyncio

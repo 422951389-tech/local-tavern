@@ -1209,7 +1209,7 @@ class LegacyMigrationService:
             try:
                 backup = self.backup_manager.create_backup(
                     f"pre_migration:{plan_id}",
-                    kind="manual",
+                    kind="pre_migration",
                 )
                 if not isinstance(backup, dict):
                     raise MigrationOperationError("迁移前备份结果无效")

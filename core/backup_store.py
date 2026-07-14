@@ -616,8 +616,8 @@ class BackupManager:
 
     def create_backup(self, reason: str | None = None, *, kind: str = "manual") -> dict:
         reason = self._validate_reason(reason)
-        if kind not in {"manual", "pre_restore"}:
-            raise ValueError("kind 仅支持 manual 或 pre_restore")
+        if kind not in {"manual", "pre_restore", "pre_migration"}:
+            raise ValueError("kind 仅支持 manual、pre_restore 或 pre_migration")
         with self._lock:
             before = self._scan_sources()
             backup_id = str(uuid4())
