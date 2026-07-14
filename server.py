@@ -18,7 +18,6 @@ from contextlib import suppress
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from core.character_loader import needs_migration, migrate_old_data
 from core.ollama_client import get_client
 from core.process_guard import claim_pid_file, release_pid_file, wait_for_stop_request
 from core.recovery_store import DataCorruptionError
@@ -33,6 +32,7 @@ from routes import (
     sessions,
     chat,
     messages,
+    migrations,
     prompts,
     recovery,
     static,
@@ -52,11 +52,6 @@ async def lifespan(app: FastAPI):
     stop_monitor = asyncio.create_task(wait_for_stop_request(process_metadata))
     logger.info("本地酒馆进程已登记 PID %s", process_metadata["pid"])
     try:
-        # ---- startup ----
-        if needs_migration():
-            logger.info("检测到旧数据，开始迁移……")
-            name = migrate_old_data()
-            logger.info("已迁移到 data/projects/%s/", name)
         yield
     finally:
         # ---- shutdown ----
@@ -115,6 +110,7 @@ app.include_router(settings.router)
 app.include_router(sessions.router)
 app.include_router(chat.router)
 app.include_router(messages.router)
+app.include_router(migrations.router)
 app.include_router(prompts.router)
 app.include_router(recovery.router)
 app.include_router(backups.router)

@@ -55,6 +55,7 @@ PROJECTS_DIR = _configured_path("TAVERN_PROJECTS_DIR", DATA_DIR / "projects")
 WEB_DIR = _configured_path("TAVERN_WEB_DIR", BASE_DIR / "web")
 PROMPTS_DIR = _configured_path("TAVERN_PROMPTS_DIR", BASE_DIR / "prompts")
 RECOVERY_DIR = _configured_path("TAVERN_RECOVERY_DIR", DATA_DIR / ".recovery")
+MIGRATIONS_DIR = _configured_path("TAVERN_MIGRATIONS_DIR", DATA_DIR / ".migrations")
 BACKUPS_DIR = _configured_path("TAVERN_BACKUP_DIR", BASE_DIR / "backups")
 LOG_DIR = _configured_path("TAVERN_LOG_DIR", BASE_DIR / "logs")
 

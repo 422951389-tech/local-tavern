@@ -29,6 +29,7 @@ from core.path_policy import (
 )
 
 ROOT_DIR = PROJECTS_DIR
+OLD_DATA_DIR = DATA_DIR  # 只读兼容别名；迁移必须通过 LegacyMigrationService 显式执行。
 
 # 角色卡 schema：单一事实源，前后端共用。
 # 前端编辑器从此 schema 渲染表单，避免前后端字段表漂移。
@@ -258,56 +259,3 @@ def delete_user_profile(project: str, session: dict = None) -> bool:
 
 def get_active_character_ids(project: str) -> list[str]:
     return [c["id"] for c in list_characters(project) if c.get("active", True)]
-
-
-# ========== 兼容旧数据迁移 ==========
-
-OLD_DATA_DIR = DATA_DIR
-
-def needs_migration() -> bool:
-    """检测是否有旧数据需要迁移"""
-    return (OLD_DATA_DIR / "characters").exists() and not ROOT_DIR.exists()
-
-
-def migrate_old_data() -> str:
-    """将旧 data/{characters,worldbook,user,saves} 迁移到 data/projects/默认项目/"""
-    import shutil
-    project_name = "默认项目"
-    dest = ensure_project(project_name)
-
-    # 迁移角色卡
-    old_chars = OLD_DATA_DIR / "characters"
-    if old_chars.exists():
-        for p in old_chars.glob("*.yaml"):
-            shutil.copy2(p, dest / "characters" / p.name)
-
-    # 迁移世界书
-    old_wb = OLD_DATA_DIR / "worldbook"
-    if old_wb.exists():
-        for p in old_wb.glob("*.yaml"):
-            shutil.copy2(p, dest / "worldbook" / p.name)
-
-    # 迁移用户档案
-    old_user = OLD_DATA_DIR / "user"
-    if old_user.exists():
-        for p in old_user.glob("*.yaml"):
-            if not p.stem.startswith("_"):
-                shutil.copy2(p, dest / "user.yaml")
-                break
-
-    # 迁移存档
-    old_saves = OLD_DATA_DIR / "saves"
-    if old_saves.exists():
-        dest_saves = dest / "saves"
-        for p in old_saves.glob("*.json"):
-            if not p.stem.startswith("."):
-                shutil.copy2(p, dest_saves / p.name)
-        # 迁移历史快照
-        old_hist = old_saves / ".history"
-        if old_hist.exists():
-            dest_hist = dest_saves / ".history"
-            dest_hist.mkdir(exist_ok=True)
-            for p in old_hist.iterdir():
-                shutil.copy2(p, dest_hist / p.name)
-
-    return project_name
