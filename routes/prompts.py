@@ -1,4 +1,6 @@
 """提示词编辑路由。"""
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Request
 
 from core.prompt_editor import read_prompt, write_prompt, reset_prompt_to_default
@@ -20,7 +22,7 @@ async def api_save_prompt(name: str, req: Request):
     content = body.get("content", "")
     if name not in ("system", "group_chat"):
         raise HTTPException(400, "未知 prompt 名")
-    write_prompt(name, content)
+    await asyncio.to_thread(write_prompt, name, content)
     return {"saved": True, "name": name}
 
 
@@ -29,6 +31,7 @@ async def api_reset_prompt(name: str):
     if name not in ("system", "group_chat"):
         raise HTTPException(400, "未知 prompt 名")
     try:
-        return {"reset": True, "name": name, "content": reset_prompt_to_default(name)}
+        content = await asyncio.to_thread(reset_prompt_to_default, name)
+        return {"reset": True, "name": name, "content": content}
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))

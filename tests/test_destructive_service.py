@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import shutil
+import threading
 from pathlib import Path
 
 import pytest
 import yaml
 
 import core.destructive_service as destructive_module
+from core.library_lock import library_lock
 from core.destructive_service import (
     DestructiveOperationError,
     DestructiveRecoveryRequired,
@@ -379,3 +382,86 @@ async def test_compensation_failure_marks_manifest_needs_recovery(
     assert manifest["metadata"]["needs_recovery"] is True
     assert manifest["metadata"]["recovery_stage"] == "delete_compensation"
     assert manifest["metadata"]["recovery_error"] == "compensation_failed"
+
+
+@pytest.mark.asyncio
+async def test_two_projects_cannot_both_pass_last_project_guard(tmp_path, monkeypatch):
+    seeded = await _seed_service(tmp_path, monkeypatch, keeper=True)
+    results = await asyncio.gather(
+        seeded["service"].delete_project(seeded["project"]),
+        seeded["service"].delete_project("keeper_project"),
+        return_exceptions=True,
+    )
+
+    successes = [result for result in results if isinstance(result, dict)]
+    failures = [result for result in results if isinstance(result, ValueError)]
+    remaining = [
+        path.name
+        for path in seeded["projects_root"].iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    ]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert str(failures[0]) == "至少保留 1 个项目"
+    assert len(remaining) == 1
+
+
+@pytest.mark.asyncio
+async def test_project_delete_blocks_late_mutation_from_recreating_half_project(
+    tmp_path,
+    monkeypatch,
+):
+    seeded = await _seed_service(tmp_path, monkeypatch, keeper=True)
+    release_reader = threading.Event()
+    reader_inside = threading.Event()
+    writer_waiting = threading.Event()
+    original_exclusive = destructive_module._run_with_library_exclusive
+
+    def hold_shared():
+        with library_lock.shared():
+            reader_inside.set()
+            release_reader.wait(2)
+
+    def announce_exclusive(callback, *args, **kwargs):
+        writer_waiting.set()
+        return original_exclusive(callback, *args, **kwargs)
+
+    blocker = threading.Thread(target=hold_shared)
+    blocker.start()
+    assert reader_inside.wait(1)
+    monkeypatch.setattr(
+        destructive_module,
+        "_run_with_library_exclusive",
+        announce_exclusive,
+    )
+
+    delete_task = asyncio.create_task(
+        seeded["service"].delete_project(seeded["project"]),
+    )
+    assert await asyncio.to_thread(writer_waiting.wait, 1)
+
+    def late_change(session, _context):
+        session["message_history"] = [{"role": "user", "content": "不得复活"}]
+
+    mutation_task = asyncio.create_task(
+        seeded["sessions"].mutate(
+            seeded["project"],
+            "late_save",
+            0,
+            late_change,
+            initial_factory=lambda: {
+                "session_id": "late_save",
+                "project": seeded["project"],
+                "message_history": [],
+            },
+        ),
+    )
+    release_reader.set()
+
+    deleted = await delete_task
+    with pytest.raises(FileNotFoundError, match="项目 .* 不存在"):
+        await mutation_task
+    blocker.join(1)
+    assert not blocker.is_alive()
+    assert deleted["deleted"] is True
+    assert not seeded["project_dir"].exists()

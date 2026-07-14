@@ -4,25 +4,29 @@
 - 主文件: PROMPTS_DIR/{name}.md
 - 默认备份: PROMPTS_DIR/.default/{name}.md（首次启动时拷贝）
 """
-import shutil
+import threading
 
 from core.config import PROMPTS_DIR
+from core.library_lock import library_lock
+from core.session_store import atomic_write
 
 
 DEFAULT_DIR = PROMPTS_DIR / ".default"
 
 VALID_NAMES = ("system", "group_chat")
+_PROMPT_WRITE_LOCK = threading.RLock()
 
 
 def _ensure_defaults():
     """确保默认备份存在（首次启动时把当前 prompt 拷到 .default）"""
-    DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
-    for name in VALID_NAMES:
-        default_path = DEFAULT_DIR / f"{name}.md"
-        if not default_path.exists():
-            src = PROMPTS_DIR / f"{name}.md"
-            if src.exists():
-                shutil.copy2(src, default_path)
+    with _PROMPT_WRITE_LOCK, library_lock.shared():
+        DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
+        for name in VALID_NAMES:
+            default_path = DEFAULT_DIR / f"{name}.md"
+            if not default_path.exists():
+                src = PROMPTS_DIR / f"{name}.md"
+                if src.exists():
+                    atomic_write(default_path, src.read_text(encoding="utf-8"))
 
 
 def read_prompt(name: str) -> str:
@@ -39,13 +43,10 @@ def write_prompt(name: str, content: str):
     """写入 prompt（原子写）"""
     if name not in VALID_NAMES:
         raise ValueError(f"无效 prompt 名: {name}")
-    PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-    _ensure_defaults()
-
-    path = PROMPTS_DIR / f"{name}.md"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    with _PROMPT_WRITE_LOCK, library_lock.shared():
+        PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+        _ensure_defaults()
+        atomic_write(PROMPTS_DIR / f"{name}.md", content)
 
 
 def _get_default_prompt(name: str) -> str:

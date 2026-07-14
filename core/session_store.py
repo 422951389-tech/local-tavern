@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any, Callable, Generic, TypeVar
 from uuid import UUID, uuid4, uuid5
 
+from core.library_lock import library_lock
 from core.path_policy import (
+    resolve_project_dir,
     resolve_saves_dir,
     resolve_session_path,
     resolve_under,
@@ -31,6 +33,11 @@ from core.recovery_store import (
 
 T = TypeVar("T")
 LEGACY_MESSAGE_NAMESPACE = UUID("5ed9739c-d4a1-4baa-92a9-0e105fdd72a1")
+
+
+def _run_with_library_shared(callback: Callable[..., T], *args, **kwargs) -> T:
+    with library_lock.shared():
+        return callback(*args, **kwargs)
 
 
 class RevisionConflict(RuntimeError):
@@ -60,26 +67,27 @@ class SessionRecoveryResult(dict):
 
 def atomic_write(path: Path, data: str) -> None:
     """同目录唯一临时文件 → flush/fsync → os.replace。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temp_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        text=True,
-    )
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    except BaseException:
+    with library_lock.shared():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            text=True,
+        )
+        temp_path = Path(temp_name)
         try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+        except BaseException:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def snapshot_timestamp() -> str:
@@ -218,6 +226,23 @@ class SessionStore:
 
     def history_dir(self, project: str) -> Path:
         return resolve_under(self.saves_dir(project), ".history")
+
+    def _require_project_sync(self, project: str, *, allow_empty_root: bool = False) -> Path:
+        project_dir = resolve_project_dir(self.projects_root, project)
+        if project_dir.is_dir():
+            return project_dir
+        if allow_empty_root:
+            existing = (
+                any(
+                    path.is_dir() and not path.name.startswith(".")
+                    for path in self.projects_root.iterdir()
+                )
+                if self.projects_root.is_dir()
+                else False
+            )
+            if not existing:
+                return project_dir
+        raise FileNotFoundError(f"项目 {project} 不存在")
 
     def _history_paths_sync(self, project: str, save_id: str) -> list[Path]:
         history_dir = self.history_dir(project)
@@ -415,6 +440,7 @@ class SessionStore:
             save_lock = await self.save_lock(project, save_id)
             async with save_lock:
                 def create_sync() -> dict:
+                    self._require_project_sync(project, allow_empty_root=True)
                     if self.session_path(project, save_id).exists():
                         raise FileExistsError(f"存档 ID {save_id} 已存在")
                     created = normalize_session(deepcopy(session), project, save_id)
@@ -423,7 +449,7 @@ class SessionStore:
                     self._write_session_sync(created, project, save_id)
                     return created
 
-                return await asyncio.to_thread(create_sync)
+                return await asyncio.to_thread(_run_with_library_shared, create_sync)
 
     async def mutate(
         self,
@@ -437,6 +463,7 @@ class SessionStore:
         lock = await self.save_lock(project, save_id)
         async with lock:
             def mutate_sync() -> MutationResult[T]:
+                self._require_project_sync(project)
                 current = self._read_sync(project, save_id)
                 existed = current is not None
                 if current is None:
@@ -464,7 +491,7 @@ class SessionStore:
                     ),
                 )
 
-            return await asyncio.to_thread(mutate_sync)
+            return await asyncio.to_thread(_run_with_library_shared, mutate_sync)
 
     async def snapshot(
         self,
@@ -487,7 +514,7 @@ class SessionStore:
                     current,
                 )
 
-            return await asyncio.to_thread(snapshot_sync)
+            return await asyncio.to_thread(_run_with_library_shared, snapshot_sync)
 
     async def delete(
         self,
@@ -538,7 +565,7 @@ class SessionStore:
                         manifest["recovery_id"],
                     )
 
-                return await asyncio.to_thread(delete_sync)
+                return await asyncio.to_thread(_run_with_library_shared, delete_sync)
 
     async def rename(
         self,
@@ -618,7 +645,7 @@ class SessionStore:
                         recovery["recovery_id"],
                     )
 
-                return await asyncio.to_thread(rename_sync)
+                return await asyncio.to_thread(_run_with_library_shared, rename_sync)
 
     async def list_recoveries(
         self,
@@ -643,6 +670,7 @@ class SessionStore:
         lock = await self.save_lock(project, save_id)
         async with lock:
             return await asyncio.to_thread(
+                _run_with_library_shared,
                 self.recovery_store.quarantine_session,
                 project=project,
                 save_id=save_id,
@@ -1014,4 +1042,4 @@ class SessionStore:
                         raise commit_exc
                     return response(restored, undo_recovery_id)
 
-                return await asyncio.to_thread(restore_sync)
+                return await asyncio.to_thread(_run_with_library_shared, restore_sync)

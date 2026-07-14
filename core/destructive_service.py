@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
+from core.library_lock import library_lock
 from core.path_policy import resolve_project_dir, resolve_under, validate_file_id
 from core.recovery_store import (
     RecoveryConflict,
@@ -32,6 +33,16 @@ EMPTY_USER_STATUS = {
     "abilities": [],
 }
 DESTRUCTIVE_ENTITY_TYPES = frozenset({"project", "character", "user", "worldbook"})
+
+
+def _run_with_library_shared(callback, *args, **kwargs):
+    with library_lock.shared():
+        return callback(*args, **kwargs)
+
+
+def _run_with_library_exclusive(callback, *args, **kwargs):
+    with library_lock.exclusive():
+        return callback(*args, **kwargs)
 
 
 class DestructiveOperationError(RuntimeError):
@@ -441,6 +452,7 @@ class DestructiveService:
                     return True
 
                 return await asyncio.to_thread(
+                    _run_with_library_shared,
                     self._delete_profile_sync,
                     entity_type="character",
                     entity_id=char_id,
@@ -474,6 +486,7 @@ class DestructiveService:
                     return True
 
                 return await asyncio.to_thread(
+                    _run_with_library_shared,
                     self._delete_profile_sync,
                     entity_type="user",
                     entity_id="user",
@@ -550,6 +563,7 @@ class DestructiveService:
         project_lock = await self.session_store.project_lock(project)
         async with project_lock:
             return await asyncio.to_thread(
+                _run_with_library_shared,
                 self._delete_file_only_sync,
                 entity_type="worldbook",
                 entity_id=entry_id,
@@ -616,6 +630,7 @@ class DestructiveService:
             save_ids = self._list_save_ids_sync(project)
             async with self.session_store._save_lock_group(project, save_ids):
                 return await asyncio.to_thread(
+                    _run_with_library_exclusive,
                     self._delete_project_sync,
                     project,
                     self._project_dir(project),
@@ -890,6 +905,7 @@ class DestructiveService:
         async with project_lock:
             async with self.session_store._save_lock_group(project, save_ids):
                 return await asyncio.to_thread(
+                    _run_with_library_shared,
                     self._restore_trash_sync,
                     recovery_id,
                     project,

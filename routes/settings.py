@@ -1,8 +1,10 @@
 """设置路由。"""
+import asyncio
 import json
 from fastapi import APIRouter, Request
 
 from core.config import SETTINGS_PATH
+from core.session_store import atomic_write
 
 router = APIRouter()
 
@@ -24,9 +26,6 @@ async def api_save_settings(req: Request):
     data = body.get("data", body)
     allowed = {"temperature", "top_p", "top_k", "num_predict", "think"}
     filtered = {k: v for k, v in data.items() if k in allowed}
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = SETTINGS_PATH.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(filtered, f, ensure_ascii=False, indent=2)
-    tmp.replace(SETTINGS_PATH)
+    content = json.dumps(filtered, ensure_ascii=False, indent=2)
+    await asyncio.to_thread(atomic_write, SETTINGS_PATH, content)
     return {"saved": True}
