@@ -144,6 +144,31 @@ def test_plan_is_stable_pure_read_and_maps_only_supported_legacy_files(tmp_path)
     assert first["can_apply"] is True
     assert first["conflicts"] == []
     assert first["skipped"] == []
+    assert first["excluded"] == [
+        {"source": "backup", "reason": "backup_directory"},
+        {"source": "backups", "reason": "backup_directory"},
+        {"source": "characters/.hidden.yaml", "reason": "hidden"},
+        {"source": "characters/_template.yaml", "reason": "template"},
+        {"source": "saves/.hidden.json", "reason": "hidden"},
+        {"source": "worldbook/_template_world.yml", "reason": "template"},
+    ]
+    assert first["counts"] == {
+        "total": 11,
+        "included": 5,
+        "copy": 5,
+        "skip_same": 0,
+        "conflict": 0,
+        "excluded": 6,
+    }
+    assert first["category_counts"]["characters"] == {
+        "total": 3,
+        "included": 1,
+        "copy": 1,
+        "skip_same": 0,
+        "conflict": 0,
+        "excluded": 2,
+    }
+    assert first["category_counts"]["other"]["excluded"] == 2
     mapping = {item["source"]: item["target"] for item in first["items"]}
     assert mapping == _expected_mapping(seeded)
     for item in first["items"]:
@@ -156,6 +181,24 @@ def test_plan_is_stable_pure_read_and_maps_only_supported_legacy_files(tmp_path)
     assert not seeded["migrations_root"].exists()
     assert not seeded["backups_root"].exists()
     assert not seeded["target_dir"].exists()
+
+
+def test_unsupported_extension_is_audited_and_changes_plan_id(tmp_path):
+    seeded = seed_legacy_library(tmp_path)
+    first = seeded["service"].plan()
+    unsupported = seeded["data_root"] / "characters" / "说明.txt"
+    _write_text(unsupported, "不参与迁移")
+    before = file_manifest(tmp_path)
+
+    second = seeded["service"].plan()
+
+    assert {"source": "characters/说明.txt", "reason": "unsupported_extension"} in second[
+        "excluded"
+    ]
+    assert second["counts"]["excluded"] == first["counts"]["excluded"] + 1
+    assert second["category_counts"]["characters"]["excluded"] == 3
+    assert second["plan_id"] != first["plan_id"]
+    assert file_manifest(tmp_path) == before
 
 
 def test_same_hash_is_skipped_and_different_hash_is_a_conflict(tmp_path):

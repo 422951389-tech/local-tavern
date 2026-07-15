@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -31,6 +31,10 @@ class MigrationApplyRequest(MigrationPlanRequest):
     expected_target_fingerprint: Fingerprint
 
 
+class MigrationRecoverRequest(MigrationPlanRequest):
+    action: Literal["resume", "rollback"]
+
+
 async def _validated_body(req: Request, model_type):
     try:
         payload = await req.json()
@@ -38,7 +42,10 @@ async def _validated_body(req: Request, model_type):
             raise ValueError("请求体必须是对象")
         return model_type.model_validate(payload)
     except (ValueError, TypeError, ValidationError):
-        raise HTTPException(400, "迁移请求体无效") from None
+        raise HTTPException(
+            400,
+            detail={"code": "invalid_migration_request", "message": "迁移请求体无效"},
+        ) from None
 
 
 def get_migration_service(target_project: str = "默认项目") -> LegacyMigrationService:
@@ -66,7 +73,8 @@ def _raise_migration_error(exc: Exception) -> None:
     if isinstance(exc, MigrationIntegrityError):
         raise HTTPException(422, detail=exc.as_detail()) from exc
     if isinstance(exc, MigrationOperationError):
-        raise HTTPException(500, detail=exc.as_detail()) from exc
+        status = 409 if exc.code == "migration_recovery_unsupported" else 500
+        raise HTTPException(status, detail=exc.as_detail()) from exc
     raise exc
 
 
@@ -80,7 +88,10 @@ async def api_plan_legacy_migration(req: Request):
     except (MigrationConflict, MigrationIntegrityError, MigrationOperationError) as exc:
         _raise_migration_error(exc)
     except ValueError as exc:
-        raise HTTPException(400, "目标项目无效") from exc
+        raise HTTPException(
+            400,
+            detail={"code": "invalid_target_project", "message": "目标项目无效"},
+        ) from exc
     return {"plan": plan}
 
 
@@ -97,9 +108,15 @@ async def api_apply_legacy_migration(plan_id: str, req: Request):
     except (MigrationConflict, MigrationIntegrityError, MigrationOperationError) as exc:
         _raise_migration_error(exc)
     except FileNotFoundError as exc:
-        raise HTTPException(404, "迁移记录不存在") from exc
+        raise HTTPException(
+            404,
+            detail={"code": "migration_not_found", "message": "迁移记录不存在"},
+        ) from exc
     except ValueError as exc:
-        raise HTTPException(400, "迁移请求参数无效") from exc
+        raise HTTPException(
+            400,
+            detail={"code": "invalid_migration_request", "message": "迁移请求参数无效"},
+        ) from exc
     return {"migration": migration}
 
 
@@ -113,7 +130,37 @@ async def api_get_migration(migration_id: str):
     except (MigrationConflict, MigrationIntegrityError, MigrationOperationError) as exc:
         _raise_migration_error(exc)
     except FileNotFoundError as exc:
-        raise HTTPException(404, "迁移记录不存在") from exc
+        raise HTTPException(
+            404,
+            detail={"code": "migration_not_found", "message": "迁移记录不存在"},
+        ) from exc
     except ValueError as exc:
-        raise HTTPException(400, "migration_id 无效") from exc
+        raise HTTPException(
+            400,
+            detail={"code": "invalid_migration_id", "message": "migration_id 无效"},
+        ) from exc
+    return {"migration": migration}
+
+
+@router.post("/api/migrations/{migration_id}/recover")
+async def api_recover_migration(migration_id: str, req: Request):
+    body = await _validated_body(req, MigrationRecoverRequest)
+    try:
+        migration = await asyncio.to_thread(
+            get_migration_service(body.target_project).recover,
+            migration_id,
+            action=body.action,
+        )
+    except (MigrationConflict, MigrationIntegrityError, MigrationOperationError) as exc:
+        _raise_migration_error(exc)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            404,
+            detail={"code": "migration_not_found", "message": "迁移记录不存在"},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            400,
+            detail={"code": "invalid_recovery_request", "message": "迁移恢复参数无效"},
+        ) from exc
     return {"migration": migration}

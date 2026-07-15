@@ -7,7 +7,12 @@ import pytest
 import yaml
 
 from core import config
+import routes.migrations as migration_routes
 from tests.data_guard import file_manifest
+
+
+class SimulatedHardExit(BaseException):
+    pass
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -191,3 +196,64 @@ async def test_apply_source_conflict_returns_409_private_error_and_zero_write(
     _assert_private(response)
     assert file_manifest(config.DATA_DIR) == data_before
     assert file_manifest(config.PROMPTS_DIR) == prompts_before
+
+
+@pytest.mark.asyncio
+async def test_recover_api_resumes_prepared_hard_exit_with_structured_status(
+    app_client,
+    monkeypatch,
+):
+    target_project = "迁移接口恢复项目"
+    _seed_legacy_api(target_project)
+    planned_response = await app_client.post(
+        "/api/migrations/legacy/plan",
+        json={"target_project": target_project},
+    )
+    assert planned_response.status_code == 200, planned_response.text
+    plan = planned_response.json()["plan"]
+    service = migration_routes.get_migration_service(target_project)
+    original = service._install_staged_file
+    crashed = False
+
+    def install_then_crash(*args, **kwargs):
+        nonlocal crashed
+        original(*args, **kwargs)
+        if not crashed:
+            crashed = True
+            raise SimulatedHardExit("injected hard exit")
+
+    monkeypatch.setattr(service, "_install_staged_file", install_then_crash)
+    with pytest.raises(SimulatedHardExit):
+        service.apply(
+            plan["plan_id"],
+            expected_source_fingerprint=plan["source_fingerprint"],
+            expected_target_fingerprint=plan["target_fingerprint"],
+        )
+
+    response = await app_client.post(
+        f"/api/migrations/{plan['plan_id']}/recover",
+        json={"target_project": target_project, "action": "resume"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert set(response.json()) == {"migration"}
+    migration = response.json()["migration"]
+    assert migration["applied"] is True
+    assert migration["status"] == "applied"
+    assert migration["migration_version"] == 2
+    assert migration["input_hashes"]["plan"] == plan["plan_id"]
+    assert migration["output_hashes"]["target"] == plan["result_target_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_recover_api_rejects_invalid_action_with_structured_error(app_client):
+    response = await app_client.post(
+        f"/api/migrations/{'0' * 64}/recover",
+        json={"target_project": "默认项目", "action": "erase"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert _error(response) == {
+        "code": "invalid_migration_request",
+        "message": "迁移请求体无效",
+    }
