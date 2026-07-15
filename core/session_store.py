@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Generic, TypeVar
 from uuid import UUID, uuid4, uuid5
 
+from core.active_turns import assert_write_allowed
 from core.library_lock import library_lock
 from core.path_policy import (
     resolve_project_dir,
@@ -444,6 +445,7 @@ class SessionStore:
         async with project_lock:
             save_lock = await self.save_lock(project, save_id)
             async with save_lock:
+                assert_write_allowed(project, save_id)
                 def create_sync() -> dict:
                     self._require_project_sync(project)
                     if self.session_path(project, save_id).exists():
@@ -456,6 +458,68 @@ class SessionStore:
 
                 return await asyncio.to_thread(_run_with_library_shared, create_sync)
 
+    async def accept_chat_turn(
+        self,
+        project: str,
+        save_id: str,
+        expected_revision: int,
+        *,
+        turn_id: str,
+        user_input: str,
+        created_at: str,
+        initial_session: dict,
+    ) -> MutationResult[str]:
+        """在 save lock 内同时校验 revision、登记 lease 并写入 pending user。"""
+        from core import active_turns
+
+        project_lock = await self.project_lock(project)
+        async with project_lock:
+            lock = await self.save_lock(project, save_id)
+            async with lock:
+                assert_write_allowed(project, save_id)
+
+                def accept_sync() -> MutationResult[str]:
+                    self._require_project_sync(project)
+                    current = self._read_sync(project, save_id)
+                    if current is None:
+                        current = normalize_session(
+                            deepcopy(initial_session),
+                            project,
+                            save_id,
+                        )
+                    self._check_revision(expected_revision, current)
+                    active_turns.register(project, save_id, turn_id)
+                    try:
+                        working = deepcopy(current)
+                        message_id = str(uuid4())
+                        working.setdefault("message_history", []).append({
+                            "id": message_id,
+                            "role": "user",
+                            "content": user_input,
+                            "turn_id": turn_id,
+                            "status": "pending",
+                            "error": None,
+                            "timestamps": {
+                                "created_at": created_at,
+                                "completed_at": None,
+                            },
+                            "pinned": False,
+                            "in_prompt": True,
+                        })
+                        working = normalize_session(working, project, save_id)
+                        working["revision"] = current["revision"] + 1
+                        working["updated_at"] = datetime.now().isoformat()
+                        self._write_session_sync(working, project, save_id)
+                    except BaseException:
+                        active_turns.unregister(project, save_id, turn_id)
+                        raise
+                    return MutationResult(
+                        session=working,
+                        value=message_id,
+                    )
+
+                return await asyncio.to_thread(_run_with_library_shared, accept_sync)
+
     async def mutate(
         self,
         project: str,
@@ -467,6 +531,7 @@ class SessionStore:
     ) -> MutationResult[T]:
         lock = await self.save_lock(project, save_id)
         async with lock:
+            assert_write_allowed(project, save_id)
             def mutate_sync() -> MutationResult[T]:
                 self._require_project_sync(project)
                 current = self._read_sync(project, save_id)
@@ -507,6 +572,7 @@ class SessionStore:
     ) -> tuple[dict, Path]:
         lock = await self.save_lock(project, save_id)
         async with lock:
+            assert_write_allowed(project, save_id)
             def snapshot_sync() -> tuple[dict, Path]:
                 current = self._read_sync(project, save_id)
                 if current is None:
@@ -533,6 +599,7 @@ class SessionStore:
         async with project_lock:
             save_lock = await self.save_lock(project, save_id)
             async with save_lock:
+                assert_write_allowed(project, save_id)
                 def delete_sync() -> SessionRecoveryResult | None:
                     current = self._read_sync(project, save_id)
                     if current is None:
@@ -583,6 +650,8 @@ class SessionStore:
         project_lock = await self.project_lock(project)
         async with project_lock:
             async with self._save_lock_group(project, [old_id, new_id]):
+                assert_write_allowed(project, old_id)
+                assert_write_allowed(project, new_id)
                 def rename_sync() -> dict:
                     current = self._read_sync(project, old_id)
                     if current is None:
@@ -674,6 +743,7 @@ class SessionStore:
     ) -> tuple[dict, bool]:
         lock = await self.save_lock(project, save_id)
         async with lock:
+            assert_write_allowed(project, save_id)
             return await asyncio.to_thread(
                 _run_with_library_shared,
                 self.recovery_store.quarantine_session,
@@ -720,6 +790,8 @@ class SessionStore:
                 project,
                 [save_id, active_save_id],
             ):
+                assert_write_allowed(project, save_id)
+                assert_write_allowed(project, active_save_id)
                 def restore_sync() -> dict:
                     verified = self.recovery_store.get_verified(recovery_id)
                     current_manifest = verified.manifest

@@ -18,6 +18,7 @@ from contextlib import suppress
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from core.active_turns import ActiveTurnConflict, TurnMaintenanceConflict
 from core.backup_store import BackupError
 from core.backup_scheduler import run_backup_scheduler
 from core.config import (
@@ -58,6 +59,15 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     process_metadata = claim_pid_file()
     stop_monitor = asyncio.create_task(wait_for_stop_request(process_metadata))
+    turn_coordinator = None
+    pending_restores = await asyncio.to_thread(
+        backups.get_backup_manager().pending_restore_ids
+    )
+    if not pending_restores:
+        from core.chat_turns import get_turn_coordinator
+
+        turn_coordinator = get_turn_coordinator()
+        await turn_coordinator.ensure_recovered()
     backup_scheduler = None
     if BACKUP_SCHEDULE_ENABLED:
         from datetime import timedelta
@@ -82,6 +92,9 @@ async def lifespan(app: FastAPI):
             backup_scheduler.cancel()
             with suppress(asyncio.CancelledError):
                 await backup_scheduler
+        if turn_coordinator is not None:
+            await turn_coordinator.shutdown()
+        await chat.shutdown_chat_background_tasks()
         try:
             await get_client().close()
         finally:
@@ -90,6 +103,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Local Tavern", lifespan=lifespan)
+
+
+@app.exception_handler(ActiveTurnConflict)
+async def handle_active_turn_conflict(_request: Request, exc: ActiveTurnConflict):
+    return JSONResponse(status_code=409, content={"error": exc.as_detail()})
+
+
+@app.exception_handler(TurnMaintenanceConflict)
+async def handle_turn_maintenance(_request: Request, exc: TurnMaintenanceConflict):
+    return JSONResponse(status_code=503, content={"error": exc.as_detail()})
 
 
 @app.exception_handler(DataCorruptionError)
@@ -105,6 +128,20 @@ async def handle_data_corruption(_request: Request, exc: DataCorruptionError):
 async def enforce_restore_maintenance(request: Request, call_next):
     """整库恢复未收口时阻断其他写入，避免 mixed 状态产生新数据后被回滚。"""
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        from core.active_turns import maintenance_operation
+
+        maintenance = maintenance_operation()
+        if maintenance is not None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "code": "turn_maintenance",
+                        "message": "整库维护期间写入已暂停",
+                        "operation": maintenance,
+                    }
+                },
+            )
         parts = request.url.path.strip("/").split("/")
         is_recovery_action = (
             len(parts) == 5
@@ -135,6 +172,21 @@ async def enforce_restore_maintenance(request: Request, call_next):
                             "code": "restore_maintenance_required",
                             "message": "存在未完成的整库恢复，写入已暂停",
                             "restore_ids": pending,
+                        }
+                    },
+                )
+            from core.chat_turns import get_turn_coordinator
+
+            try:
+                await get_turn_coordinator().ensure_recovered()
+            except Exception:
+                logger.exception("中断 turn 恢复失败")
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "code": "turn_recovery_failed",
+                            "message": "中断聊天状态未完成恢复，写入已暂停",
                         }
                     },
                 )

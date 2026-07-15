@@ -39,9 +39,21 @@ class FakeOllamaClient:
         self.chat_calls: list[dict] = []
         self.summary_calls: list[dict] = []
         self.closed = False
+        self.block_before_first = False
+        self.pause_after: int | None = None
+        self.entered = asyncio.Event()
+        self.paused = asyncio.Event()
+        self.release = asyncio.Event()
         self.configure("normal")
 
-    def configure(self, scenario: str, *, delay: float = 0.0) -> "FakeOllamaClient":
+    def configure(
+        self,
+        scenario: str,
+        *,
+        delay: float = 0.0,
+        block_before_first: bool = False,
+        pause_after: int | None = None,
+    ) -> "FakeOllamaClient":
         scenarios = {
             "normal": [
                 {"type": "thinking", "content": "测试思考"},
@@ -49,7 +61,12 @@ class FakeOllamaClient:
                 {"type": "done", "content": ""},
             ],
             "error": [
-                {"type": "error", "content": "fake Ollama 上游错误"},
+                {
+                    "type": "error",
+                    "code": "upstream_http_error",
+                    "http_status": 503,
+                    "content": "fake Ollama 上游错误",
+                },
             ],
             "eof": [
                 {"type": "content", "content": "未完成的 fake 响应"},
@@ -59,6 +76,11 @@ class FakeOllamaClient:
             raise ValueError(f"未知 fake Ollama 场景: {scenario}")
         self.events = deepcopy(scenarios[scenario])
         self.delay = delay
+        self.block_before_first = block_before_first
+        self.pause_after = pause_after
+        self.entered = asyncio.Event()
+        self.paused = asyncio.Event()
+        self.release = asyncio.Event()
         return self
 
     async def list_models(self) -> list[str]:
@@ -83,10 +105,16 @@ class FakeOllamaClient:
             "top_p": top_p,
             "top_k": top_k,
         })
-        for event in self.events:
+        self.entered.set()
+        if self.block_before_first:
+            await self.release.wait()
+        for index, event in enumerate(self.events, start=1):
             if self.delay:
                 await asyncio.sleep(self.delay)
             yield deepcopy(event)
+            if self.pause_after == index:
+                self.paused.set()
+                await self.release.wait()
 
     async def summarize_once(
         self,

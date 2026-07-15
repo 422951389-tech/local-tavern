@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
+from core.active_turns import assert_project_write_allowed
 from core.library_lock import library_lock
 from core.path_policy import resolve_project_dir, resolve_under, validate_file_id
 from core.recovery_store import (
@@ -435,6 +436,7 @@ class DestructiveService:
         expected_revision: int,
     ) -> dict:
         project = validate_file_id(project, label="项目 ID")
+        assert_project_write_allowed(project)
         char_id = self._validate_entity_id(char_id, label="角色 ID")
         save_id = validate_file_id(save_id, label="存档 ID")
         project_lock = await self.session_store.project_lock(project)
@@ -444,6 +446,7 @@ class DestructiveService:
                 project,
                 [*save_ids, save_id],
             ):
+                assert_project_write_allowed(project)
                 def remove_character(session: dict) -> bool:
                     states = session.get("characters_state")
                     if not isinstance(states, dict) or char_id not in states:
@@ -471,6 +474,7 @@ class DestructiveService:
         expected_revision: int,
     ) -> dict:
         project = validate_file_id(project, label="项目 ID")
+        assert_project_write_allowed(project)
         save_id = validate_file_id(save_id, label="存档 ID")
         project_lock = await self.session_store.project_lock(project)
         async with project_lock:
@@ -479,6 +483,7 @@ class DestructiveService:
                 project,
                 [*save_ids, save_id],
             ):
+                assert_project_write_allowed(project)
                 def clear_user(session: dict) -> bool:
                     if session.get("user_status") == EMPTY_USER_STATUS:
                         return False
@@ -559,9 +564,11 @@ class DestructiveService:
         entry_id: str,
     ) -> dict:
         project = validate_file_id(project, label="项目 ID")
+        assert_project_write_allowed(project)
         entry_id = self._validate_entity_id(entry_id, label="世界书 ID")
         project_lock = await self.session_store.project_lock(project)
         async with project_lock:
+            assert_project_write_allowed(project)
             return await asyncio.to_thread(
                 _run_with_library_shared,
                 self._delete_file_only_sync,
@@ -625,10 +632,12 @@ class DestructiveService:
 
     async def delete_project(self, project: str) -> dict:
         project = validate_file_id(project, label="项目 ID")
+        assert_project_write_allowed(project)
         project_lock = await self.session_store.project_lock(project)
         async with project_lock:
             save_ids = self._list_save_ids_sync(project)
             async with self.session_store._save_lock_group(project, save_ids):
+                assert_project_write_allowed(project)
                 return await asyncio.to_thread(
                     _run_with_library_exclusive,
                     self._delete_project_sync,
@@ -904,6 +913,7 @@ class DestructiveService:
         project_lock = await self.session_store.project_lock(project)
         async with project_lock:
             async with self.session_store._save_lock_group(project, save_ids):
+                assert_project_write_allowed(project)
                 return await asyncio.to_thread(
                     _run_with_library_shared,
                     self._restore_trash_sync,

@@ -166,7 +166,14 @@ async def save_session(
     return result.session
 
 
-def append_history(session: dict, role: str, content: str, thinking: str = "") -> dict:
+def append_history(
+    session: dict,
+    role: str,
+    content: str,
+    thinking: str = "",
+    *,
+    metadata: dict | None = None,
+) -> dict:
     message = {
         "id": str(uuid4()),
         "role": role,
@@ -176,6 +183,8 @@ def append_history(session: dict, role: str, content: str, thinking: str = "") -
     }
     if thinking:
         message["thinking"] = thinking
+    if metadata:
+        message.update(deepcopy(metadata))
     session.setdefault("message_history", []).append(message)
     return message
 

@@ -90,7 +90,12 @@ class OllamaClient:
             async with client.stream("POST", "/api/chat", json=payload) as resp:
                 if resp.status_code != 200:
                     err = await resp.aread()
-                    yield {"type": "error", "content": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='ignore')}"}
+                    yield {
+                        "type": "error",
+                        "code": "upstream_http_error",
+                        "http_status": resp.status_code,
+                        "content": f"HTTP {resp.status_code}: {err.decode('utf-8', errors='ignore')}",
+                    }
                     return
 
                 async for line in resp.aiter_lines():
@@ -126,10 +131,18 @@ class OllamaClient:
                         yield {"type": "done", "content": ""}
                         return
         except httpx.RequestError as e:
-            yield {"type": "error", "content": f"网络错误: {e}"}
+            yield {
+                "type": "error",
+                "code": "upstream_network_error",
+                "content": f"网络错误: {e}",
+            }
         except Exception as e:
             logger.exception("流式调用异常")
-            yield {"type": "error", "content": f"未知错误: {e}"}
+            yield {
+                "type": "error",
+                "code": "upstream_internal_error",
+                "content": f"未知错误: {e}",
+            }
 
     async def summarize_once(
         self,

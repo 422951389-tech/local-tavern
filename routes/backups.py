@@ -123,17 +123,26 @@ async def api_get_restore_journal(restore_id: str):
 
 @router.post("/api/backups/restores/{restore_id}/recover")
 async def api_recover_restore(restore_id: str):
+    from core.active_turns import begin_maintenance, end_maintenance
+    from core.chat_turns import get_turn_coordinator
+
+    maintenance_token = begin_maintenance("backup_restore_recovery")
     try:
-        return await asyncio.to_thread(
-            get_backup_manager().recover_restore,
-            restore_id,
-        )
-    except BackupError as exc:
-        _raise_backup_error(exc)
-    except FileNotFoundError as exc:
-        _raise_not_found(exc)
-    except ValueError as exc:
-        _raise_bad_request(exc)
+        try:
+            result = await asyncio.to_thread(
+                get_backup_manager().recover_restore,
+                restore_id,
+            )
+        except BackupError as exc:
+            _raise_backup_error(exc)
+        except FileNotFoundError as exc:
+            _raise_not_found(exc)
+        except ValueError as exc:
+            _raise_bad_request(exc)
+        await get_turn_coordinator().reconcile_after_restore()
+        return result
+    finally:
+        end_maintenance(maintenance_token)
 
 
 @router.get("/api/backups/retention/plan")
@@ -232,17 +241,26 @@ async def api_run_backup_drill(backup_id: str):
 
 @router.post("/api/backups/{backup_id}/restore")
 async def api_restore_backup(backup_id: str, req: Request):
+    from core.active_turns import begin_maintenance, end_maintenance
+    from core.chat_turns import get_turn_coordinator
+
     body = await _validated_body(req, BackupRestoreRequest)
+    maintenance_token = begin_maintenance("backup_restore")
     try:
-        return await asyncio.to_thread(
-            get_backup_manager().restore,
-            backup_id,
-            expected_current_fingerprint=body.expected_current_fingerprint,
-            confirm_conflicts=body.confirm_conflicts,
-        )
-    except BackupError as exc:
-        _raise_backup_error(exc)
-    except FileNotFoundError as exc:
-        _raise_not_found(exc)
-    except ValueError as exc:
-        _raise_bad_request(exc)
+        try:
+            result = await asyncio.to_thread(
+                get_backup_manager().restore,
+                backup_id,
+                expected_current_fingerprint=body.expected_current_fingerprint,
+                confirm_conflicts=body.confirm_conflicts,
+            )
+        except BackupError as exc:
+            _raise_backup_error(exc)
+        except FileNotFoundError as exc:
+            _raise_not_found(exc)
+        except ValueError as exc:
+            _raise_bad_request(exc)
+        await get_turn_coordinator().reconcile_after_restore()
+        return result
+    finally:
+        end_maintenance(maintenance_token)

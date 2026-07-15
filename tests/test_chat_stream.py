@@ -45,7 +45,7 @@ async def test_chat_normal_flow_uses_fake_and_persists_only_in_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_chat_upstream_error_does_not_mutate_the_save(
+async def test_chat_upstream_error_preserves_user_and_fixed_failure(
     app_client, fake_ollama, seed_project, isolated_paths
 ):
     project = seed_project("qa_error")
@@ -63,12 +63,23 @@ async def test_chat_upstream_error_does_not_mutate_the_save(
 
     events = _sse_events(response.text)
     assert response.status_code == 200
-    assert events == [{"type": "error", "content": "fake Ollama 上游错误"}]
-    assert hashlib.sha256(save_path.read_bytes()).hexdigest() == before
+    assert events == [{
+        "type": "error",
+        "content": "fake Ollama 上游错误",
+        "code": "upstream_http_error",
+    }]
+    assert hashlib.sha256(save_path.read_bytes()).hexdigest() != before
+    session = json.loads(save_path.read_text(encoding="utf-8"))
+    assert session["revision"] == 2
+    assert [item["role"] for item in session["message_history"]] == ["user"]
+    message = session["message_history"][0]
+    assert message["status"] == "failed"
+    assert message["error"]["code"] == "upstream_http_error"
+    assert message["timestamps"]["completed_at"]
 
 
 @pytest.mark.asyncio
-async def test_chat_eof_without_done_is_visible_and_does_not_mutate_the_save(
+async def test_chat_eof_without_done_preserves_partial_as_failed(
     app_client, fake_ollama, seed_project, isolated_paths
 ):
     project = seed_project("qa_eof")
@@ -86,16 +97,32 @@ async def test_chat_eof_without_done_is_visible_and_does_not_mutate_the_save(
 
     events = _sse_events(response.text)
     assert response.status_code == 200
-    assert events == [{"type": "content", "content": "未完成的 fake 响应"}]
-    assert hashlib.sha256(save_path.read_bytes()).hexdigest() == before
+    assert events == [
+        {"type": "content", "content": "未完成的 fake 响应"},
+        {
+            "type": "error",
+            "content": "上游连接结束但未发送完成标记",
+            "code": "upstream_eof",
+        },
+    ]
+    assert hashlib.sha256(save_path.read_bytes()).hexdigest() != before
+    session = json.loads(save_path.read_text(encoding="utf-8"))
+    assert [item["role"] for item in session["message_history"]] == [
+        "user",
+        "assistant",
+    ]
+    assert {item["status"] for item in session["message_history"]} == {"failed"}
+    assert session["message_history"][-1]["content"] == "未完成的 fake 响应"
+    assert session["message_history"][-1]["in_prompt"] is False
+    assert session["message_history"][-1]["error"]["code"] == "upstream_eof"
 
 
 @pytest.mark.asyncio
-async def test_chat_commit_conflict_is_reported_as_sse_and_does_not_overwrite(
+async def test_active_turn_blocks_model_switch_and_completes_without_overwrite(
     app_client, fake_ollama, seed_project
 ):
     project = seed_project("qa_chat_conflict")
-    fake_ollama.configure("normal", delay=0.05)
+    fake_ollama.configure("normal", block_before_first=True)
     chat_task = asyncio.create_task(app_client.post("/api/chat", json={
         "project": project,
         "save": "默认存档",
@@ -103,31 +130,28 @@ async def test_chat_commit_conflict_is_reported_as_sse_and_does_not_overwrite(
         "model": "fake-model:latest",
         "expected_revision": 0,
     }))
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(fake_ollama.entered.wait(), timeout=1)
     switch = await app_client.post("/api/model/switch", json={
         "project": project,
         "save": "默认存档",
         "model": "concurrent-model",
         "expected_revision": 0,
     })
-    assert switch.status_code == 200
+    assert switch.status_code == 409
+    assert switch.json()["error"]["code"] == "active_turn_conflict"
+    fake_ollama.release.set()
     response = await chat_task
     events = _sse_events(response.text)
-    conflicts = [
-        event for event in events
-        if isinstance(event, dict) and event.get("type") == "conflict"
-    ]
-    assert conflicts == [{
-        "type": "conflict",
-        "expected_revision": 0,
-        "current_revision": 1,
-    }]
+    assert events[-1] == "[DONE]"
     session = (await app_client.get(
         f"/api/session?project={project}&save=默认存档"
     )).json()
-    assert session["revision"] == 1
-    assert session["current_model"] == "concurrent-model"
-    assert session["message_history"] == []
+    assert session["revision"] == 2
+    assert session["current_model"] == "fake-model:latest"
+    assert [message["status"] for message in session["message_history"]] == [
+        "completed",
+        "completed",
+    ]
 
 
 @pytest.mark.asyncio
@@ -201,10 +225,11 @@ async def test_one_hundred_edit_pin_chat_reset_races_are_explicit(
         assert len(successes) == 1
         assert len(conflicts) == 3
         final = (await app_client.get(session_url)).json()
-        assert final["revision"] == revision + 1
+        winner = successes[0]
+        expected_increment = 2 if winner == "chat" else 1
+        assert final["revision"] == revision + expected_increment
         ids = [message["id"] for message in final["message_history"]]
         assert len(ids) == len(set(ids))
-        winner = successes[0]
         if winner == "edit":
             assert final["message_history"][0]["content"] == f"edited-{save}"
         elif winner == "pin":

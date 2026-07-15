@@ -42,8 +42,9 @@ async def test_bad_ndjson_chunk_is_skipped_without_losing_valid_events():
 
 
 @pytest.mark.asyncio
-async def test_http_error_becomes_stream_error_event():
-    transport = httpx.MockTransport(lambda request: httpx.Response(503, text="offline"))
+@pytest.mark.parametrize("status", [400, 503])
+async def test_http_error_becomes_stream_error_event(status):
+    transport = httpx.MockTransport(lambda request: httpx.Response(status, text="offline"))
     client = OllamaClient("http://ollama.invalid")
     client._client = httpx.AsyncClient(base_url=client.host, transport=transport)
     try:
@@ -51,7 +52,12 @@ async def test_http_error_becomes_stream_error_event():
     finally:
         await client.close()
 
-    assert events == [{"type": "error", "content": "HTTP 503: offline"}]
+    assert events == [{
+        "type": "error",
+        "code": "upstream_http_error",
+        "http_status": status,
+        "content": f"HTTP {status}: offline",
+    }]
 
 
 @pytest.mark.asyncio
@@ -69,6 +75,7 @@ async def test_network_error_becomes_stream_error_event():
 
     assert len(events) == 1
     assert events[0]["type"] == "error"
+    assert events[0]["code"] == "upstream_network_error"
     assert "blocked by test transport" in events[0]["content"]
 
 
