@@ -368,6 +368,71 @@ async def quarantine_session(
     }
 
 
+def _yaml_entity_path(entity_type: str, project: str, entity_id: str) -> Path:
+    from core.character_loader import (
+        get_character_path,
+        get_user_profile_path,
+        get_worldbook_path,
+    )
+
+    if entity_type == "character":
+        return get_character_path(project, entity_id)
+    if entity_type == "worldbook":
+        return get_worldbook_path(project, entity_id)
+    if entity_type == "user":
+        if entity_id != "user":
+            raise ValueError("user 实体 ID 必须为 user")
+        return get_user_profile_path(project)
+    raise ValueError("不支持隔离该 YAML 实体类型")
+
+
+async def quarantine_yaml_entity(
+    entity_type: str,
+    project: str,
+    entity_id: str,
+    fingerprint: str,
+) -> dict:
+    source_path = _yaml_entity_path(entity_type, project, entity_id)
+    store = get_session_store().recovery_store
+
+    def quarantine_sync() -> tuple[dict, bool]:
+        from core.character_loader import yaml_write_transaction
+
+        with yaml_write_transaction():
+            return store.quarantine_entity(
+                entity_type=entity_type,
+                project=project,
+                entity_id=entity_id,
+                source_path=source_path,
+                fingerprint=fingerprint,
+            )
+
+    recovery, deduplicated = await asyncio.to_thread(quarantine_sync)
+    return {
+        "recovery": recovery,
+        "deduplicated": deduplicated,
+    }
+
+
+async def restore_yaml_quarantine(
+    recovery_id: str,
+    *,
+    overwrite: bool = False,
+) -> dict:
+    store = get_session_store().recovery_store
+
+    def restore_sync() -> dict:
+        from core.character_loader import yaml_write_transaction
+
+        with yaml_write_transaction():
+            return store.restore_yaml_quarantine(
+                recovery_id,
+                overwrite=overwrite,
+            )
+
+    return await asyncio.to_thread(restore_sync)
+
+
 async def restore_recovery_item(
     recovery_id: str,
     *,
@@ -383,6 +448,17 @@ async def restore_recovery_item(
         return await store.restore_recovery(
             recovery_id,
             expected_revision=expected_revision,
+            overwrite=overwrite,
+        )
+    if (
+        inspected.manifest.get("category") == "quarantine"
+        and inspected.manifest.get("entity_type")
+        in {"character", "user", "worldbook"}
+    ):
+        if expected_revision is not None:
+            raise ValueError("YAML 隔离项恢复不接受 expected_revision")
+        return await restore_yaml_quarantine(
+            recovery_id,
             overwrite=overwrite,
         )
     if overwrite:

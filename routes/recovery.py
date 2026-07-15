@@ -7,6 +7,7 @@ from core.session_manager import (
     RevisionConflict,
     list_recovery_items,
     quarantine_session,
+    quarantine_yaml_entity,
     restore_recovery_item,
 )
 from core.destructive_service import DestructiveOperationError
@@ -48,12 +49,20 @@ async def api_list_recovery_items(
 
 @router.post("/api/recovery/quarantine")
 async def api_quarantine_corrupt(req: QuarantineRequest):
-    if req.entity_type != "session":
-        raise HTTPException(400, "当前仅支持隔离 session")
+    if req.entity_type not in {"session", "character", "user", "worldbook"}:
+        raise HTTPException(400, "不支持隔离该 entity_type")
     try:
-        return await quarantine_session(
-            _norm_project(req.project),
-            _norm_save(req.entity_id),
+        project = _norm_project(req.project)
+        if req.entity_type == "session":
+            return await quarantine_session(
+                project,
+                _norm_save(req.entity_id),
+                req.fingerprint,
+            )
+        return await quarantine_yaml_entity(
+            req.entity_type,
+            project,
+            req.entity_id,
             req.fingerprint,
         )
     except RecoveryConflict as exc:

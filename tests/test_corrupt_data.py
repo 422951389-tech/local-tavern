@@ -198,7 +198,7 @@ async def test_changed_fingerprint_rejects_quarantine_without_recovery_write(app
             "fingerprint": "not-a-sha256",
         },
         {
-            "entity_type": "character",
+            "entity_type": "unsupported",
             "project": "corrupt_invalid_project",
             "entity_id": "corrupt_invalid_save",
             "fingerprint": "0" * 64,

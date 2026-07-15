@@ -459,7 +459,7 @@ async def test_project_delete_blocks_late_mutation_from_recreating_half_project(
     release_reader.set()
 
     deleted = await delete_task
-    with pytest.raises(FileNotFoundError, match="项目 .* 不存在"):
+    with pytest.raises(FileNotFoundError, match="项目 .* 已移入回收区"):
         await mutation_task
     blocker.join(1)
     assert not blocker.is_alive()

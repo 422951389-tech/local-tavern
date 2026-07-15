@@ -14,11 +14,15 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable
 from uuid import UUID, uuid4
 
+from core.library_lock import library_lock
+from core.path_policy import PathPolicyError, validate_file_id
+
 
 MANIFEST_VERSION = 1
 RECOVERY_CATEGORIES = frozenset({"checkpoint", "quarantine", "trash"})
 RECOVERY_STATUSES = frozenset({"complete", "restoring", "restored"})
 DESTRUCTIVE_ENTITY_TYPES = frozenset({"project", "character", "user", "worldbook"})
+YAML_ENTITY_TYPES = frozenset({"character", "user", "worldbook"})
 _TOKEN_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
@@ -60,14 +64,16 @@ class DataCorruptionError(RecoveryError):
         path: Path,
         fingerprint: str,
         reason: str,
+        quarantine_available: bool = True,
     ):
-        super().__init__(f"{entity_type} 数据损坏: {project}/{entity_id}: {reason}")
+        super().__init__("数据存在但无法解析")
         self.entity_type = entity_type
         self.project = project
         self.entity_id = entity_id
         self.path = Path(path)
         self.fingerprint = fingerprint
         self.reason = reason
+        self.quarantine_available = bool(quarantine_available)
         self.code = "data_corrupt"
 
     @classmethod
@@ -79,6 +85,7 @@ class DataCorruptionError(RecoveryError):
         project: str,
         entity_id: str,
         reason: str,
+        quarantine_available: bool = True,
     ) -> "DataCorruptionError":
         return cls(
             entity_type=entity_type,
@@ -87,17 +94,41 @@ class DataCorruptionError(RecoveryError):
             path=path,
             fingerprint=sha256_file(path),
             reason=reason,
+            quarantine_available=quarantine_available,
+        )
+
+    @classmethod
+    def from_bytes(
+        cls,
+        path: Path,
+        payload: bytes,
+        *,
+        entity_type: str,
+        project: str,
+        entity_id: str,
+        reason: str,
+        quarantine_available: bool = True,
+    ) -> "DataCorruptionError":
+        """把错误指纹绑定到实际完成解析的同一份字节。"""
+        return cls(
+            entity_type=entity_type,
+            project=project,
+            entity_id=entity_id,
+            path=path,
+            fingerprint=hashlib.sha256(payload).hexdigest(),
+            reason=reason,
+            quarantine_available=quarantine_available,
         )
 
     def as_detail(self) -> dict:
         return {
             "code": self.code,
+            "message": "数据损坏，请先隔离原件再处理",
             "entity_type": self.entity_type,
             "project": self.project,
             "entity_id": self.entity_id,
             "fingerprint": self.fingerprint,
-            "reason": self.reason,
-            "quarantine_available": True,
+            "quarantine_available": self.quarantine_available,
         }
 
 
@@ -198,13 +229,13 @@ class RecoveryStore:
     @staticmethod
     def _validate_category(category: str) -> str:
         if category not in RECOVERY_CATEGORIES:
-            raise ValueError(f"未知恢复分类: {category}")
+            raise ValueError("未知恢复分类")
         return category
 
     @staticmethod
     def _validate_token(value: str, *, label: str) -> str:
         if not isinstance(value, str) or not _TOKEN_RE.fullmatch(value):
-            raise ValueError(f"无效{label}: {value}")
+            raise ValueError(f"无效{label}")
         return value
 
     @staticmethod
@@ -221,6 +252,8 @@ class RecoveryStore:
     def _safe_relative(value: str) -> PurePosixPath:
         if not isinstance(value, str) or not value:
             raise RecoveryIntegrityError("恢复清单包含空路径")
+        if "\\" in value:
+            raise RecoveryIntegrityError("恢复清单包含越界路径")
         path = PurePosixPath(value)
         if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
             raise RecoveryIntegrityError("恢复清单包含越界路径")
@@ -240,6 +273,55 @@ class RecoveryStore:
         if not target.is_relative_to(self.projects_root):
             raise RecoveryIntegrityError("恢复目标越出 projects 根目录")
         return target
+
+    def project_target_path(self, project: str, source_relpath: str) -> Path:
+        """把恢复目标同时绑定到 projects 根和 manifest 声明的项目根。"""
+        project = self._validate_owner_id(project, label="project")
+        relative = self._safe_relative(source_relpath)
+        if not relative.parts or relative.parts[0] != project:
+            raise RecoveryIntegrityError("恢复目标与 manifest 项目归属不一致")
+        project_root = Path(os.path.abspath(self.projects_root / project))
+        target = Path(os.path.abspath(self.projects_root.joinpath(*relative.parts)))
+        if target == project_root or not target.is_relative_to(project_root):
+            raise RecoveryIntegrityError("恢复目标越出 manifest 项目根")
+        current = project_root
+        while True:
+            if os.path.lexists(current) and current.resolve(strict=False) != current:
+                raise RecoveryIntegrityError("恢复目标路径包含 reparse point")
+            if current == target.parent:
+                break
+            next_part = target.relative_to(current).parts[0]
+            current = current / next_part
+        resolved = target.resolve(strict=False)
+        if not resolved.is_relative_to(project_root):
+            raise RecoveryIntegrityError("恢复目标越出 manifest 项目根")
+        return target
+
+    @staticmethod
+    def _validate_owner_id(value: object, *, label: str) -> str:
+        try:
+            return validate_file_id(value, label=label)
+        except PathPolicyError as exc:
+            raise RecoveryIntegrityError(f"恢复 manifest {label}无效") from exc
+
+    @classmethod
+    def yaml_source_relpath(
+        cls,
+        *,
+        entity_type: str,
+        project: str,
+        entity_id: str,
+    ) -> str:
+        project = cls._validate_owner_id(project, label="project")
+        if entity_type not in YAML_ENTITY_TYPES:
+            raise ValueError("不支持的 YAML 实体类型")
+        if entity_type == "user":
+            if entity_id != "user":
+                raise RecoveryIntegrityError("user 恢复项归属不一致")
+            return PurePosixPath(project, "user.yaml").as_posix()
+        entity_id = cls._validate_owner_id(entity_id, label="entity_id")
+        directory = "characters" if entity_type == "character" else "worldbook"
+        return PurePosixPath(project, directory, f"{entity_id}.yaml").as_posix()
 
     def _entry_dir(self, category: str, recovery_id: str) -> Path:
         category = self._validate_category(category)
@@ -399,6 +481,8 @@ class RecoveryStore:
             raise RecoveryIntegrityError("恢复 manifest project 无效")
         if not isinstance(entity_id, str) or not entity_id:
             raise RecoveryIntegrityError("恢复 manifest entity_id 无效")
+        project = self._validate_owner_id(project, label="project")
+        entity_id = self._validate_owner_id(entity_id, label="entity_id")
         if not isinstance(manifest.get("metadata"), dict):
             raise RecoveryIntegrityError("恢复 manifest metadata 无效")
         if "restore_journal" in manifest and not isinstance(
@@ -418,8 +502,9 @@ class RecoveryStore:
                 raise RecoveryIntegrityError("恢复 manifest item 必须是对象")
             source_relpath = self._safe_relative(item.get("source_relpath", "")).as_posix()
             payload_relpath = self._safe_relative(item.get("payload_relpath", "")).as_posix()
-            if not payload_relpath.startswith("payload/"):
-                raise RecoveryIntegrityError("恢复 payload 路径前缀无效")
+            expected_payload = PurePosixPath("payload", source_relpath).as_posix()
+            if payload_relpath != expected_payload:
+                raise RecoveryIntegrityError("恢复 payload 路径与源路径不一致")
             if source_relpath in seen_sources or payload_relpath in seen_payloads:
                 raise RecoveryIntegrityError("恢复 manifest 路径重复")
             seen_sources.add(source_relpath)
@@ -443,6 +528,19 @@ class RecoveryStore:
                     or not name.endswith(".json")
                 ):
                     raise RecoveryIntegrityError("session 恢复项包含跨归属文件")
+        elif entity_type in YAML_ENTITY_TYPES and category == "quarantine":
+            primary = self.yaml_source_relpath(
+                entity_type=entity_type,
+                project=project,
+                entity_id=entity_id,
+            )
+            if manifest.get("operation") != "parse_failure":
+                raise RecoveryIntegrityError("YAML 隔离项 operation 无效")
+            if manifest.get("source_relpath") != primary or len(items) != 1:
+                raise RecoveryIntegrityError("YAML 隔离项包含跨归属文件")
+            fingerprint = manifest["metadata"].get("fingerprint")
+            if fingerprint != items[0].get("sha256"):
+                raise RecoveryIntegrityError("YAML 隔离项指纹与 payload 不一致")
         elif entity_type in DESTRUCTIVE_ENTITY_TYPES:
             if category != "trash":
                 raise RecoveryIntegrityError("破坏性恢复项必须属于 trash")
@@ -506,6 +604,8 @@ class RecoveryStore:
                     raise RecoveryIntegrityError("tombstone 与主路径不一致")
                 if metadata.get("tombstone_kind") != "file":
                     raise RecoveryIntegrityError("实体 tombstone 类型无效")
+        else:
+            raise RecoveryIntegrityError("恢复 manifest entity_type 不受支持")
 
     def _verify_manifest(
         self,
@@ -579,10 +679,10 @@ class RecoveryStore:
                     manifest = verified.manifest
                 except (ValueError, RecoveryIntegrityError) as exc:
                     entries.append({
-                        "recovery_id": entry_dir.name,
+                        "recovery_id": None,
                         "category": current_category,
                         "status": "invalid",
-                        "error": str(exc),
+                        "error": "恢复项完整性校验失败",
                     })
                     continue
                 if project is not None and manifest.get("project") != project:
@@ -596,6 +696,7 @@ class RecoveryStore:
     def find_matching_quarantine(
         self,
         *,
+        entity_type: str = "session",
         project: str,
         entity_id: str,
         fingerprint: str,
@@ -603,9 +704,9 @@ class RecoveryStore:
         for manifest in self.list_entries(
             category="quarantine",
             project=project,
-            entity_type="session",
+            entity_type=entity_type,
         ):
-            if manifest.get("status") == "invalid":
+            if manifest.get("status") != "complete":
                 continue
             if (
                 manifest.get("entity_id") == entity_id
@@ -613,6 +714,82 @@ class RecoveryStore:
             ):
                 return manifest
         return None
+
+    def quarantine_entity(
+        self,
+        *,
+        entity_type: str,
+        project: str,
+        entity_id: str,
+        source_path: Path,
+        fingerprint: str,
+    ) -> tuple[dict, bool]:
+        if entity_type not in {"session", *YAML_ENTITY_TYPES}:
+            raise ValueError("不支持隔离该实体类型")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", str(fingerprint)):
+            raise ValueError("fingerprint 必须是 64 位 SHA-256")
+        project = self._validate_owner_id(project, label="project")
+        entity_id = self._validate_owner_id(entity_id, label="entity_id")
+        if entity_type == "session":
+            expected_relpath = PurePosixPath(
+                project,
+                "saves",
+                f"{entity_id}.json",
+            ).as_posix()
+        else:
+            expected_relpath = self.yaml_source_relpath(
+                entity_type=entity_type,
+                project=project,
+                entity_id=entity_id,
+            )
+        source_path = Path(source_path)
+        if self._source_relative(source_path) != expected_relpath:
+            raise ValueError("隔离源路径与实体归属不一致")
+
+        expected = str(fingerprint).lower()
+        with library_lock.shared():
+            existing = self.find_matching_quarantine(
+                entity_type=entity_type,
+                project=project,
+                entity_id=entity_id,
+                fingerprint=expected,
+            )
+            if source_path.is_file():
+                if sha256_file(source_path) != expected:
+                    raise RecoveryConflict(
+                        "源文件指纹已变化，拒绝隔离",
+                        code="source_changed",
+                    )
+                if existing is not None:
+                    if sha256_file(source_path) != expected:
+                        raise RecoveryConflict(
+                            "源文件指纹已变化，拒绝隔离",
+                            code="source_changed",
+                        )
+                    source_path.unlink()
+                    return existing, True
+            elif existing is not None:
+                return existing, True
+            else:
+                raise FileNotFoundError("隔离源文件不存在")
+
+            manifest = self.create_entry(
+                category="quarantine",
+                operation="parse_failure",
+                entity_type=entity_type,
+                project=project,
+                entity_id=entity_id,
+                source_paths=[source_path],
+                source_revision=None,
+                metadata={"fingerprint": expected},
+            )
+            if not source_path.is_file() or sha256_file(source_path) != expected:
+                raise RecoveryConflict(
+                    "源文件指纹已变化，拒绝隔离",
+                    code="source_changed",
+                )
+            source_path.unlink()
+            return manifest, False
 
     def quarantine_session(
         self,
@@ -622,37 +799,13 @@ class RecoveryStore:
         session_path: Path,
         fingerprint: str,
     ) -> tuple[dict, bool]:
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", str(fingerprint)):
-            raise ValueError("fingerprint 必须是 64 位 SHA-256")
-        expected = str(fingerprint).lower()
-        existing = self.find_matching_quarantine(
+        return self.quarantine_entity(
+            entity_type="session",
             project=project,
             entity_id=save_id,
-            fingerprint=expected,
+            source_path=session_path,
+            fingerprint=fingerprint,
         )
-        if session_path.is_file():
-            current = sha256_file(session_path)
-            if current != expected:
-                raise RecoveryConflict("源文件指纹已变化，拒绝隔离", code="source_changed")
-            if existing is not None:
-                session_path.unlink()
-                return existing, True
-        elif existing is not None:
-            return existing, True
-        else:
-            raise FileNotFoundError(f"存档 {save_id} 不存在")
-
-        manifest = self.create_session_entry(
-                category="quarantine",
-                operation="parse_failure",
-                project=project,
-                save_id=save_id,
-                session_path=session_path,
-                source_revision=None,
-                metadata={"fingerprint": expected},
-        )
-        session_path.unlink()
-        return manifest, False
 
     @staticmethod
     def payload_path(verified: VerifiedRecovery, item: dict) -> Path:
@@ -686,7 +839,10 @@ class RecoveryStore:
     ) -> Path:
         item = self.item_for_source(verified, source_relpath)
         payload = self.payload_path(verified, item)
-        target = self.target_path(source_relpath)
+        target = self.project_target_path(
+            verified.manifest["project"],
+            source_relpath,
+        )
         size, digest = _copy_verified(payload, target)
         if size != item["size"] or digest != item["sha256"]:
             raise RecoveryIntegrityError("恢复文件精确校验失败")
@@ -719,7 +875,10 @@ class RecoveryStore:
             if item["source_relpath"] == primary_relpath
         )
         payload = self.payload_path(verified, primary_item)
-        target = self.target_path(primary_relpath)
+        target = self.project_target_path(
+            verified.manifest["project"],
+            primary_relpath,
+        )
         size, digest = _copy_verified(payload, target)
         if size != primary_item["size"] or digest != primary_item["sha256"]:
             raise RecoveryIntegrityError("恢复主文件精确校验失败")
@@ -755,7 +914,10 @@ class RecoveryStore:
         for item in verified.manifest["items"]:
             if item["source_relpath"] == primary_relpath:
                 continue
-            target = self.target_path(item["source_relpath"])
+            target = self.project_target_path(
+                verified.manifest["project"],
+                item["source_relpath"],
+            )
             if target.exists():
                 if not target.is_file() or sha256_file(target) != item["sha256"]:
                     raise RecoveryConflict(
@@ -816,3 +978,130 @@ class RecoveryStore:
         )
         self._verify_manifest(manifest, verified.entry_dir)
         return manifest
+
+    def restore_yaml_quarantine(
+        self,
+        recovery_id: str,
+        *,
+        overwrite: bool = False,
+    ) -> dict:
+        """恢复单个 YAML 隔离文件，任何情况都不覆盖目标。"""
+        if overwrite:
+            raise ValueError("YAML 隔离项恢复禁止覆盖")
+
+        with library_lock.shared():
+            verified = self.get_verified(recovery_id)
+            manifest = verified.manifest
+            entity_type = manifest.get("entity_type")
+            if (
+                manifest.get("category") != "quarantine"
+                or entity_type not in YAML_ENTITY_TYPES
+            ):
+                raise ValueError("恢复项不是 YAML 隔离数据")
+            source_relpath = self.yaml_source_relpath(
+                entity_type=entity_type,
+                project=manifest["project"],
+                entity_id=manifest["entity_id"],
+            )
+            if source_relpath != manifest.get("source_relpath"):
+                raise RecoveryIntegrityError("YAML 恢复目标与 manifest 归属不一致")
+            item = self.item_for_source(verified, source_relpath)
+            target = self.project_target_path(manifest["project"], source_relpath)
+            if manifest["status"] == "restored":
+                if target.is_file() and sha256_file(target) == item["sha256"]:
+                    return {
+                        "restored": True,
+                        "recovery": deepcopy(manifest),
+                        "target_relpath": source_relpath,
+                        "idempotent": True,
+                    }
+                raise RecoveryIntegrityError("已完成恢复的 YAML 目标状态不一致")
+
+            if manifest["status"] == "restoring":
+                resumed = True
+                journal = manifest.get("restore_journal")
+                if (
+                    not isinstance(journal, dict)
+                    or journal.get("operation") != "restore_quarantine"
+                    or journal.get("target_relpath") != source_relpath
+                    or journal.get("target_existed") is not False
+                ):
+                    raise RecoveryIntegrityError("YAML 恢复 journal 无效")
+                if target.exists():
+                    if not target.is_file() or sha256_file(target) != item["sha256"]:
+                        raise RecoveryConflict(
+                            "恢复目标已存在且不属于未完成恢复",
+                            code="target_exists",
+                        )
+                    completed = self.mark_restored(verified)
+                    return {
+                        "restored": True,
+                        "recovery": completed,
+                        "target_relpath": source_relpath,
+                        "resumed": True,
+                    }
+                restoring = verified
+            else:
+                resumed = False
+                if target.exists():
+                    raise RecoveryConflict(
+                        "恢复目标已存在，拒绝覆盖",
+                        code="target_exists",
+                    )
+                restoring = self.begin_restore(
+                    verified,
+                    {
+                        "operation": "restore_quarantine",
+                        "target_relpath": source_relpath,
+                        "target_existed": False,
+                        "phase": "copying",
+                    },
+                )
+            try:
+                target = self.project_target_path(manifest["project"], source_relpath)
+                restored_target = self.restore_primary_exact(restoring)
+                if restored_target != target or sha256_file(target) != item["sha256"]:
+                    raise RecoveryIntegrityError("恢复后的 YAML 文件校验失败")
+                completed = self.mark_restored(restoring)
+                return {
+                    "restored": True,
+                    "recovery": completed,
+                    "target_relpath": source_relpath,
+                    "resumed": resumed,
+                }
+            except Exception as exc:
+                compensated = not target.exists()
+                if target.is_file():
+                    try:
+                        if sha256_file(target) == item["sha256"]:
+                            target.unlink()
+                        compensated = not target.exists()
+                    except OSError:
+                        compensated = False
+
+                if isinstance(exc, RecoveryConflict):
+                    error_code = exc.code
+                elif isinstance(exc, RecoveryIntegrityError):
+                    error_code = exc.code
+                elif isinstance(exc, OSError):
+                    error_code = "io_error"
+                else:
+                    error_code = "restore_failed"
+
+                failed = deepcopy(restoring.manifest)
+                failed["status"] = "complete" if compensated else "restoring"
+                failed_journal = failed.setdefault("restore_journal", {})
+                failed_journal.update({
+                    "failed_at": utc_now().isoformat(),
+                    "phase": "failed",
+                    "error_code": error_code,
+                    "compensated": compensated,
+                })
+                if not compensated:
+                    failed.setdefault("metadata", {})["needs_recovery"] = True
+                try:
+                    self.replace_manifest(restoring, failed)
+                except Exception:
+                    # begin_restore 已在目标变更前持久化 journal。
+                    pass
+                raise

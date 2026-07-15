@@ -172,6 +172,56 @@ async def test_different_saves_write_in_parallel(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_read_waits_for_same_save_atomic_write(tmp_path, monkeypatch):
+    store = SessionStore(tmp_path / "projects")
+    await store.create(
+        "read_lock_project",
+        "read_lock_save",
+        _session("read_lock_project", "read_lock_save"),
+    )
+    entered_write = threading.Event()
+    release_write = threading.Event()
+    original_write = store._write_session_sync
+
+    def blocked_write(session, project, save_id):
+        entered_write.set()
+        if not release_write.wait(timeout=2):
+            raise TimeoutError("test write release timed out")
+        original_write(session, project, save_id)
+
+    monkeypatch.setattr(store, "_write_session_sync", blocked_write)
+
+    def update(session, _context):
+        session["name"] = "updated"
+
+    mutation = asyncio.create_task(
+        store.mutate(
+            "read_lock_project",
+            "read_lock_save",
+            1,
+            update,
+            initial_factory=lambda: _session(
+                "read_lock_project",
+                "read_lock_save",
+            ),
+        )
+    )
+    assert await asyncio.to_thread(entered_write.wait, 1)
+    reading = asyncio.create_task(
+        store.read("read_lock_project", "read_lock_save")
+    )
+    await asyncio.sleep(0.02)
+    assert not reading.done()
+
+    release_write.set()
+    mutated, read_back = await asyncio.gather(mutation, reading)
+
+    assert mutated.session["revision"] == 2
+    assert read_back["revision"] == 2
+    assert read_back["name"] == "updated"
+
+
+@pytest.mark.asyncio
 async def test_snapshot_names_do_not_collide_within_one_second(tmp_path):
     store = SessionStore(tmp_path / "projects")
     await store.create("snapshot_project", "snapshot_save", _session("snapshot_project", "snapshot_save"))

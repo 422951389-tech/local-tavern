@@ -10,26 +10,32 @@
     ├── worldbook/     世界设定
     └── user.yaml      用户档案
 """
-from pathlib import Path
-from typing import Optional
 import io
 import json
 import logging
+import math
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
 import yaml
 
 from core.config import DATA_DIR, PROJECTS_DIR
+from core.library_lock import library_lock
 from core.path_policy import (
     PathPolicyError,
     resolve_project_dir,
     resolve_under,
     validate_file_id,
 )
+from core.recovery_store import DataCorruptionError
 
 ROOT_DIR = PROJECTS_DIR
 OLD_DATA_DIR = DATA_DIR  # 只读兼容别名；迁移必须通过 LegacyMigrationService 显式执行。
+_YAML_WRITE_LOCK = threading.RLock()
 
 # 角色卡 schema：单一事实源，前后端共用。
 # 前端编辑器从此 schema 渲染表单，避免前后端字段表漂移。
@@ -94,6 +100,14 @@ def _atomic_dump(path: Path, data: dict):
     atomic_write(path, buf.getvalue())
 
 
+@contextmanager
+def yaml_write_transaction() -> Iterator[None]:
+    """YAML 变更串行化，并纳入整库共享锁。"""
+    with library_lock.shared():
+        with _YAML_WRITE_LOCK:
+            yield
+
+
 # ========== 项目 ==========
 
 def list_projects() -> list[str]:
@@ -152,11 +166,108 @@ def ensure_project(name: str) -> Path:
 
 # ========== YAML 工具 ==========
 
-def load_yaml(path: Path) -> dict:
+_MAX_YAML_BYTES = 2 * 1024 * 1024
+_MAX_YAML_DEPTH = 64
+_MAX_YAML_NODES = 10_000
+
+
+def _validate_yaml_tree(value: object) -> None:
+    """限制 YAML 为有界、无环、JSON 兼容的数据树。"""
+    visited_nodes = 0
+
+    def visit(node: object, depth: int, ancestors: set[int]) -> None:
+        nonlocal visited_nodes
+        visited_nodes += 1
+        if visited_nodes > _MAX_YAML_NODES:
+            raise ValueError("YAML 节点数量超限")
+        if depth > _MAX_YAML_DEPTH:
+            raise ValueError("YAML 嵌套深度超限")
+        if node is None or isinstance(node, (str, bool, int)):
+            return
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                raise ValueError("YAML 浮点值必须有限")
+            return
+        if isinstance(node, (dict, list)):
+            identity = id(node)
+            if identity in ancestors:
+                raise ValueError("YAML 数据存在循环引用")
+            next_ancestors = {*ancestors, identity}
+            if isinstance(node, dict):
+                for key, item in node.items():
+                    if not isinstance(key, str):
+                        raise ValueError("YAML 对象键必须是字符串")
+                    visit(item, depth + 1, next_ancestors)
+            else:
+                for item in node:
+                    visit(item, depth + 1, next_ancestors)
+            return
+        raise ValueError("YAML 包含不支持的数据类型")
+
+    visit(value, 0, set())
+
+def load_yaml(
+    path: Path,
+    *,
+    entity_type: str,
+    project: str,
+    entity_id: str,
+) -> dict:
+    """严格纯读 YAML；已存在的损坏文件绝不回写。"""
     if not path.exists():
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    try:
+        validate_file_id(entity_id, label="条目 ID")
+        quarantine_available = not entity_id.startswith("_")
+    except PathPolicyError:
+        quarantine_available = False
+    try:
+        payload = path.read_bytes()
+        if len(payload) > _MAX_YAML_BYTES:
+            raise DataCorruptionError.from_bytes(
+                path,
+                payload,
+                entity_type=entity_type,
+                project=project,
+                entity_id=entity_id,
+                reason="yaml_too_large",
+                quarantine_available=quarantine_available,
+            )
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DataCorruptionError.from_bytes(
+            path,
+            payload,
+            entity_type=entity_type,
+            project=project,
+            entity_id=entity_id,
+            reason="invalid_utf8",
+            quarantine_available=quarantine_available,
+        ) from exc
+    try:
+        data = yaml.safe_load(text)
+        _validate_yaml_tree(data)
+    except (yaml.YAMLError, RecursionError, ValueError) as exc:
+        raise DataCorruptionError.from_bytes(
+            path,
+            payload,
+            entity_type=entity_type,
+            project=project,
+            entity_id=entity_id,
+            reason="invalid_yaml",
+            quarantine_available=quarantine_available,
+        ) from exc
+    if not isinstance(data, dict):
+        raise DataCorruptionError.from_bytes(
+            path,
+            payload,
+            entity_type=entity_type,
+            project=project,
+            entity_id=entity_id,
+            reason="top_level_not_object",
+            quarantine_available=quarantine_available,
+        )
+    return data
 
 
 def _safe_id(char_id: str) -> str:
@@ -169,7 +280,13 @@ def _safe_id(char_id: str) -> str:
 # ========== 角色卡 ==========
 
 def load_character(project: str, char_id: str) -> dict:
-    return load_yaml(get_character_path(project, char_id))
+    char_id = _safe_id(char_id)
+    return load_yaml(
+        get_character_path(project, char_id),
+        entity_type="character",
+        project=project,
+        entity_id=char_id,
+    )
 
 
 def list_characters(project: str) -> list[dict]:
@@ -177,10 +294,15 @@ def list_characters(project: str) -> list[dict]:
     if not d.exists():
         return []
     chars = []
-    for p in d.glob("*.yaml"):
+    for p in sorted(d.glob("*.yaml")):
         if p.stem.startswith("_") or p.stem.startswith("."):
             continue
-        data = load_yaml(p)
+        data = load_yaml(
+            p,
+            entity_type="character",
+            project=project,
+            entity_id=p.stem,
+        )
         if data:
             chars.append(data)
     return chars
@@ -188,12 +310,16 @@ def list_characters(project: str) -> list[dict]:
 
 def save_character(project: str, char_id: str, data: dict) -> Path:
     char_id = _safe_id(char_id)
+    if not isinstance(data, dict):
+        raise ValueError("角色卡数据顶层必须是对象")
+    data = dict(data)
     if data.get("id") and data["id"] != char_id:
         raise ValueError(f"文件 id({char_id}) 与内容 id({data['id']}) 不一致")
     data["id"] = char_id
-    d = resolve_under(ensure_project(project), "characters")
-    path = resolve_under(d, f"{char_id}.yaml")
-    _atomic_dump(path, data)
+    with yaml_write_transaction():
+        d = resolve_under(ensure_project(project), "characters")
+        path = resolve_under(d, f"{char_id}.yaml")
+        _atomic_dump(path, data)
     return path
 
 
@@ -210,10 +336,15 @@ def load_worldbook(project: str) -> list[dict]:
     if not d.exists():
         return []
     entries = []
-    for p in d.glob("*.yaml"):
+    for p in sorted(d.glob("*.yaml")):
         if p.stem.startswith("_") or p.stem.startswith("."):
             continue
-        data = load_yaml(p)
+        data = load_yaml(
+            p,
+            entity_type="worldbook",
+            project=project,
+            entity_id=p.stem,
+        )
         if data:
             entries.append(data)
     return entries
@@ -221,12 +352,16 @@ def load_worldbook(project: str) -> list[dict]:
 
 def save_worldbook(project: str, entry_id: str, data: dict) -> Path:
     entry_id = _safe_id(entry_id)
+    if not isinstance(data, dict):
+        raise ValueError("世界书数据顶层必须是对象")
+    data = dict(data)
     if data.get("id") and data["id"] != entry_id:
         raise ValueError(f"文件 id({entry_id}) 与内容 id({data['id']}) 不一致")
     data["id"] = entry_id
-    d = resolve_under(ensure_project(project), "worldbook")
-    path = resolve_under(d, f"{entry_id}.yaml")
-    _atomic_dump(path, data)
+    with yaml_write_transaction():
+        d = resolve_under(ensure_project(project), "worldbook")
+        path = resolve_under(d, f"{entry_id}.yaml")
+        _atomic_dump(path, data)
     return path
 
 
@@ -239,13 +374,21 @@ def delete_worldbook_entry(project: str, entry_id: str) -> bool:
 # ========== 用户档案 ==========
 
 def load_user_profile(project: str) -> dict:
-    return load_yaml(get_user_profile_path(project))
+    return load_yaml(
+        get_user_profile_path(project),
+        entity_type="user",
+        project=project,
+        entity_id="user",
+    )
 
 
 def save_user_profile(project: str, data: dict) -> Path:
-    d = ensure_project(project)
-    path = resolve_under(d, "user.yaml")
-    _atomic_dump(path, data)
+    if not isinstance(data, dict):
+        raise ValueError("用户档案数据顶层必须是对象")
+    with yaml_write_transaction():
+        d = ensure_project(project)
+        path = resolve_under(d, "user.yaml")
+        _atomic_dump(path, dict(data))
     return path
 
 

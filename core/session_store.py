@@ -227,22 +227,22 @@ class SessionStore:
     def history_dir(self, project: str) -> Path:
         return resolve_under(self.saves_dir(project), ".history")
 
-    def _require_project_sync(self, project: str, *, allow_empty_root: bool = False) -> Path:
+    def _require_project_sync(self, project: str) -> Path:
         project_dir = resolve_project_dir(self.projects_root, project)
         if project_dir.is_dir():
             return project_dir
-        if allow_empty_root:
-            existing = (
-                any(
-                    path.is_dir() and not path.name.startswith(".")
-                    for path in self.projects_root.iterdir()
-                )
-                if self.projects_root.is_dir()
-                else False
+        deleted = any(
+            manifest.get("entity_id") == project
+            and manifest.get("status") in {"complete", "restoring"}
+            for manifest in self.recovery_store.list_entries(
+                category="trash",
+                project=project,
+                entity_type="project",
             )
-            if not existing:
-                return project_dir
-        raise FileNotFoundError(f"项目 {project} 不存在")
+        )
+        if deleted:
+            raise FileNotFoundError(f"项目 {project} 已移入回收区")
+        return project_dir
 
     def _history_paths_sync(self, project: str, save_id: str) -> list[Path]:
         history_dir = self.history_dir(project)
@@ -322,18 +322,21 @@ class SessionStore:
         if not path.is_file():
             return None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            payload = path.read_bytes()
+            data = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise DataCorruptionError.from_path(
+            raise DataCorruptionError.from_bytes(
                 path,
+                payload,
                 entity_type="session",
                 project=project,
                 entity_id=save_id,
                 reason=f"JSON 解析失败: {exc}",
             ) from exc
         if not isinstance(data, dict):
-            raise DataCorruptionError.from_path(
+            raise DataCorruptionError.from_bytes(
                 path,
+                payload,
                 entity_type="session",
                 project=project,
                 entity_id=save_id,
@@ -345,8 +348,10 @@ class SessionStore:
         return self._read_sync(project, save_id)
 
     async def read(self, project: str, save_id: str) -> dict | None:
-        """纯读取：不创建目录、不 trim、不持久化兼容字段。"""
-        return await asyncio.to_thread(self._read_sync, project, save_id)
+        """纯读取；与同存档写事务串行，避免读到 Windows 替换窗口。"""
+        lock = await self.save_lock(project, save_id)
+        async with lock:
+            return await asyncio.to_thread(self._read_sync, project, save_id)
 
     def list_sessions_sync(self, project: str) -> list[dict]:
         """纯读取列表；坏档作为可识别条目返回，禁止静默隐藏。"""
@@ -440,7 +445,7 @@ class SessionStore:
             save_lock = await self.save_lock(project, save_id)
             async with save_lock:
                 def create_sync() -> dict:
-                    self._require_project_sync(project, allow_empty_root=True)
+                    self._require_project_sync(project)
                     if self.session_path(project, save_id).exists():
                         raise FileExistsError(f"存档 ID {save_id} 已存在")
                     created = normalize_session(deepcopy(session), project, save_id)
