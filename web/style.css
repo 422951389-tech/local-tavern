@@ -1517,3 +1517,15 @@ body {
     cursor: pointer;
 }
 .summary-cancel-btn:hover { color: #ff7070; border-color: #ff7070; }
+/* 仅供读屏器读取的实时状态，不参与视觉布局。 */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}

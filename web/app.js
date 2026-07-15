@@ -2,6 +2,26 @@
 // 流式对话、角色卡渲染、行动建议、会话管理、提示词编辑
 
 if (!globalThis.TavernSecurity) throw new Error('安全渲染模块未加载');
+if (!globalThis.TavernApi) throw new Error('ApiClient 模块未加载');
+if (!globalThis.TavernSessionRef) throw new Error('SessionRef 模块未加载');
+if (!globalThis.TavernTurn) throw new Error('TurnClient 模块未加载');
+
+const { ApiClient, ApiError, payloadMessage } = globalThis.TavernApi;
+const {
+    SessionRefTracker,
+    sessionBelongsToRef,
+    buildSessionCommit,
+    shouldCreateDefaultSave,
+} = globalThis.TavernSessionRef;
+const {
+    TurnClient,
+    TERMINAL_STATUSES,
+    createTurnState,
+    reduceTurnEvent,
+    canPerformAction,
+} = globalThis.TavernTurn;
+const apiClient = new ApiClient({ timeoutMs: 15000 });
+const turnClient = new TurnClient(apiClient);
 
 const API = {
     models: '/api/models',
@@ -9,7 +29,6 @@ const API = {
     user: '/api/user',
     worldbook: '/api/worldbook',
     session: '/api/session',
-    chat: '/api/chat',
     reset: '/api/session/reset',
     switchModel: '/api/model/switch',
     // 项目
@@ -49,6 +68,8 @@ const state = {
     projectList: [],
     saveList: [],
     isStreaming: false,
+    navigationBusy: false,
+    activeTurn: null,
     modelParams: {
         temperature: 0.8,
         top_p: 0.9,
@@ -58,34 +79,61 @@ const state = {
     },
 };
 
-let activeController = null;   // 当前流式请求的 AbortController，用于中途取消
+const sessionRefs = new SessionRefTracker(state.currentProject, state.currentSave);
+let committedSessionRef = sessionRefs.capture();
+let activeController = null;   // 当前 turn SSE 的 AbortController；业务取消必须调用服务端 cancel API
+const latestRequest = { projects: 0, projectStats: 0, saves: 0 };
 
-function currentRevision() {
+function currentRevision(ref = captureSessionRef()) {
+    if (!isCurrentSessionRef(ref) || !sessionBelongsToRef(state.session, ref)) return 0;
     const revision = state.session && state.session.revision;
     return Number.isInteger(revision) && revision >= 0 ? revision : 0;
 }
 
 function errorDetail(payload, fallback = '请求失败') {
-    if (!payload) return fallback;
-    if (typeof payload.detail === 'string') return payload.detail;
-    if (payload.detail && payload.detail.code === 'revision_conflict') {
-        return `存档版本冲突（当前 revision ${payload.detail.current_revision}）`;
-    }
-    if (payload.detail && typeof payload.detail.message === 'string') return payload.detail.message;
-    if (payload.error && typeof payload.error === 'object') {
-        return payload.error.message || payload.error.code || fallback;
-    }
-    return payload.error || fallback;
+    if (payload instanceof Error) return payload.message || fallback;
+    return payloadMessage(payload, fallback);
 }
 
-function captureSessionRef(project = state.currentProject, save = state.currentSave) {
-    return { project, save };
+function captureSessionRef() {
+    return sessionRefs.capture();
 }
 
 function isCurrentSessionRef(ref) {
-    return Boolean(ref)
-        && state.currentProject === ref.project
-        && state.currentSave === ref.save;
+    return sessionRefs.isCurrent(ref);
+}
+
+function setNavigationUiState(active) {
+    state.navigationBusy = active;
+    const blocked = active || Boolean(state.activeTurn && !state.activeTurn.terminal);
+    for (const id of ['project-btn', 'tab-saves', 'model-select', 'reset-btn']) {
+        const element = document.getElementById(id);
+        if (!element) continue;
+        if ('disabled' in element) element.disabled = blocked;
+        element.setAttribute('aria-disabled', String(blocked));
+        element.setAttribute('aria-busy', String(active));
+    }
+}
+
+function beginSessionTransition(project, save = null) {
+    setNavigationUiState(true);
+    return sessionRefs.advance(project, save);
+}
+
+function rollbackSessionTransition(candidateRef) {
+    if (isCurrentSessionRef(candidateRef)) {
+        sessionRefs.advance(committedSessionRef.project, committedSessionRef.save);
+        setNavigationUiState(false);
+    }
+}
+
+function commitSessionIdentity(ref) {
+    if (!isCurrentSessionRef(ref)) return false;
+    state.currentProject = ref.project;
+    state.currentSave = ref.save;
+    committedSessionRef = ref;
+    setNavigationUiState(false);
+    return true;
 }
 
 function sessionFromResult(body) {
@@ -96,94 +144,151 @@ function sessionFromResult(body) {
     return session;
 }
 
-function sessionBelongsToRef(session, ref) {
-    if (!session || !ref || session.session_id !== ref.save) return false;
-    return !session.project || session.project === ref.project;
-}
-
 function applySessionResult(payload, ref = null) {
     if (ref && !isCurrentSessionRef(ref)) return null;
     const session = sessionFromResult(payload);
     if (!session || (ref && !sessionBelongsToRef(session, ref))) return null;
-    state.session = session;
+    if (!commitSessionState(session, ref || captureSessionRef())) return null;
     return session;
 }
 
-async function sessionWrite(url, method, payload, label = '保存', options = {}) {
-    const requestRef = captureSessionRef(
-        payload && payload.project !== undefined ? payload.project : state.currentProject,
-        payload && payload.save !== undefined ? payload.save : state.currentSave,
-    );
-    const response = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...payload, expected_revision: currentRevision() }),
+function commitSessionState(session, ref) {
+    const commit = buildSessionCommit({
+        session,
+        ref,
+        currentRef: captureSessionRef(),
+        currentSession: state.session,
+        saveList: state.saveList,
     });
-    if (response.status === 409) {
-        const conflict = await response.json().catch(() => ({}));
-        if (isCurrentSessionRef(requestRef)) {
-            try { await reloadCurrentSession(); } catch (e) {}
+    if (!commit.accepted) return false;
+    if (!commitSessionIdentity(ref)) return false;
+    state.session = commit.session;
+    state.saveList = commit.saveList;
+    renderSession(commit.session);
+    renderHistory(commit.messageHistory);
+    const modelSelect = document.getElementById('model-select');
+    if (modelSelect && commit.currentModel) modelSelect.value = commit.currentModel;
+    renderSaveListControls();
+    if (isTurnActiveForRef(ref)) setTurnUiState(true, Boolean(state.activeTurn && state.activeTurn.cancelling));
+    return true;
+}
+
+function isTurnActiveForRef(ref = captureSessionRef()) {
+    return Boolean(
+        state.activeTurn
+        && !state.activeTurn.terminal
+        && state.activeTurn.ref
+        && state.activeTurn.ref.project === ref.project
+        && state.activeTurn.ref.save === ref.save
+        && state.activeTurn.ref.epoch === ref.epoch
+    );
+}
+
+async function sessionWrite(url, method, payload, label = '保存', options = {}) {
+    const requestRef = captureSessionRef();
+    if (state.navigationBusy) throw new ApiError('正在切换项目或存档，请稍候', { code: 'navigation_busy' });
+    if (isTurnActiveForRef(requestRef)) {
+        throw new ApiError('当前存档正在生成，请先取消或等待完成', { code: 'active_turn_client' });
+    }
+    if (
+        (payload && payload.project !== undefined && payload.project !== requestRef.project)
+        || (payload && payload.save !== undefined && payload.save !== requestRef.save)
+    ) {
+        throw new ApiError(`${label}目标与当前存档不一致`, { code: 'stale_session_ref' });
+    }
+    const expectedRevision = currentRevision(requestRef);
+    if (!sessionBelongsToRef(state.session, requestRef)) {
+        throw new ApiError('当前存档尚未加载完成', { code: 'session_not_ready' });
+    }
+    let result;
+    try {
+        result = await apiClient.request(url, {
+            method,
+            json: { ...payload, expected_revision: expectedRevision },
+            signal: options.signal,
+            timeoutMs: options.timeoutMs,
+        });
+    } catch (error) {
+        if (error instanceof ApiError && error.status === 409 && isCurrentSessionRef(requestRef)) {
+            try { await reloadCurrentSession(requestRef); } catch (_reloadError) {}
         }
-        throw new Error(errorDetail(conflict, `${label}冲突，已重新加载`));
+        throw error;
     }
-    if (!response.ok) {
-        const error = await response.json().catch(() => ({}));
-        throw new Error(errorDetail(error, `${label}失败：HTTP ${response.status}`));
+    if (options.applyResult !== false) {
+        const applied = applySessionResult(result, requestRef);
+        if (!applied && isCurrentSessionRef(requestRef)) {
+            throw new ApiError(`${label}响应缺少有效存档`, {
+                code: 'invalid_response_schema', payload: result,
+            });
+        }
     }
-    const result = await response.json();
-    if (options.applyResult !== false) applySessionResult(result, requestRef);
     return result;
 }
 
 // ===== 项目列表 =====
 async function loadProjects() {
-    try {
-        const res = await fetch(API.projects);
-        const data = await res.json();
-        state.projectList = data.projects || [];
-        if (state.projectList.length === 0) state.projectList = ['默认项目'];
-
-        // 兼容旧 select（hidden 但仍存在）
-        const oldSelect = document.getElementById('project-select');
-        if (oldSelect) {
-            oldSelect.innerHTML = '';
-            state.projectList.forEach(p => {
-                const opt = document.createElement('option');
-                opt.value = p; opt.textContent = p;
-                oldSelect.appendChild(opt);
-            });
-            oldSelect.value = state.currentProject;
-        }
-        // 渲染新顶栏的项目下拉
-        await renderProjectDropdown();
-    } catch (e) {
-        console.warn('加载项目失败', e);
+    const requestRef = captureSessionRef();
+    const requestId = ++latestRequest.projects;
+    const data = await apiClient.get(API.projects, {
+        schema: body => Array.isArray(body && body.projects) || '项目列表响应无效',
+    });
+    if (!isCurrentSessionRef(requestRef) || requestId !== latestRequest.projects) return null;
+    if (data.projects.length === 0) {
+        throw new ApiError('服务端没有可用项目', { code: 'empty_project_list' });
     }
+    state.projectList = [...data.projects];
+
+    const oldSelect = document.getElementById('project-select');
+    if (oldSelect) {
+        oldSelect.innerHTML = '';
+        state.projectList.forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p;
+            opt.textContent = p;
+            oldSelect.appendChild(opt);
+        });
+        oldSelect.value = state.currentProject;
+    }
+    await renderProjectDropdown(requestRef);
+    return state.projectList;
 }
 
 // ===== 项目下拉渲染（含元信息） =====
-async function renderProjectDropdown() {
+async function renderProjectDropdown(requestRef = captureSessionRef()) {
     const listEl = document.getElementById('project-list');
     if (!listEl) return;
+    const requestId = ++latestRequest.projectStats;
 
     // 并发拉每个项目的 stats（角色/世界书/存档数）
     const stats = {};
-    await Promise.all(state.projectList.map(async (p) => {
+    const projectList = [...state.projectList];
+    await Promise.all(projectList.map(async (p) => {
         try {
             const [c, w, s] = await Promise.all([
-                fetch(`${API.characters}?project=${encodeURIComponent(p)}`).then(r => r.json()).catch(() => ({characters:[]})),
-                fetch(`${API.worldbook}?project=${encodeURIComponent(p)}`).then(r => r.json()).catch(() => ({entries:[]})),
-                fetch(`${API.sessions}?project=${encodeURIComponent(p)}`).then(r => r.json()).catch(() => ({sessions:[]})),
+                apiClient.get(`${API.characters}?project=${encodeURIComponent(p)}`, {
+                    schema: body => Array.isArray(body && body.characters) || '角色列表响应无效',
+                }),
+                apiClient.get(`${API.worldbook}?project=${encodeURIComponent(p)}`, {
+                    schema: body => Array.isArray(body && body.entries) || '世界书列表响应无效',
+                }),
+                apiClient.get(`${API.sessions}?project=${encodeURIComponent(p)}`, {
+                    schema: body => Array.isArray(body && body.sessions) || '存档列表响应无效',
+                }),
             ]);
             stats[p] = {
                 chars: (c.characters || []).length,
                 world: (w.entries || []).length,
                 saves: (s.sessions || []).length,
             };
-        } catch { stats[p] = { chars: 0, world: 0, saves: 0 }; }
+        } catch (error) {
+            console.warn(`加载项目 ${p} 元信息失败`, error);
+            stats[p] = { chars: '—', world: '—', saves: '—' };
+        }
     }));
 
-    listEl.innerHTML = state.projectList.map(p => {
+    if (!isCurrentSessionRef(requestRef) || requestId !== latestRequest.projectStats) return;
+
+    listEl.innerHTML = projectList.map(p => {
         const st = stats[p] || { chars:0, world:0, saves:0 };
         const active = p === state.currentProject ? 'active' : '';
         return `<div class="dropdown-item ${active}" data-project="${escapeHtml(p)}">
@@ -216,6 +321,8 @@ function updateProjectButton(statsMap) {
 
 // ===== Toast 提示 =====
 function showToast(msg, duration = 1800) {
+    const status = document.getElementById('app-status');
+    if (status) status.textContent = String(msg || '');
     let el = document.getElementById('toast-msg');
     if (!el) {
         el = document.createElement('div');
@@ -243,26 +350,22 @@ function positionDropdown(panel, anchor) {
 // ===== 初始化 =====
 async function init() {
     try {
-        await loadModels();
-        await loadProjects();
+        await Promise.all([loadModels(), loadProjects(), loadSettings()]);
         // 优先用 URL hash 指定的项目；其次用「默认项目」字面量；最后才 fallback 到 projectList[0]
         const hash = window.location.hash.replace('#', '');
-        if (hash && state.projectList.includes(hash)) state.currentProject = hash;
-        else if (state.projectList.includes('默认项目')) state.currentProject = '默认项目';
-        else if (state.projectList.length > 0) state.currentProject = state.projectList[0];
-        // 刷新项目下拉（让当前项目高亮 + 显示元信息）
-        await renderProjectDropdown();
-        // 同步旧 select（兜底）
-        const oldProjSel = document.getElementById('project-select');
-        if (oldProjSel) oldProjSel.value = state.currentProject;
-
-        await loadUser();
-        await loadCharacters();
-        await loadSettings();
-        await loadSaveList();
-        await loadOrCreateCurrentSave();
+        const persistedTurn = readPersistedTurnPointer();
+        let initialProject = state.projectList[0];
+        if (persistedTurn && state.projectList.includes(persistedTurn.project)) initialProject = persistedTurn.project;
+        else if (hash && state.projectList.includes(hash)) initialProject = hash;
+        else if (state.projectList.includes('默认项目')) initialProject = '默认项目';
+        const preferredSave = persistedTurn && persistedTurn.project === initialProject
+            ? persistedTurn.save
+            : null;
+        await loadProjectContext(initialProject, preferredSave);
+        await renderProjectDropdown(captureSessionRef());
         bindUI();
         showToast(`已进入「${state.currentProject}」`, 1500);
+        resumePersistedTurn(persistedTurn).catch(error => console.warn('恢复 turn 失败', error));
     } catch (e) {
         console.error('初始化失败', e);
         alert('初始化失败：' + e.message + '\n请确认 server.py 已启动');
@@ -271,9 +374,9 @@ async function init() {
 
 async function loadSettings() {
     try {
-        const res = await fetch(API.settings);
-        if (!res.ok) return;
-        const s = await res.json();
+        const s = await apiClient.get(API.settings, {
+            schema: body => Boolean(body && typeof body === 'object' && !Array.isArray(body)) || '设置响应无效',
+        });
         if (s.temperature !== undefined) state.modelParams.temperature = s.temperature;
         if (s.top_p !== undefined) state.modelParams.top_p = s.top_p;
         if (s.top_k !== undefined) state.modelParams.top_k = s.top_k;
@@ -284,17 +387,14 @@ async function loadSettings() {
 
 async function saveSettings() {
     try {
-        await fetch(API.settings, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ data: state.modelParams }),
-        });
+        await apiClient.put(API.settings, { data: state.modelParams });
     } catch (e) { console.warn('保存设置失败', e); }
 }
 
 async function loadModels() {
-    const res = await fetch(API.models);
-    const data = await res.json();
+    const data = await apiClient.get(API.models, {
+        schema: body => Array.isArray(body && body.models) || '模型列表响应无效',
+    });
     const select = document.getElementById('model-select');
     select.innerHTML = '';
     data.models.forEach(m => {
@@ -305,23 +405,110 @@ async function loadModels() {
     });
 }
 
-async function loadUser() {
-    await fetch(`${API.user}?project=${encodeURIComponent(state.currentProject)}`);
+async function loadUser(project = state.currentProject) {
+    return apiClient.get(`${API.user}?project=${encodeURIComponent(project)}`, {
+        schema: body => Boolean(body && typeof body === 'object' && !Array.isArray(body)) || '用户档案响应无效',
+    });
 }
 
-async function loadCharacters() {
-    const res = await fetch(`${API.characters}?project=${encodeURIComponent(state.currentProject)}`);
-    const data = await res.json();
-    state.characters = data.characters || [];
+async function loadCharacters(project = state.currentProject) {
+    const data = await apiClient.get(`${API.characters}?project=${encodeURIComponent(project)}`, {
+        schema: body => Array.isArray(body && body.characters) || '角色列表响应无效',
+    });
+    return data.characters;
+}
+
+async function fetchSaveList(project) {
+    const data = await apiClient.get(`${API.sessions}?project=${encodeURIComponent(project)}`, {
+        schema: body => Array.isArray(body && body.sessions) || '存档列表响应无效',
+    });
+    return data.sessions;
+}
+
+async function fetchSession(ref) {
+    if (!ref || !ref.save) throw new ApiError('缺少存档引用', { code: 'invalid_session_ref' });
+    const url = `${API.session}?project=${encodeURIComponent(ref.project)}&save=${encodeURIComponent(ref.save)}`;
+    const session = await apiClient.get(url, {
+        schema: body => Boolean(sessionFromResult(body)) || '存档响应无效',
+    });
+    if (!sessionBelongsToRef(session, ref)) {
+        throw new ApiError('服务端返回了其他存档', { code: 'session_ref_mismatch', payload: session });
+    }
+    return session;
+}
+
+async function loadProjectContext(project, preferredSave = null) {
+    if (!project) throw new ApiError('缺少项目 ID', { code: 'invalid_project_ref' });
+    if (state.navigationBusy) throw new ApiError('正在切换项目或存档，请稍候', { code: 'navigation_busy' });
+    if (isTurnActiveForRef(committedSessionRef)) {
+        throw new ApiError('当前存档正在生成，请先取消或等待完成', { code: 'active_turn_client' });
+    }
+
+    let candidateRef = beginSessionTransition(project, null);
+    try {
+        const [characters, saves] = await Promise.all([
+            loadCharacters(project),
+            fetchSaveList(project),
+            loadUser(project),
+        ]).then(values => [values[0], values[1]]);
+        if (!isCurrentSessionRef(candidateRef)) return false;
+
+        let nextSaves = [...saves];
+        let session;
+        let saveId = preferredSave && saves.some(item => item.session_id === preferredSave)
+            ? preferredSave
+            : (saves[0] && saves[0].session_id);
+        if (!saveId && shouldCreateDefaultSave(saves, candidateRef, captureSessionRef())) {
+            session = await apiClient.post(API.sessionCreate, { project, name: '默认存档' }, {
+                schema: body => Boolean(sessionFromResult(body)) || '创建存档响应无效',
+            });
+            if (!isCurrentSessionRef(candidateRef)) return false;
+            saveId = session.session_id;
+            nextSaves = [{
+                session_id: saveId,
+                name: session.name || saveId,
+                message_count: Array.isArray(session.message_history) ? session.message_history.length : 0,
+                updated_at: session.updated_at || '',
+            }];
+        }
+        if (!saveId) throw new ApiError('存档列表已失效，未创建默认存档', { code: 'stale_session_ref' });
+
+        candidateRef = sessionRefs.advance(project, saveId);
+        if (!session) session = await fetchSession(candidateRef);
+        if (!isCurrentSessionRef(candidateRef)) return false;
+
+        state.characters = characters;
+        state.saveList = nextSaves;
+        if (!commitSessionState(session, candidateRef)) return false;
+        window.location.hash = `#${project}`;
+        const projectName = document.getElementById('project-name');
+        if (projectName) projectName.textContent = project;
+        const oldProjectSelect = document.getElementById('project-select');
+        if (oldProjectSelect) oldProjectSelect.value = project;
+        renderSaveListControls();
+        return true;
+    } catch (error) {
+        rollbackSessionTransition(candidateRef);
+        throw error;
+    }
 }
 
 // ===== 存档管理 =====
 
-async function loadSaveList() {
-    const res = await fetch(`${API.sessions}?project=${encodeURIComponent(state.currentProject)}`);
-    const data = await res.json();
-    state.saveList = data.sessions || [];
+async function loadSaveList(requestRef = captureSessionRef()) {
+    const requestId = ++latestRequest.saves;
+    const saves = await fetchSaveList(requestRef.project);
+    if (
+        !isCurrentSessionRef(requestRef)
+        || state.currentProject !== requestRef.project
+        || requestId !== latestRequest.saves
+    ) return null;
+    state.saveList = [...saves];
+    renderSaveListControls();
+    return state.saveList;
+}
 
+function renderSaveListControls() {
     // 兼容旧 select
     const oldSelect = document.getElementById('save-select');
     if (oldSelect) {
@@ -371,64 +558,64 @@ function renderSaveDropdown() {
 }
 
 async function loadOrCreateCurrentSave() {
-    if (state.saveList.length === 0) {
-        const res = await fetch(API.sessionCreate, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ project: state.currentProject, name: '默认存档' }),
-        });
-        const session = await res.json();
-        state.currentSave = session.session_id;
-        state.session = session;
-        await loadSaveList();
-    } else {
-        state.currentSave = state.saveList[0].session_id;
-        await loadCurrentSession();
-    }
-    document.getElementById('save-select').value = state.currentSave;
-    renderSession(state.session);
-    renderHistory(state.session.message_history || []);
+    return loadProjectContext(state.currentProject);
 }
 
-async function loadCurrentSession() {
-    const url = `${API.session}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
-    const res = await fetch(url);
-    state.session = await res.json();
+async function loadCurrentSession(requestRef = captureSessionRef()) {
+    const session = await fetchSession(requestRef);
+    if (!isCurrentSessionRef(requestRef)) return null;
+    return commitSessionState(session, requestRef) ? session : null;
 }
 
 async function switchSave(newSaveId) {
     if (!newSaveId || newSaveId === state.currentSave) return;
-    if (state.isStreaming && activeController) activeController.abort();
-    state.currentSave = newSaveId;
-    await loadCurrentSession();
-    renderSession(state.session);
-    renderHistory(state.session.message_history || []);
-    if (state.session.current_model) {
-        document.getElementById('model-select').value = state.session.current_model;
+    if (state.navigationBusy) {
+        showToast('正在切换项目或存档，请稍候');
+        return;
     }
-    document.getElementById('suggestions').innerHTML = '';
-    document.getElementById('thinking-panel').classList.add('hidden');
+    if (isTurnActiveForRef(committedSessionRef)) {
+        showToast('当前存档正在生成，请先取消或等待完成');
+        return;
+    }
+    const candidateRef = beginSessionTransition(state.currentProject, newSaveId);
+    try {
+        const session = await fetchSession(candidateRef);
+        if (!isCurrentSessionRef(candidateRef)) return;
+        if (!commitSessionState(session, candidateRef)) return;
+        document.getElementById('suggestions').innerHTML = '';
+        document.getElementById('thinking-panel').classList.add('hidden');
+    } catch (error) {
+        rollbackSessionTransition(candidateRef);
+        showToast(`切换存档失败：${errorDetail(error)}`, 3000);
+    }
 }
 
 async function createNewSave(name) {
-    const res = await fetch(API.sessionCreate, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project: state.currentProject, name }),
-    });
-    if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        showToast('创建失败：' + (err.detail || `HTTP ${res.status}`));
+    if (!name || state.navigationBusy || isTurnActiveForRef(committedSessionRef)) {
+        showToast(state.navigationBusy ? '正在切换，请稍候' : '当前存档正在生成，请先取消或等待完成');
         return null;
     }
-    const session = await res.json();
-    await loadSaveList();
-    state.currentSave = session.session_id;
-    state.session = session;
-    document.getElementById('save-select').value = state.currentSave;
-    renderSession(session);
-    renderHistory([]);
-    document.getElementById('suggestions').innerHTML = '';
+    let candidateRef = beginSessionTransition(state.currentProject, null);
+    try {
+        const session = await apiClient.post(API.sessionCreate, {
+            project: state.currentProject,
+            name,
+        }, {
+            schema: body => Boolean(sessionFromResult(body)) || '创建存档响应无效',
+        });
+        if (!isCurrentSessionRef(candidateRef)) return null;
+        candidateRef = sessionRefs.advance(state.currentProject, session.session_id);
+        const saves = await fetchSaveList(candidateRef.project);
+        if (!isCurrentSessionRef(candidateRef)) return null;
+        state.saveList = saves;
+        if (!commitSessionState(session, candidateRef)) return null;
+        document.getElementById('suggestions').innerHTML = '';
+        return session;
+    } catch (error) {
+        rollbackSessionTransition(candidateRef);
+        showToast(`创建失败：${errorDetail(error)}`, 3000);
+        return null;
+    }
 }
 
 async function renameCurrentSave(newName) {
@@ -451,12 +638,15 @@ async function renameCurrentSave(newName) {
         alert('重命名失败：响应缺少有效存档');
         return;
     }
-    state.session = session;
-    state.currentSave = session.session_id;
-    const renamedRef = captureSessionRef();
-    await loadSaveList();
-    if (!isCurrentSessionRef(renamedRef)) return;
-    document.getElementById('save-select').value = state.currentSave;
+    const candidateRef = beginSessionTransition(requestRef.project, session.session_id);
+    state.saveList = state.saveList.map(item => item.session_id === requestRef.save
+        ? { ...item, session_id: session.session_id, name: session.name || newName }
+        : item);
+    if (!commitSessionState(session, candidateRef)) {
+        rollbackSessionTransition(candidateRef);
+        return;
+    }
+    renderSaveListControls();
 }
 
 async function deleteCurrentSave() {
@@ -465,7 +655,6 @@ async function deleteCurrentSave() {
         alert('至少保留 1 个存档');
         return;
     }
-    if (state.isStreaming && activeController) activeController.abort();
     const requestRef = captureSessionRef();
     const s = state.saveList.find(x => x.session_id === state.currentSave);
     const name = s ? s.name : state.currentSave;
@@ -486,16 +675,21 @@ async function deleteCurrentSave() {
     }
     if (!isCurrentSessionRef(requestRef)) return;
     showToast('存档已移入回收区，可恢复');
-    await loadSaveList();
-    if (!isCurrentSessionRef(requestRef)) return;
-    await loadOrCreateCurrentSave();
+    try {
+        await loadProjectContext(requestRef.project);
+    } catch (error) {
+        showToast(`刷新剩余存档失败：${errorDetail(error)}`, 3000);
+    }
 }
 
 async function exportCurrentSave() {
     if (!state.currentSave) return;
-    const url = `${API.sessionExport}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
-    const res = await fetch(url);
-    const data = await res.json();
+    const requestRef = captureSessionRef();
+    const url = `${API.sessionExport}?project=${encodeURIComponent(requestRef.project)}&save=${encodeURIComponent(requestRef.save)}`;
+    const data = await apiClient.get(url, {
+        schema: body => Boolean(body && typeof body.json_str === 'string') || '导出响应无效',
+    });
+    if (!isCurrentSessionRef(requestRef)) return;
     const blob = new Blob([data.json_str], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -508,54 +702,56 @@ async function importSave(file) {
     const validationError = TavernSecurity.validateImportFile(file);
     if (validationError) throw new Error(validationError);
     const text = await file.text();
-    const res = await fetch(API.sessionImport, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project: state.currentProject, json_str: text, name: file.name.replace(/\.json$/i, '') }),
+    const requestRef = captureSessionRef();
+    await apiClient.post(API.sessionImport, {
+        project: requestRef.project,
+        json_str: text,
+        name: file.name.replace(/\.json$/i, ''),
+    }, {
+        schema: body => Boolean(sessionFromResult(body)) || '导入响应无效',
     });
-    if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `HTTP ${res.status}`);
-    }
-    await loadSaveList();
+    if (!isCurrentSessionRef(requestRef)) return false;
+    await loadSaveList(requestRef);
     return true;
 }
 
 async function switchProject(newProject) {
     if (!newProject || newProject === state.currentProject) return;
-    // A9：切换前若还在生成中，等待流结束（防止跨项目竞态）
-    if (state.isStreaming) {
-        showToast('正在生成中，请稍候再切换项目');
+    if (state.navigationBusy) {
+        showToast('正在切换项目或存档，请稍候');
         return;
     }
-    state.currentProject = newProject;
-    window.location.hash = '#' + newProject;
-    document.getElementById('project-name').textContent = newProject;
-    await loadUser();
-    await loadCharacters();
-    await loadSaveList();
-    await loadOrCreateCurrentSave();
-    // 视觉反馈：顶栏项目按钮高亮 + toast
-    const btn = document.getElementById('project-btn');
-    if (btn) {
-        btn.classList.add('highlight');
-        setTimeout(() => btn.classList.remove('highlight'), 700);
+    if (isTurnActiveForRef(committedSessionRef)) {
+        showToast('当前存档正在生成，请先取消或等待完成');
+        return;
     }
-    showToast(`已切换到「${newProject}」`);
-    // 刷新元信息（角色/世界书/存档数变了）
-    await renderProjectDropdown();
+    try {
+        const switched = await loadProjectContext(newProject);
+        if (!switched) return;
+        const btn = document.getElementById('project-btn');
+        if (btn) {
+            btn.classList.add('highlight');
+            setTimeout(() => btn.classList.remove('highlight'), 700);
+        }
+        showToast(`已切换到「${newProject}」`);
+        await renderProjectDropdown(captureSessionRef());
+    } catch (error) {
+        showToast(`切换项目失败：${errorDetail(error)}`, 3000);
+    }
 }
 
 async function createNewProject(name) {
-    const res = await fetch(API.projects, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name }),
+    if (state.navigationBusy || isTurnActiveForRef(committedSessionRef)) {
+        throw new ApiError('当前正在切换或生成，请稍候', { code: 'ui_busy' });
+    }
+    const requestRef = captureSessionRef();
+    const created = await apiClient.post(API.projects, { name }, {
+        schema: body => Boolean(body && typeof body.name === 'string') || '创建项目响应无效',
     });
-    if (!res.ok) { const err = await res.json(); alert('创建失败：' + (err.detail || '')); return; }
-    const created = await res.json();
+    if (!isCurrentSessionRef(requestRef)) return null;
     await loadProjects();
     await switchProject(created.name);
+    return created;
 }
 
 // ===== 渲染 =====
@@ -718,11 +914,6 @@ function bindMessageActions(msgEl) {
                     alert('钉选失败: ' + (res && res.error ? res.error : '网络错误'));
                     return;
                 }
-                // 以服务端真实状态为准
-                const nowPinned = res.session && res.session.message_history
-                    && res.session.message_history.find(message => message.id === messageId)?.pinned;
-                pinBtn.classList.toggle('active', !!nowPinned);
-                Object.assign(state.session, res.session || {});
                 // 常驻超 15 条软上限提示（非阻塞 toast）
                 if (res.pinned_count > 15) {
                     showToast(`已钉选 ${res.pinned_count} 条常驻记忆，偏多，建议清理早期钉选`, 3000);
@@ -807,10 +998,8 @@ async function regenerateFrom(messageRef) {
     await sendMessage(lastUserMsg.content, true);
 }
 
-async function reloadCurrentSession() {
-    await loadCurrentSession();
-    renderSession(state.session);
-    renderHistory(state.session.message_history || []);
+async function reloadCurrentSession(requestRef = captureSessionRef()) {
+    return loadCurrentSession(requestRef);
 }
 
 // ===== 角色卡渲染 =====
@@ -1078,9 +1267,7 @@ async function regenerateLastSummary(panel, sess) {
             save: state.currentSave,
         }, '重生成总结');
         if (res.error) { alert('重新生成失败: ' + res.error); if (btn) btn.disabled = false; return; }
-        // 成功 → 刷新存档与对话，重新渲染面板（旧 panel 已脱离 DOM）
-        if (res.session) Object.assign(state.session, res.session);
-        await reloadCurrentSession();
+        // sessionWrite 已原子提交并重绘完整 Session。
         const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
         if (lastAI) renderSummaryPanel(lastAI, state.session);
     } catch (e) {
@@ -1105,118 +1292,354 @@ function renderSuggestions(suggestions) {
 
 // ===== 发送消息 =====
 
-async function sendMessage(text = null, isRegenerate = false) {
-    const input = document.getElementById('user-input');
-    const userText = text !== null ? text : input.value.trim();
-    if (!userText || state.isStreaming) return;
-    const expectedRevision = currentRevision();
-    // 清空上一轮残留思考内容，避免跨轮累积串味
-    const tc = document.getElementById('thinking-content');
-    if (tc) tc.textContent = '';
-    if (!isRegenerate) input.value = '';
-    if (!isRegenerate) appendUserMessage(userText);
-    const targetEl = appendAssistantMessage('（生成中…）');
-    state.isStreaming = true;
-    // 新建 AbortController，用于中途取消
-    activeController = new AbortController();
-    // 切流式态：隐藏发送、显示取消
+const ACTIVE_TURN_STORAGE_KEY = 'local-tavern.active-turn.v1';
+
+function readPersistedTurnPointer() {
+    try {
+        const value = JSON.parse(sessionStorage.getItem(ACTIVE_TURN_STORAGE_KEY) || 'null');
+        if (!value || typeof value.turnId !== 'string') return null;
+        if (typeof value.project !== 'string' || typeof value.save !== 'string') return null;
+        return {
+            turnId: value.turnId,
+            project: value.project,
+            save: value.save,
+            lastEventId: Number.isSafeInteger(value.lastEventId) && value.lastEventId >= 0
+                ? value.lastEventId
+                : 0,
+        };
+    } catch (_error) {
+        return null;
+    }
+}
+
+function persistActiveTurn(turn = state.activeTurn) {
+    if (!turn || !turn.turnId || !turn.ref) return;
+    try {
+        sessionStorage.setItem(ACTIVE_TURN_STORAGE_KEY, JSON.stringify({
+            turnId: turn.turnId,
+            project: turn.ref.project,
+            save: turn.ref.save,
+            lastEventId: turn.lastEventId || 0,
+        }));
+    } catch (_error) {}
+}
+
+function clearPersistedTurn() {
+    try { sessionStorage.removeItem(ACTIVE_TURN_STORAGE_KEY); } catch (_error) {}
+}
+
+function setTurnUiState(active, cancelling = false) {
+    state.isStreaming = active;
     const sendBtn = document.getElementById('send-btn');
     const cancelBtn = document.getElementById('send-cancel-btn');
-    sendBtn.classList.add('hidden');
-    cancelBtn.classList.remove('hidden');
+    if (sendBtn) {
+        sendBtn.disabled = active;
+        sendBtn.classList.toggle('hidden', active);
+        sendBtn.setAttribute('aria-disabled', String(active));
+    }
+    if (cancelBtn) {
+        cancelBtn.disabled = !active || cancelling;
+        cancelBtn.classList.toggle('hidden', !active);
+        cancelBtn.setAttribute('aria-busy', String(cancelling));
+        cancelBtn.textContent = cancelling ? '正在取消…' : '⏹ 取消';
+    }
 
-    let rawContent = '';
+    const selectors = [
+        '#project-btn', '#tab-saves', '#model-select', '#reset-btn',
+        '#save-new-inline', '#save-rename-inline', '#save-delete-inline',
+        '#save-import-inline', '#history-btn',
+        '.msg-action-btn', '.msg-checkbox', '.summary-save-btn', '.summary-regen-btn',
+        '.history-restore', '.ce-save', '.ce-delete',
+    ];
+    document.querySelectorAll(selectors.join(',')).forEach(element => {
+        if ('disabled' in element) element.disabled = active;
+        element.setAttribute('aria-disabled', String(active));
+    });
+}
+
+function makeProvisionalTurn(ref) {
+    return {
+        turnId: null,
+        ref,
+        status: 'pending',
+        lastEventId: 0,
+        content: '',
+        thinking: '',
+        parsed: null,
+        error: null,
+        terminal: false,
+        terminalCount: 0,
+        provisional: true,
+        cancelling: false,
+    };
+}
+
+function renderActiveTurnBuffer(turn = state.activeTurn) {
+    if (!turn) return;
+    if (turn.targetEl && turn.targetEl.isConnected) {
+        turn.targetEl.textContent = turn.content || (turn.terminal ? '' : '（生成中…）');
+    }
+    const thinking = document.getElementById('thinking-content');
+    const panel = document.getElementById('thinking-panel');
+    if (thinking) thinking.textContent = turn.thinking || '';
+    if (panel) panel.classList.toggle('hidden', !turn.thinking);
+}
+
+function installActiveTurn(turn, ref, options = {}) {
+    const base = createTurnState(turn, ref);
+    activeController = new AbortController();
+    state.activeTurn = {
+        ...base,
+        lastEventId: options.lastEventId === undefined ? base.lastEventId : options.lastEventId,
+        content: options.content === undefined ? base.content : options.content,
+        thinking: options.thinking === undefined ? base.thinking : options.thinking,
+        controller: activeController,
+        targetEl: options.targetEl || null,
+        cancelling: false,
+    };
+    persistActiveTurn();
+    setTurnUiState(true, false);
+    return state.activeTurn;
+}
+
+function applyTurnEvent(event) {
+    const active = state.activeTurn;
+    if (!active || active.terminal) return false;
+    const reduced = reduceTurnEvent(active, event);
+    if (!reduced.accepted) return false;
+    if (reduced.gap) {
+        throw new ApiError(`turn 事件不连续：期望 ${active.lastEventId + 1}，收到 ${event.id}`, {
+            code: 'turn_event_gap', payload: event,
+        });
+    }
+    state.activeTurn = reduced.state;
+    persistActiveTurn();
+    if (event.type === 'content' || event.type === 'thinking' || event.type === 'started') {
+        renderActiveTurnBuffer();
+    } else if (event.type === 'parsed') {
+        const applied = applySessionResult(event.session, active.ref);
+        if (applied && isCurrentSessionRef(active.ref)) renderParsedResponse(event.parsed || {});
+        setTurnUiState(true, state.activeTurn.cancelling);
+    }
+    return true;
+}
+
+function updateActiveTurnFromMeta(meta) {
+    const active = state.activeTurn;
+    if (!active || active.turnId !== meta.turn_id) return false;
+    const terminal = TERMINAL_STATUSES.includes(meta.status);
+    state.activeTurn = {
+        ...active,
+        status: meta.status,
+        content: terminal && typeof meta.content === 'string' ? meta.content : active.content,
+        thinking: terminal && typeof meta.thinking === 'string' ? meta.thinking : active.thinking,
+        error: meta.error || null,
+        terminal,
+        terminalCount: terminal ? Math.max(1, active.terminalCount) : active.terminalCount,
+    };
+    persistActiveTurn();
+    renderActiveTurnBuffer();
+    return true;
+}
+
+function waitForReconnect(delayMs) {
+    return new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+async function consumeActiveTurn(turnId) {
+    let reconnects = 0;
+    let terminalMeta = null;
+    while (state.activeTurn && state.activeTurn.turnId === turnId && !state.activeTurn.terminal) {
+        const active = state.activeTurn;
+        try {
+            for await (const event of turnClient.events(turnId, {
+                after: active.lastEventId,
+                signal: active.controller.signal,
+            })) {
+                if (!state.activeTurn || state.activeTurn.turnId !== turnId) return;
+                applyTurnEvent(event);
+                reconnects = 0;
+                if (state.activeTurn.terminal) break;
+            }
+        } catch (error) {
+            if (!state.activeTurn || state.activeTurn.turnId !== turnId) return;
+            if (state.activeTurn.terminal) break;
+            if (error instanceof ApiError && error.isAbort && state.activeTurn.cancelling) break;
+            console.warn('turn 事件流中断，准备按 cursor 重连', error);
+        }
+
+        if (!state.activeTurn || state.activeTurn.turnId !== turnId || state.activeTurn.terminal) break;
+        try {
+            const meta = await turnClient.get(turnId);
+            if (TERMINAL_STATUSES.includes(meta.status)) terminalMeta = meta;
+            else updateActiveTurnFromMeta(meta);
+        } catch (error) {
+            console.warn('查询 turn 状态失败', error);
+        }
+        reconnects += 1;
+        if (reconnects > 5) {
+            if (terminalMeta) {
+                updateActiveTurnFromMeta(terminalMeta);
+                break;
+            }
+            showToast('与生成流的连接已中断；可点击取消重试，或刷新页面恢复持久 turn', 5000);
+            return;
+        }
+        await waitForReconnect(Math.min(1000, reconnects * 200));
+    }
+}
+
+function terminalMessage(turn) {
+    if (turn.status === 'completed') return '生成完成';
+    if (turn.status === 'cancelled') return '生成已取消，已保存现有内容';
+    const detail = turn.error && (turn.error.message || turn.error.code);
+    return `生成失败：${detail || '未知错误'}`;
+}
+
+async function finalizeActiveTurn(turnId) {
+    const active = state.activeTurn;
+    if (!active || active.turnId !== turnId || !active.terminal) return false;
+    try {
+        await reloadCurrentSession(active.ref);
+        if (active.parsed && isCurrentSessionRef(active.ref)) {
+            renderParsedResponse(active.parsed.parsed || {});
+        }
+    } catch (error) {
+        showToast(`turn 已终止，但刷新存档失败：${errorDetail(error)}`, 4000);
+    }
+    showToast(terminalMessage(active), active.status === 'completed' ? 1800 : 3500);
+    if (active.controller && !active.controller.signal.aborted) active.controller.abort();
+    clearPersistedTurn();
+    state.activeTurn = null;
+    activeController = null;
+    setTurnUiState(false, false);
+    return true;
+}
+
+async function resumePersistedTurn(pointer = readPersistedTurnPointer()) {
+    let turnId = pointer && pointer.turnId;
+    if (!turnId && state.session) {
+        const pending = [...(state.session.message_history || [])].reverse().find(message =>
+            message && message.turn_id && ['pending', 'streaming'].includes(message.status));
+        if (pending) turnId = pending.turn_id;
+    }
+    if (!turnId) return false;
+    const ref = captureSessionRef();
+    if (pointer && (pointer.project !== ref.project || pointer.save !== ref.save)) return false;
+    try {
+        const meta = await turnClient.get(turnId);
+        if (meta.project !== ref.project || meta.save !== ref.save) {
+            clearPersistedTurn();
+            return false;
+        }
+        const active = installActiveTurn(meta, ref, {
+            lastEventId: meta.last_event_id || (pointer && pointer.lastEventId) || 0,
+        });
+        if (!active.terminal) {
+            const targetEl = appendAssistantMessage(active.content || '（恢复生成状态…）');
+            state.activeTurn = { ...state.activeTurn, targetEl };
+            renderActiveTurnBuffer();
+            await consumeActiveTurn(turnId);
+        }
+        if (state.activeTurn && state.activeTurn.terminal) await finalizeActiveTurn(turnId);
+        return true;
+    } catch (error) {
+        clearPersistedTurn();
+        console.warn('恢复持久 turn 失败', error);
+        return false;
+    }
+}
+
+async function cancelActiveTurn() {
+    const active = state.activeTurn;
+    if (!active || !active.turnId || active.terminal || active.cancelling) return;
+    state.activeTurn = { ...active, cancelling: true };
+    setTurnUiState(true, true);
+    try {
+        const meta = await turnClient.cancel(active.turnId);
+        updateActiveTurnFromMeta(meta);
+        if (state.activeTurn && state.activeTurn.terminal && state.activeTurn.controller) {
+            state.activeTurn.controller.abort();
+        }
+    } catch (error) {
+        if (state.activeTurn && state.activeTurn.turnId === active.turnId) {
+            state.activeTurn = { ...state.activeTurn, cancelling: false };
+            setTurnUiState(true, false);
+        }
+        showToast(`取消失败：${errorDetail(error)}`, 3500);
+    }
+}
+
+async function sendMessage(text = null, isRegenerate = false) {
+    const input = document.getElementById('user-input');
+    const userText = text !== null ? String(text).trim() : input.value.trim();
+    if (!userText || state.navigationBusy || !canPerformAction('send', state.activeTurn && state.activeTurn.status)) return;
+    const requestRef = captureSessionRef();
+    if (!sessionBelongsToRef(state.session, requestRef)) {
+        showToast('当前存档尚未加载完成');
+        return;
+    }
+    const expectedRevision = currentRevision(requestRef);
+    const thinking = document.getElementById('thinking-content');
+    if (thinking) thinking.textContent = '';
+    state.activeTurn = makeProvisionalTurn(requestRef);
+    setTurnUiState(true, false);
 
     try {
-        const res = await fetch(API.chat, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal: activeController.signal,
-            body: JSON.stringify({
-                user_input: userText,
-                project: state.currentProject,
-                save: state.currentSave,
-                expected_revision: expectedRevision,
-                temperature: state.modelParams.temperature,
-                top_p: state.modelParams.top_p,
-                top_k: state.modelParams.top_k,
-                num_predict: state.modelParams.num_predict,
-                think: state.modelParams.think,
-            }),
+        const turn = await turnClient.create({
+            user_input: userText,
+            project: requestRef.project,
+            save: requestRef.save,
+            model: state.session.current_model || document.getElementById('model-select').value || null,
+            expected_revision: expectedRevision,
+            temperature: state.modelParams.temperature,
+            top_p: state.modelParams.top_p,
+            top_k: state.modelParams.top_k,
+            num_predict: state.modelParams.num_predict,
+            think: state.modelParams.think,
         });
-
-        if (!res.ok) {
-            const errorPayload = await res.json().catch(() => ({}));
-            if (res.status === 409) {
-                if (targetEl && targetEl.isConnected) targetEl.textContent = '⚠️ 存档已变化，本轮未提交';
-                showToast(errorDetail(errorPayload, '存档版本冲突'));
-            } else if (targetEl && targetEl.isConnected) {
-                targetEl.textContent = `❌ 错误: ${errorDetail(errorPayload, `HTTP ${res.status}`)}`;
-            }
-            return;  // 复位由 finally 统一处理
+        if (!isCurrentSessionRef(requestRef)) {
+            throw new ApiError('发送期间存档引用已失效', { code: 'stale_session_ref' });
         }
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n\n');
-            buffer = lines.pop();
-            let stopStream = false;
-            for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-                const payload = line.slice(6).trim();
-                if (payload === '[DONE]') continue;
+        installActiveTurn(turn, requestRef);
+        if (!isRegenerate) input.value = '';
+        try { await reloadCurrentSession(requestRef); } catch (error) {
+            console.warn('同步 pending user 失败，继续读取持久 turn', error);
+        }
+        if (!state.activeTurn || state.activeTurn.turnId !== turn.turn_id) return;
+        const targetEl = appendAssistantMessage('（生成中…）');
+        state.activeTurn = { ...state.activeTurn, targetEl };
+        const consumePromise = consumeActiveTurn(turn.turn_id);
+        state.activeTurn = { ...state.activeTurn, consumePromise };
+        await consumePromise;
+        await finalizeActiveTurn(turn.turn_id);
+    } catch (error) {
+        if (error instanceof ApiError && error.code === 'active_turn_conflict') {
+            const detail = error.payload && (error.payload.error || error.payload.detail);
+            if (detail && detail.turn_id) {
+                clearPersistedTurn();
                 try {
-                    const data = JSON.parse(payload);
-                    if (data.type === 'thinking') appendStreamThinking(data.content);
-                    else if (data.type === 'content') {
-                        rawContent += data.content;
-                        if (targetEl && targetEl.isConnected && targetEl.textContent === '（生成中…）') targetEl.textContent = '';
-                        if (targetEl && targetEl.isConnected) appendStreamChunk(targetEl, data.content);
-                    } else if (data.type === 'error') {
-                        if (targetEl && targetEl.isConnected) targetEl.textContent = `❌ ${data.content}`;
-                        stopStream = true;  // 后端报错，停止读取整个流
-                        break;
-                    } else if (data.type === 'conflict') {
-                        if (targetEl && targetEl.isConnected) {
-                            targetEl.textContent = `⚠️ 存档已更新（revision ${data.current_revision}），本轮未提交`;
-                        }
-                        showToast('聊天提交冲突，已重新加载最新存档');
-                        stopStream = true;
-                        break;
-                    } else if (data.type === 'parsed') {
-                        // 仅当 targetEl 仍挂在 DOM 时才应用，防止跨流串扰
-                        if (targetEl && targetEl.isConnected) {
-                            if (data.session) state.session = data.session;
-                            renderParsedResponse(data.parsed);
-                            loadSaveList();
-                        }
-                    }
-                } catch (e) { console.warn('解析 SSE 数据失败', e, payload); }
+                    const meta = await turnClient.get(detail.turn_id);
+                    installActiveTurn(meta, requestRef);
+                    const targetEl = appendAssistantMessage(meta.content || '（恢复生成状态…）');
+                    state.activeTurn = { ...state.activeTurn, targetEl };
+                    await consumeActiveTurn(meta.turn_id);
+                    await finalizeActiveTurn(meta.turn_id);
+                    return;
+                } catch (resumeError) {
+                    console.warn('附着既有 turn 失败', resumeError);
+                }
             }
-            if (stopStream) break;
         }
-    } catch (e) {
-        // AbortController 主动 abort 抛出的异常不算网络错误
-        if (e.name !== 'AbortError' && e.name !== 'TypeError') {
-            console.error('发送失败', e);
-            if (targetEl && targetEl.isConnected) targetEl.textContent = `❌ 网络错误: ${e.message}`;
-        } else if (targetEl && targetEl.isConnected) {
-            targetEl.textContent = '⏹ 已取消';
+        if (state.activeTurn && !state.activeTurn.provisional) {
+            setTurnUiState(true, Boolean(state.activeTurn.cancelling));
+            showToast(`生成流处理异常：${errorDetail(error)}；持久 turn 仍可恢复`, 5000);
+            return;
         }
-    } finally {
-        state.isStreaming = false;
+        state.activeTurn = null;
         activeController = null;
-        // 复位发送/取消按钮态
-        document.getElementById('send-btn').classList.remove('hidden');
-        document.getElementById('send-cancel-btn').classList.add('hidden');
-        // A2：chat 结束兜底拉一次完整 session，确保前端 state 与落盘一致
-        try { await reloadCurrentSession(); } catch (e) {}
+        setTurnUiState(false, false);
+        showToast(`发送失败：${errorDetail(error)}`, 4000);
     }
 }
 
@@ -1296,22 +1719,29 @@ function collectTextareaLines(id) {
 // ============================================================
 
 async function createCardEditor(config) {
+    const editorRef = config.sessionRef || captureSessionRef();
+    config.sessionRef = editorRef;
+    if (!isCurrentSessionRef(editorRef)) return;
     // 1. 加载数据
     let items = [];
     let extraData = null;
-    if (config.listApi) {
-        try {
-            const res = await fetch(config.listApi);
-            const json = await res.json();
-            items = json[config.listKey] || json.data || [];
-        } catch (e) { console.warn('加载列表失败', e); }
+    try {
+        if (config.listApi) {
+            const json = await apiClient.get(config.listApi, {
+                schema: body => Array.isArray(body && (body[config.listKey] || body.data)) || '编辑器列表响应无效',
+            });
+            items = json[config.listKey] || json.data;
+        }
+        if (config.extraApi) {
+            extraData = await apiClient.get(config.extraApi, {
+                schema: body => Boolean(body && typeof body === 'object' && !Array.isArray(body)) || '编辑器档案响应无效',
+            });
+        }
+    } catch (error) {
+        showToast(`加载编辑器失败：${errorDetail(error)}`, 3500);
+        return;
     }
-    if (config.extraApi) {
-        try {
-            const res = await fetch(config.extraApi);
-            extraData = await res.json();
-        } catch (e) { console.warn('加载附加数据失败', e); }
-    }
+    if (!isCurrentSessionRef(editorRef)) return;
 
     // 2. 构造 modal HTML
     const body = document.createElement('div');
@@ -1541,7 +1971,17 @@ async function createCardEditor(config) {
             groupsEl.appendChild(makeGroup(g, groupsEl.querySelectorAll('.grp-container').length));
         });
 
-        formEl.querySelector('.ce-save').addEventListener('click', async () => {
+        formEl.querySelector('.ce-save').addEventListener('click', async (event) => {
+            const saveButton = event.currentTarget;
+            if (!isCurrentSessionRef(editorRef)) {
+                statusEl.textContent = '✗ 当前项目或存档已切换，请重新打开编辑器';
+                return;
+            }
+            if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+                statusEl.textContent = '✗ 当前存档正在生成，请先取消或等待完成';
+                return;
+            }
+            saveButton.disabled = true;
             const data = { custom: {} };
             let idVal = '';
             groupsEl.querySelectorAll('.grp-container').forEach(grp => {
@@ -1559,34 +1999,43 @@ async function createCardEditor(config) {
                     }
                 });
             });
-            if (config.idField && !idVal) return alert(`请填 ${config.idLabel || 'ID'}`);
+            if (config.idField && !idVal) {
+                saveButton.disabled = false;
+                alert(`请填 ${config.idLabel || 'ID'}`);
+                return;
+            }
             if (!data.custom || Object.keys(data.custom).length === 0) delete data.custom;
             // 单条模式（用户档案）固定 id='user'
             if (!config.idField) data.id = 'user';
 
             const saveUrl = config.saveApi ? config.saveApi(idVal || 'user') : null;
-            if (!saveUrl) { statusEl.textContent = '✗ 缺少保存 API'; return; }
+            if (!saveUrl) {
+                saveButton.disabled = false;
+                statusEl.textContent = '✗ 缺少保存 API';
+                return;
+            }
 
             statusEl.textContent = '保存中…';
             try {
-                const r = await fetch(saveUrl, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ data }),
-                });
-                if (!r.ok) { const err = await r.json(); throw new Error(err.detail || '保存失败'); }
+                await apiClient.put(saveUrl, { data });
+                if (!isCurrentSessionRef(editorRef)) return;
                 statusEl.textContent = '✓ 已保存';
                 // 刷新列表
                 if (config.allowNew) {
-                    const fresh = await fetch(config.listApi).then(r => r.json()).catch(() => null);
-                    if (fresh) {
-                        items = fresh[config.listKey] || fresh.data || [];
-                        currentItem = items.find(it => it[config.idField] === idVal) || data;
-                        renderList(); renderForm();
-                    }
+                    const fresh = await apiClient.get(config.listApi, {
+                        schema: body => Array.isArray(body && (body[config.listKey] || body.data)) || '编辑器列表响应无效',
+                    });
+                    if (!isCurrentSessionRef(editorRef)) return;
+                    items = fresh[config.listKey] || fresh.data;
+                    currentItem = items.find(it => it[config.idField] === idVal) || data;
+                    renderList(); renderForm();
                 }
                 if (config.postSave) await config.postSave(data);
-            } catch (e) { statusEl.textContent = '✗ ' + e.message; }
+            } catch (e) {
+                statusEl.textContent = '✗ ' + e.message;
+            } finally {
+                if (saveButton.isConnected) saveButton.disabled = isTurnActiveForRef(editorRef);
+            }
         });
 
         const delBtn = formEl.querySelector('.ce-delete');
@@ -1595,8 +2044,8 @@ async function createCardEditor(config) {
                 const deleteId = config.idField ? (currentItem && currentItem[config.idField]) : 'user';
                 const displayName = config.idField ? (currentItem && (currentItem.name || currentItem[config.idField])) : '用户档案';
                 if (!deleteId) return;
-                const requestRef = config.sessionRef || captureSessionRef();
-                if (config.sessionRef && !isCurrentSessionRef(requestRef)) {
+                const requestRef = editorRef;
+                if (!isCurrentSessionRef(requestRef)) {
                     statusEl.textContent = '✗ 当前存档已切换，请重新打开编辑器';
                     return;
                 }
@@ -1604,20 +2053,27 @@ async function createCardEditor(config) {
                     statusEl.textContent = '✗ 当前项目已切换，请重新打开编辑器';
                     return;
                 }
+                if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+                    statusEl.textContent = '✗ 当前存档正在生成，请先取消或等待完成';
+                    return;
+                }
                 if (!confirm(`确定要删除「${displayName}」吗？删除后将移入回收区，可以恢复。`)) return;
 
                 const deleteUrl = config.deleteApi(deleteId);
                 statusEl.textContent = '删除中…';
                 try {
-                    const r = await fetch(deleteUrl, { method: 'DELETE' });
-                    const result = await r.json().catch(() => ({}));
-                    if (r.status === 409) {
-                        if (config.sessionRef && isCurrentSessionRef(requestRef)) {
-                            try { await reloadCurrentSession(); } catch (e) {}
+                    let result;
+                    try {
+                        result = await apiClient.delete(deleteUrl);
+                    } catch (error) {
+                        if (error instanceof ApiError && error.status === 409) {
+                            if (isCurrentSessionRef(requestRef)) {
+                                try { await reloadCurrentSession(requestRef); } catch (_reloadError) {}
+                            }
                         }
-                        throw new Error(errorDetail(result, '删除冲突，已重新加载'));
+                        throw error;
                     }
-                    if (!r.ok) throw new Error(errorDetail(result, '删除失败'));
+                    if (!isCurrentSessionRef(requestRef)) return;
                     if (result.deleted !== true) throw new Error('删除响应无效：deleted 必须为 true');
 
                     const recoveryId = typeof result.recovery_id === 'string'
@@ -1635,8 +2091,7 @@ async function createCardEditor(config) {
                             && isCurrentSessionRef(requestRef)
                             && sessionBelongsToRef(activeSession, requestRef)
                         ) {
-                            state.session = activeSession;
-                            renderSession(activeSession);
+                            commitSessionState(activeSession, requestRef);
                         }
                     }
 
@@ -1644,31 +2099,25 @@ async function createCardEditor(config) {
                     let refreshedExtra = null;
                     try {
                         if (config.allowNew && config.listApi) {
-                            const freshResponse = await fetch(config.listApi);
-                            const fresh = await freshResponse.json();
-                            if (!freshResponse.ok) {
-                                throw new Error(errorDetail(fresh, `HTTP ${freshResponse.status}`));
-                            }
+                            const fresh = await apiClient.get(config.listApi);
                             const freshItems = fresh[config.listKey] || fresh.data;
                             if (!Array.isArray(freshItems)) throw new Error('列表响应格式无效');
                             refreshedItems = freshItems;
                         } else if (!config.allowNew && config.extraApi) {
-                            const freshResponse = await fetch(config.extraApi);
-                            refreshedExtra = await freshResponse.json();
-                            if (!freshResponse.ok) {
-                                throw new Error(errorDetail(refreshedExtra, `HTTP ${freshResponse.status}`));
-                            }
+                            refreshedExtra = await apiClient.get(config.extraApi);
                             if (!refreshedExtra || typeof refreshedExtra !== 'object' || Array.isArray(refreshedExtra)) {
                                 throw new Error('档案响应格式无效');
                             }
                         }
                     } catch (refreshError) {
+                        if (!isCurrentSessionRef(requestRef)) return;
                         statusEl.textContent = `✓ 已移入回收区，可恢复${impactText}；列表刷新失败：${refreshError.message}`;
                         if (recoveryId) statusEl.title = `恢复记录：${recoveryId}`;
                         showToast('已移入回收区，可恢复');
                         return;
                     }
 
+                    if (!isCurrentSessionRef(requestRef)) return;
                     if (config.allowNew) {
                         if (refreshedItems !== null) items = refreshedItems;
                         currentItem = null;
@@ -1704,7 +2153,12 @@ async function createCardEditor(config) {
 async function openCharactersEditor() {
     const editorRef = captureSessionRef();
     // D2：角色卡字段由后端 schema 单一来源驱动
-    const schema = await fetch(API.characterSchema).then(r => r.json()).catch(() => null);
+    const schema = await apiClient.get(API.characterSchema, {
+        schema: body => Boolean(body && Array.isArray(body.groups)) || '角色卡 schema 响应无效',
+    }).catch(error => {
+        console.warn('加载角色卡 schema 失败', error);
+        return null;
+    });
     if (!schema || !schema.groups) {
         showToast('角色卡 schema 加载失败，请刷新重试');
         return;
@@ -1751,6 +2205,7 @@ async function openWorldbookEditor() {
         saveApi: (id) => `${API.worldbookSave(id)}?project=${encodeURIComponent(editorRef.project)}`,
         deleteApi: (id) => `${API.worldbookDelete(id)}?project=${encodeURIComponent(editorRef.project)}`,
         project: editorRef.project,
+        sessionRef: editorRef,
         allowNew: true,
         idField: 'id',
         idLabel: '条目名（英文）',
@@ -1869,8 +2324,9 @@ async function showHistoryEditor() {
     const listEl = body.querySelector('#history-list');
     try {
         const url = `${API.sessionHistory}?project=${encodeURIComponent(historyRef.project)}&save=${encodeURIComponent(historyRef.save)}`;
-        const res = await fetch(url);
-        const data = await res.json();
+        const data = await apiClient.get(url, {
+            schema: body => Array.isArray(body && body.snapshots) || '历史快照列表响应无效',
+        });
         if (!isCurrentSessionRef(historyRef)) {
             listEl.innerHTML = '<p class="empty">当前存档已切换，请重新打开历史存档。</p>';
             return;
@@ -1889,7 +2345,7 @@ async function showHistoryEditor() {
                 </div></div>`;
         }).join('');
         listEl.querySelectorAll('.history-preview').forEach(btn => {
-            btn.addEventListener('click', () => showSnapshotPreview(btn.dataset.fn));
+            btn.addEventListener('click', () => showSnapshotPreview(btn.dataset.fn, historyRef));
         });
         listEl.querySelectorAll('.history-restore').forEach(btn => {
             btn.addEventListener('click', async () => {
@@ -1917,9 +2373,7 @@ async function showHistoryEditor() {
                     alert('恢复失败：响应存档与当前存档不一致');
                     return;
                 }
-                state.session = session;
-                renderSession(session);
-                renderHistory(session.message_history || []);
+                if (!commitSessionState(session, historyRef)) return;
                 hideModal();
                 alert('已恢复到该快照');
             });
@@ -1927,17 +2381,21 @@ async function showHistoryEditor() {
     } catch (e) { listEl.innerHTML = `<p class="empty">读取历史失败：${escapeHtml(e.message)}</p>`; }
 }
 
-async function showSnapshotPreview(filename) {
+async function showSnapshotPreview(filename, snapshotRef = captureSessionRef()) {
     const body = document.createElement('div');
     body.innerHTML = '<div class="snapshot-preview"><p style="color:var(--text-dim)">加载中…</p></div>';
     showModal({ title: '🔍 快照预览', body });
 
     const previewEl = body.querySelector('.snapshot-preview');
     try {
-        const url = `${API.sessionSnapshot(filename)}&project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
-        const res = await fetch(url);
-        if (!res.ok) { const e = await res.json().catch(() => ({})); previewEl.innerHTML = `<p class="empty">读取失败：${escapeHtml(e.detail || res.statusText)}</p>`; return; }
-        const data = await res.json();
+        const url = `${API.sessionSnapshot(filename)}&project=${encodeURIComponent(snapshotRef.project)}&save=${encodeURIComponent(snapshotRef.save)}`;
+        const data = await apiClient.get(url, {
+            schema: body => Boolean(body && typeof body.filename === 'string' && Array.isArray(body.messages)) || '快照响应无效',
+        });
+        if (!isCurrentSessionRef(snapshotRef)) {
+            previewEl.innerHTML = '<p class="empty">当前存档已切换，请重新打开快照。</p>';
+            return;
+        }
         const typeBadge = data.snapshot_type === 'trim' ? '📄 trim（被截消息）'
             : data.snapshot_type === 'reset' ? '🔄 重置归档'
             : '💾 快照';
@@ -1963,8 +2421,11 @@ async function showSnapshotPreview(filename) {
 
 // ===== 提示词编辑器 =====
 
-function showPromptsEditor() {
-    fetch(API.prompts).then(r => r.json()).then(data => {
+async function showPromptsEditor() {
+    try {
+        const data = await apiClient.get(API.prompts, {
+            schema: body => Boolean(body && typeof body.system === 'string' && typeof body.group_chat === 'string') || '提示词响应无效',
+        });
         const body = document.createElement('div');
         body.innerHTML = `
             <div class="modal-tabs">
@@ -1995,24 +2456,32 @@ function showPromptsEditor() {
         body.querySelector('#prompt-save').addEventListener('click', async () => {
             const statusEl = body.querySelector('#prompt-status');
             statusEl.textContent = '保存中…';
-            const res = await fetch(API.promptSave(currentTab), {
-                method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: textarea.value }),
-            });
-            if (res.ok) { statusEl.textContent = '✓ 已保存，下次对话生效'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
-            else { const err = await res.json(); statusEl.textContent = '✗ ' + (err.detail || '保存失败'); }
+            try {
+                await apiClient.put(API.promptSave(currentTab), { content: textarea.value });
+                statusEl.textContent = '✓ 已保存，下次对话生效';
+                setTimeout(() => { statusEl.textContent = ''; }, 3000);
+            } catch (error) {
+                statusEl.textContent = '✗ ' + errorDetail(error);
+            }
         });
 
         body.querySelector('#prompt-reset').addEventListener('click', async () => {
             if (!confirm('恢复为默认提示词？当前编辑内容会丢失。')) return;
-            const res = await fetch(API.promptReset(currentTab), { method: 'POST' });
-            if (res.ok) {
-                const fresh = await (await fetch(API.prompts)).json();
+            try {
+                await apiClient.post(API.promptReset(currentTab));
+                const fresh = await apiClient.get(API.prompts, {
+                    schema: body => Boolean(body && typeof body.system === 'string' && typeof body.group_chat === 'string') || '提示词响应无效',
+                });
                 data[currentTab] = fresh[currentTab]; textarea.value = fresh[currentTab] || '';
                 const statusEl = body.querySelector('#prompt-status');
                 statusEl.textContent = '✓ 已恢复默认'; setTimeout(() => { statusEl.textContent = ''; }, 3000);
+            } catch (error) {
+                body.querySelector('#prompt-status').textContent = '✗ ' + errorDetail(error);
             }
         });
-    });
+    } catch (error) {
+        showToast(`加载提示词失败：${errorDetail(error)}`, 3500);
+    }
 }
 
 // ===== 事件绑定 =====
@@ -2025,6 +2494,10 @@ function bindUI() {
     const projectDropdown = document.getElementById('project-dropdown');
     projectBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (state.navigationBusy || isTurnActiveForRef(committedSessionRef)) {
+            showToast('当前正在切换或生成，请稍候');
+            return;
+        }
         const wasHidden = projectDropdown.classList.contains('hidden');
         hideAllDropdowns();
         if (wasHidden) {
@@ -2056,6 +2529,10 @@ function bindUI() {
     const saveDropdown = document.getElementById('save-dropdown');
     saveTab.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (state.navigationBusy || isTurnActiveForRef(committedSessionRef)) {
+            showToast('当前正在切换或生成，请稍候');
+            return;
+        }
         const wasHidden = saveDropdown.classList.contains('hidden');
         hideAllDropdowns();
         if (wasHidden) {
@@ -2102,7 +2579,6 @@ function bindUI() {
 
     // 重置
     document.getElementById('reset-btn').addEventListener('click', async () => {
-    if (state.isStreaming && activeController) activeController.abort();
         if (!confirm('重置当前存档？将清空对话历史和角色状态，但保留存档本身。')) return;
         const requestRef = captureSessionRef();
         let result;
@@ -2121,12 +2597,8 @@ function bindUI() {
             alert('重置失败：响应存档与当前存档不一致');
             return;
         }
-        state.session = session;
-        document.getElementById('chat-stream').innerHTML = '';
+        if (!commitSessionState(session, requestRef)) return;
         document.getElementById('suggestions').innerHTML = '';
-        renderSession(session);
-        renderHistory([]);
-        if (session.current_model) document.getElementById('model-select').value = session.current_model;
     });
 
     // 工具按钮（顶栏右侧）
@@ -2136,11 +2608,9 @@ function bindUI() {
 
     // 发送
     document.getElementById('send-btn').addEventListener('click', () => sendMessage());
-    // A1：取消生成——中断当前流式请求，后端 finally 保证已写入内容落盘
+    // 业务取消必须由服务端收口 turn；POST 完成后才关闭本地 SSE。
     const cancelGenBtn = document.getElementById('send-cancel-btn');
-    cancelGenBtn.addEventListener('click', () => {
-        if (activeController) activeController.abort();
-    });
+    cancelGenBtn.addEventListener('click', () => cancelActiveTurn());
     document.getElementById('user-input').addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
     });

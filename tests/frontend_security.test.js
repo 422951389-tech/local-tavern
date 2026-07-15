@@ -35,18 +35,27 @@ test('security module loads before app and app has one escaping entry point', ()
     const html = fs.readFileSync(path.join(root, 'web', 'index.html'), 'utf8');
     const app = fs.readFileSync(path.join(root, 'web', 'app.js'), 'utf8');
     assert.ok(html.indexOf('security.js') < html.indexOf('app.js'));
+    assert.ok(html.indexOf('api-client.js') < html.indexOf('app.js'));
+    assert.ok(html.indexOf('session-ref.js') < html.indexOf('app.js'));
+    assert.ok(html.indexOf('turn-client.js') < html.indexOf('app.js'));
     assert.equal((app.match(/function escapeHtml\s*\(/g) || []).length, 1);
     assert.match(app, /aria-live/);
     assert.doesNotMatch(app, /\$\{c\.affinity\}/);
 });
 
-test('session writes carry revisions and message actions prefer UUIDs', () => {
+test('session writes use ApiClient, immutable refs and persistent turn APIs', () => {
     const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.js'), 'utf8');
-    assert.match(app, /expected_revision:\s*currentRevision\(\)/);
+    assert.match(app, /const expectedRevision = currentRevision\(requestRef\)/);
     assert.match(app, /expected_revision:\s*expectedRevision/);
     assert.match(app, /dataset\.messageId/);
     assert.match(app, /message_id:\s*messageId\s*\|\|\s*undefined/);
-    assert.match(app, /data\.type === 'conflict'/);
+    assert.match(app, /new TurnClient\(apiClient\)/);
+    assert.match(app, /turnClient\.events\(/);
+    assert.match(app, /turnClient\.cancel\(/);
+    assert.match(app, /SessionRefTracker/);
+    assert.equal((app.match(/\bfetch\s*\(/g) || []).length, 0);
+    assert.equal((app.match(/state\.session\s*=/g) || []).length, 1);
+    assert.doesNotMatch(app, /chat:\s*['"]\/api\/chat['"]/);
     assert.equal((app.match(/function enterMessageEditMode\s*\(/g) || []).length, 1);
     assert.equal((app.match(/function enterSummaryEditMode\s*\(/g) || []).length, 1);
     assert.doesNotMatch(app, /function enterEditMode\s*\(/);
