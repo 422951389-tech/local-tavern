@@ -8,7 +8,12 @@ import pytest
 import yaml
 
 from core import config
+from routes import backups as backup_routes
 from tests.data_guard import file_manifest
+
+
+class SimulatedProcessExit(BaseException):
+    pass
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -220,3 +225,122 @@ async def test_stale_fingerprint_returns_409_and_performs_zero_writes(app_client
     assert "正文不得进入错误响应" not in response.text
     assert file_manifest(config.DATA_DIR) == data_before
     assert file_manifest(config.PROMPTS_DIR) == prompts_before
+
+
+@pytest.mark.asyncio
+async def test_retention_and_drill_api_require_explicit_apply_and_persist_result(
+    app_client,
+):
+    project = "backup_api_drill"
+    _seed_api_library(project)
+    created_response = await app_client.post(
+        "/api/backups",
+        json={"reason": "API drill source"},
+    )
+    assert created_response.status_code == 200, created_response.text
+    identifier = created_response.json()["backup"]["backup_id"]
+    active_before = _active_hashes()
+
+    drill_response = await app_client.post(
+        f"/api/backups/{identifier}/drill",
+    )
+    assert drill_response.status_code == 200, drill_response.text
+    drill = drill_response.json()
+    assert drill["status"] == "passed"
+    assert drill["workspace_cleaned"] is True
+    assert _active_hashes() == active_before
+    get_response = await app_client.get(
+        f"/api/backups/drills/{drill['drill_id']}",
+    )
+    assert get_response.status_code == 200, get_response.text
+    assert get_response.json() == drill
+    list_response = await app_client.get("/api/backups/drills")
+    assert list_response.status_code == 200, list_response.text
+    assert drill["drill_id"] in {
+        item["drill_id"] for item in list_response.json()["drills"]
+    }
+
+    plan_response = await app_client.get("/api/backups/retention/plan")
+    assert plan_response.status_code == 200, plan_response.text
+    plan = plan_response.json()
+    unconfirmed = await app_client.post(
+        "/api/backups/retention/apply",
+        json={
+            "plan_fingerprint": plan["plan_fingerprint"],
+            "confirm": False,
+        },
+    )
+    assert unconfirmed.status_code == 409, unconfirmed.text
+    assert _error(unconfirmed)["code"] == "confirmation_required"
+    applied = await app_client.post(
+        "/api/backups/retention/apply",
+        json={
+            "plan_fingerprint": plan["plan_fingerprint"],
+            "confirm": True,
+        },
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["applied"] is True
+
+
+@pytest.mark.asyncio
+async def test_restore_recovery_query_and_apply_api_resolve_switching_state(
+    app_client,
+    monkeypatch,
+):
+    project = "backup_api_recovery"
+    project_dir = _seed_api_library(project)
+    created_response = await app_client.post(
+        "/api/backups",
+        json={"reason": "API recovery source"},
+    )
+    assert created_response.status_code == 200, created_response.text
+    identifier = created_response.json()["backup"]["backup_id"]
+    (project_dir / "user.yaml").write_text(
+        "id: user\nname: API recovery current\n",
+        encoding="utf-8",
+    )
+    active_before = _active_hashes()
+    manager = backup_routes.get_backup_manager()
+    current = manager.dry_run(identifier)["current_fingerprint"]
+    original_replace = manager._replace_path
+
+    def exit_after_first_root_move(source, target):
+        original_replace(source, target)
+        if Path(source) == config.PROJECTS_DIR:
+            raise SimulatedProcessExit()
+
+    monkeypatch.setattr(manager, "_replace_path", exit_after_first_root_move)
+    with pytest.raises(SimulatedProcessExit):
+        manager.restore(
+            identifier,
+            expected_current_fingerprint=current,
+            confirm_conflicts=True,
+        )
+
+    list_response = await app_client.get("/api/backups/restores")
+    assert list_response.status_code == 200, list_response.text
+    restores = list_response.json()["restores"]
+    assert len(restores) == 1
+    restore_id = restores[0]["restore_id"]
+    query_response = await app_client.get(
+        f"/api/backups/restores/{restore_id}",
+    )
+    assert query_response.status_code == 200, query_response.text
+    assert query_response.json()["active_state"] == "mixed"
+
+    blocked_write = await app_client.post(
+        "/api/projects",
+        json={"name": "blocked_during_restore"},
+    )
+    assert blocked_write.status_code == 503, blocked_write.text
+    assert _error(blocked_write)["code"] == "restore_maintenance_required"
+
+    recover_response = await app_client.post(
+        f"/api/backups/restores/{restore_id}/recover",
+    )
+    assert recover_response.status_code == 200, recover_response.text
+    recovered = recover_response.json()
+    assert recovered["action"] == "rollback"
+    assert recovered["status"] == "rolled_back"
+    assert _active_hashes() == active_before

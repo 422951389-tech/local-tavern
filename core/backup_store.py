@@ -18,17 +18,18 @@ from uuid import UUID, uuid4
 
 import yaml
 
+from core.library_lock import library_lock
+
 
 MANIFEST_VERSION = 1
+RESTORE_JOURNAL_VERSION = 1
+DRILL_RECORD_VERSION = 1
 APPLICATION = "local-tavern"
 APPLICATION_VERSION = "1.0"
 DATA_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _TOKEN_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-_EXCLUDED_PARTS = frozenset({
-    ".recovery", "recovery", ".backups", "backups", "backup",
-    "logs", "log", "__pycache__", ".pytest_cache", ".cache", "cache",
-})
+_PROJECT_INTERNAL_ROOTS = frozenset({".migration-receipts"})
 _WINDOWS_RESERVED = frozenset({
     "con", "prn", "aux", "nul",
     *(f"com{index}" for index in range(1, 10)),
@@ -37,6 +38,20 @@ _WINDOWS_RESERVED = frozenset({
 _WINDOWS_INVALID = frozenset('<>:"|?*')
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
+_RESTORE_STATUSES = frozenset({
+    "prepared",
+    "switching",
+    "recovering",
+    "committed",
+    "rolled_back",
+    "needs_recovery",
+})
+_PENDING_RESTORE_STATUSES = frozenset({
+    "prepared",
+    "switching",
+    "recovering",
+    "needs_recovery",
+})
 
 
 class BackupError(RuntimeError):
@@ -224,16 +239,14 @@ class BackupManager:
             raise ValueError("settings 不能位于目录型备份根内")
 
     @staticmethod
-    def _excluded(parts: tuple[str, ...], *, is_file: bool) -> bool:
+    def _excluded(prefix: str, parts: tuple[str, ...], *, is_file: bool) -> bool:
+        del is_file
         if not parts:
             return False
-        lowered = tuple(part.casefold() for part in parts)
-        if any(part in _EXCLUDED_PARTS for part in lowered):
-            return True
-        if is_file:
-            name = lowered[-1]
-            return name.endswith((".log", ".pid", ".pyc", ".pyo", ".tmp")) or name == "tavern.pid"
-        return False
+        return (
+            prefix == "projects"
+            and parts[0].casefold() in _PROJECT_INTERNAL_ROOTS
+        )
 
     @staticmethod
     def _validate_name(name: str) -> None:
@@ -287,7 +300,7 @@ class BackupManager:
                     is_file = entry.is_file(follow_symlinks=False)
                 except OSError as exc:
                     raise BackupConflict("源文件在扫描期间发生变化", code="source_changed") from exc
-                if self._excluded(parts, is_file=is_file):
+                if self._excluded(prefix, parts, is_file=is_file):
                     continue
                 if is_dir:
                     walk(current, parts)
@@ -328,14 +341,26 @@ class BackupManager:
             return self._scan_sources().fingerprint
 
     @staticmethod
-    def _validate_backup_id(backup_id: str) -> str:
+    def _validate_uuid(value: str, label: str) -> str:
         try:
-            canonical = str(UUID(str(backup_id)))
+            canonical = str(UUID(str(value)))
         except (ValueError, TypeError, AttributeError) as exc:
-            raise ValueError("无效 backup_id") from exc
-        if canonical != str(backup_id).lower():
-            raise ValueError("backup_id 必须使用规范 UUID")
+            raise ValueError(f"无效 {label}") from exc
+        if canonical != str(value).lower():
+            raise ValueError(f"{label} 必须使用规范 UUID")
         return canonical
+
+    @classmethod
+    def _validate_backup_id(cls, backup_id: str) -> str:
+        return cls._validate_uuid(backup_id, "backup_id")
+
+    @classmethod
+    def _validate_restore_id(cls, restore_id: str) -> str:
+        return cls._validate_uuid(restore_id, "restore_id")
+
+    @classmethod
+    def _validate_drill_id(cls, drill_id: str) -> str:
+        return cls._validate_uuid(drill_id, "drill_id")
 
     def _backup_path(self, backup_id: str) -> Path:
         backup_id = self._validate_backup_id(backup_id)
@@ -386,7 +411,10 @@ class BackupManager:
         )
         if not allowed or path == "manifest.json":
             raise BackupIntegrityError("manifest item 不在备份白名单")
-        if cls._excluded(tuple(pure.parts[1:]), is_file=True):
+        if (
+            path != "settings.json"
+            and cls._excluded(pure.parts[0], tuple(pure.parts[1:]), is_file=True)
+        ):
             raise BackupIntegrityError("manifest item 命中排除规则")
         return path
 
@@ -615,10 +643,23 @@ class BackupManager:
         }
 
     def create_backup(self, reason: str | None = None, *, kind: str = "manual") -> dict:
+        """在整库独占锁内创建一致性备份。"""
+        with library_lock.exclusive():
+            return self._create_backup_locked(reason, kind=kind)
+
+    def _create_backup_locked(
+        self,
+        reason: str | None = None,
+        *,
+        kind: str = "manual",
+    ) -> dict:
         reason = self._validate_reason(reason)
-        if kind not in {"manual", "pre_restore", "pre_migration"}:
-            raise ValueError("kind 仅支持 manual、pre_restore 或 pre_migration")
+        if kind not in {"manual", "scheduled", "pre_restore", "pre_migration"}:
+            raise ValueError(
+                "kind 仅支持 manual、scheduled、pre_restore 或 pre_migration"
+            )
         with self._lock:
+            self._assert_no_unresolved_restore()
             before = self._scan_sources()
             backup_id = str(uuid4())
             manifest = self._build_manifest(backup_id, before, reason=reason, kind=kind)
@@ -887,7 +928,7 @@ class BackupManager:
         plans: list[_RootPlan],
     ) -> dict:
         return {
-            "journal_version": 1,
+            "journal_version": RESTORE_JOURNAL_VERSION,
             "restore_id": restore_id,
             "backup_id": backup_id,
             "pre_restore_backup_id": pre_restore_backup_id,
@@ -932,6 +973,479 @@ class BackupManager:
                 plans=plans,
             ),
         )
+
+    def _journal_path(self, restore_id: str) -> Path:
+        restore_id = self._validate_restore_id(restore_id)
+        path = _absolute(self.backups_root / ".journals" / f"{restore_id}.json")
+        expected_parent = _absolute(self.backups_root / ".journals")
+        if path.parent != expected_parent:
+            raise ValueError("restore_id 路径越界")
+        return path
+
+    @staticmethod
+    def _strict_bool(value: object, label: str) -> bool:
+        if type(value) is not bool:
+            raise BackupIntegrityError(f"恢复 journal 的 {label} 必须是布尔值")
+        return value
+
+    def _load_restore_journal(self, restore_id: str) -> tuple[Path, dict]:
+        restore_id = self._validate_restore_id(restore_id)
+        path = self._journal_path(restore_id)
+        if _has_reparse_in_chain(path.parent):
+            raise BackupIntegrityError("恢复 journal 目录不能是 reparse point")
+        if _is_reparse(path):
+            raise BackupIntegrityError("恢复 journal 不能是 reparse point")
+        if not path.is_file():
+            raise FileNotFoundError(f"恢复 journal 不存在: {restore_id}")
+        try:
+            journal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BackupIntegrityError("恢复 journal 无法读取") from exc
+        required = {
+            "journal_version",
+            "restore_id",
+            "backup_id",
+            "pre_restore_backup_id",
+            "expected_current_fingerprint",
+            "status",
+            "updated_at",
+            "roots",
+        }
+        if not isinstance(journal, dict) or set(journal) != required:
+            raise BackupIntegrityError("恢复 journal 结构无效")
+        if journal["journal_version"] != RESTORE_JOURNAL_VERSION:
+            raise BackupIntegrityError("恢复 journal 版本不兼容")
+        if journal["restore_id"] != restore_id:
+            raise BackupIntegrityError("恢复 journal ID 与文件名不一致")
+        try:
+            self._validate_backup_id(journal["backup_id"])
+            self._validate_backup_id(journal["pre_restore_backup_id"])
+        except ValueError as exc:
+            raise BackupIntegrityError("恢复 journal 的 backup_id 无效") from exc
+        if journal["backup_id"] == journal["pre_restore_backup_id"]:
+            raise BackupIntegrityError("恢复 journal 的备份引用不能相同")
+        fingerprint = journal["expected_current_fingerprint"]
+        if not isinstance(fingerprint, str) or not _SHA256_RE.fullmatch(fingerprint):
+            raise BackupIntegrityError("恢复 journal 的预期指纹无效")
+        if journal["status"] not in _RESTORE_STATUSES:
+            raise BackupIntegrityError("恢复 journal 状态无效")
+        try:
+            updated_at = datetime.fromisoformat(journal["updated_at"])
+        except (TypeError, ValueError) as exc:
+            raise BackupIntegrityError("恢复 journal 时间无效") from exc
+        if updated_at.tzinfo is None:
+            raise BackupIntegrityError("恢复 journal 时间必须包含时区")
+
+        roots = journal["roots"]
+        if not isinstance(roots, list) or len(roots) != 3:
+            raise BackupIntegrityError("恢复 journal 根列表无效")
+        specifications = (
+            ("projects", self.projects_root, True),
+            ("prompts", self.prompts_dir, True),
+            ("settings", self.settings_path, False),
+        )
+        root_required = {
+            "label",
+            "desired",
+            "had_current",
+            "move_attempted",
+            "old_moved",
+            "install_attempted",
+            "new_installed",
+            "stage",
+            "rollback",
+        }
+        for root, (label, target, _directory) in zip(roots, specifications, strict=True):
+            if not isinstance(root, dict) or set(root) != root_required:
+                raise BackupIntegrityError("恢复 journal 根结构无效")
+            if root["label"] != label:
+                raise BackupIntegrityError("恢复 journal 根顺序或名称无效")
+            for field_name in (
+                "desired",
+                "had_current",
+                "move_attempted",
+                "old_moved",
+                "install_attempted",
+                "new_installed",
+            ):
+                self._strict_bool(root[field_name], field_name)
+            if root["old_moved"] and not root["had_current"]:
+                raise BackupIntegrityError("恢复 journal 根状态矛盾")
+            if (root["install_attempted"] or root["new_installed"]) and not root["desired"]:
+                raise BackupIntegrityError("恢复 journal 根状态矛盾")
+            expected_stage = target.parent / f".{target.name}.restore-{restore_id}.stage"
+            expected_rollback = target.parent / f".{target.name}.restore-{restore_id}.rollback"
+            if root["stage"] != str(expected_stage) or root["rollback"] != str(expected_rollback):
+                raise BackupIntegrityError("恢复 journal 生成路径越界")
+        return path, journal
+
+    def _plans_from_journal(self, journal: dict) -> list[_RootPlan]:
+        specifications = (
+            ("projects", self.projects_root, True),
+            ("prompts", self.prompts_dir, True),
+            ("settings", self.settings_path, False),
+        )
+        plans: list[_RootPlan] = []
+        for root, (label, target, directory) in zip(
+            journal["roots"],
+            specifications,
+            strict=True,
+        ):
+            plans.append(_RootPlan(
+                label=label,
+                target=target,
+                stage=Path(root["stage"]),
+                rollback=Path(root["rollback"]),
+                desired=root["desired"],
+                directory=directory,
+                had_current=root["had_current"],
+                move_attempted=root["move_attempted"],
+                old_moved=root["old_moved"],
+                install_attempted=root["install_attempted"],
+                new_installed=root["new_installed"],
+            ))
+        return plans
+
+    def _restore_journal_ids(self) -> list[str]:
+        journals_root = self.backups_root / ".journals"
+        if _has_reparse_in_chain(journals_root):
+            raise BackupIntegrityError("恢复 journal 目录不能是 reparse point")
+        if not journals_root.exists():
+            return []
+        if not journals_root.is_dir():
+            raise BackupIntegrityError("恢复 journal 路径必须是目录")
+        identifiers: list[str] = []
+        for path in sorted(journals_root.iterdir()):
+            if _is_reparse(path) or not path.is_file():
+                raise BackupIntegrityError("恢复 journal 目录包含非法条目")
+            if path.name.startswith(".") and path.name.endswith(".tmp"):
+                candidate, separator, random_suffix = path.name[1:-4].partition(".json.")
+                if separator and random_suffix:
+                    try:
+                        self._validate_restore_id(candidate)
+                    except ValueError:
+                        pass
+                    else:
+                        # 原子 journal 写入被进程终止时会留下该精确命名的普通
+                        # 临时文件；恢复枚举只信任最终 UUID.json，不让残留阻断自救。
+                        continue
+            if path.suffix != ".json":
+                raise BackupIntegrityError("恢复 journal 目录包含非法条目")
+            try:
+                identifiers.append(self._validate_restore_id(path.stem))
+            except ValueError as exc:
+                raise BackupIntegrityError("恢复 journal 文件名无效") from exc
+        return identifiers
+
+    def _pending_restore_ids(self) -> list[str]:
+        pending: list[str] = []
+        for restore_id in self._restore_journal_ids():
+            _path, journal = self._load_restore_journal(restore_id)
+            if journal["status"] in _PENDING_RESTORE_STATUSES:
+                pending.append(restore_id)
+        return pending
+
+    def pending_restore_ids(self) -> list[str]:
+        """返回未完成整库恢复 ID；只读，用于服务维护态门禁。"""
+        with self._lock:
+            return list(self._pending_restore_ids())
+
+    def _assert_no_unresolved_restore(self) -> None:
+        pending = self._pending_restore_ids()
+        if pending:
+            raise BackupConflict(
+                "存在未完成的整库恢复，必须先执行恢复处理",
+                code="restore_recovery_required",
+                detail={"restore_ids": pending},
+            )
+
+    @staticmethod
+    def _public_journal(journal: dict) -> dict:
+        return {
+            "restore_id": journal["restore_id"],
+            "backup_id": journal["backup_id"],
+            "pre_restore_backup_id": journal["pre_restore_backup_id"],
+            "expected_current_fingerprint": journal["expected_current_fingerprint"],
+            "status": journal["status"],
+            "updated_at": journal["updated_at"],
+            "roots": [
+                {
+                    key: root[key]
+                    for key in (
+                        "label",
+                        "desired",
+                        "had_current",
+                        "move_attempted",
+                        "old_moved",
+                        "install_attempted",
+                        "new_installed",
+                    )
+                }
+                for root in journal["roots"]
+            ],
+        }
+
+    def list_restore_journals(self) -> list[dict]:
+        """严格读取所有恢复日志，不改变活动数据。"""
+        with self._lock:
+            journals = [
+                self._public_journal(self._load_restore_journal(identifier)[1])
+                for identifier in self._restore_journal_ids()
+            ]
+            journals.sort(key=lambda item: item["updated_at"], reverse=True)
+            return journals
+
+    def get_restore_journal(self, restore_id: str) -> dict:
+        """查询恢复日志及当前整库状态，不执行恢复。"""
+        with self._lock:
+            _path, journal = self._load_restore_journal(restore_id)
+            current = self._scan_sources().fingerprint
+            try:
+                target = self.get_verified(journal["backup_id"]).manifest[
+                    "source_fingerprint"
+                ]
+            except FileNotFoundError:
+                target = None
+            if target is not None and current == target:
+                active_state = "backup"
+                suggested_action = "commit"
+            elif current == journal["expected_current_fingerprint"]:
+                active_state = "expected_current"
+                suggested_action = "rollback"
+            else:
+                active_state = "mixed"
+                suggested_action = "rollback"
+            result = self._public_journal(journal)
+            result.update({
+                "current_fingerprint": current,
+                "backup_fingerprint": target,
+                "active_state": active_state,
+                "suggested_action": (
+                    None
+                    if journal["status"] not in _PENDING_RESTORE_STATUSES
+                    else suggested_action
+                ),
+            })
+            return result
+
+    def _recover_plans_to_expected(self, plans: list[_RootPlan]) -> None:
+        """根据磁盘拓扑把硬退出后的多根状态补偿回原指纹。"""
+        for plan in plans:
+            for path in (plan.target, plan.stage, plan.rollback):
+                if _is_reparse(path):
+                    raise BackupIntegrityError("恢复补偿路径不能是 reparse point")
+            if plan.had_current and not plan.target.exists() and not plan.rollback.exists():
+                raise BackupOperationError(
+                    "恢复补偿缺少原始根",
+                    code="restore_recovery_required",
+                )
+            if not plan.had_current and plan.rollback.exists():
+                raise BackupIntegrityError("恢复补偿发现不应存在的 rollback 根")
+
+        for plan in reversed(plans):
+            if plan.had_current and plan.rollback.exists():
+                if plan.target.exists():
+                    self._remove_generated(plan.target)
+                self._replace_path(plan.rollback, plan.target)
+                plan.old_moved = False
+                plan.new_installed = False
+            elif not plan.had_current and plan.target.exists():
+                self._remove_generated(plan.target)
+                plan.new_installed = False
+
+    def _hydrate_missing_rollback(
+        self,
+        plan: _RootPlan,
+        pre_restore: VerifiedBackup,
+    ) -> None:
+        """从已验证的 pre_restore ZIP 重建丢失的单个 rollback 根。"""
+        if (
+            not plan.had_current
+            or not pre_restore.manifest["root_states"][plan.label]
+            or plan.rollback.exists()
+            or _is_reparse(plan.rollback)
+        ):
+            raise BackupIntegrityError("恢复前备份与缺失 rollback 根状态不一致")
+        if _has_reparse_in_chain(plan.target.parent):
+            raise BackupIntegrityError("恢复补偿目标父目录不能是 reparse point")
+        if os.path.lexists(plan.stage):
+            self._remove_generated(plan.stage)
+        if plan.directory:
+            plan.stage.mkdir(parents=True)
+
+        matched = 0
+        try:
+            with zipfile.ZipFile(pre_restore.path, mode="r") as archive:
+                for item in pre_restore.manifest["items"]:
+                    pure = PurePosixPath(item["path"])
+                    if plan.label == "settings":
+                        if item["path"] != "settings.json":
+                            continue
+                        relative: tuple[str, ...] = ()
+                    else:
+                        if not pure.parts or pure.parts[0] != plan.label:
+                            continue
+                        relative = tuple(pure.parts[1:])
+                        if not relative:
+                            raise BackupIntegrityError("恢复前备份根成员路径无效")
+                    matched += 1
+                    target = plan.stage if not relative else plan.stage.joinpath(*relative)
+                    if plan.directory:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                    elif relative:
+                        raise BackupIntegrityError("settings 恢复前备份路径无效")
+                    digest = hashlib.sha256()
+                    size = 0
+                    with archive.open(item["path"], mode="r") as source, target.open("xb") as output:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            size += len(chunk)
+                            digest.update(chunk)
+                            output.write(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    if size != item["size"] or digest.hexdigest() != item["sha256"]:
+                        raise BackupIntegrityError("恢复前备份 rollback 重建校验失败")
+            if not plan.directory and matched != 1:
+                raise BackupIntegrityError("恢复前备份缺少 settings rollback")
+            self._replace_path(plan.stage, plan.rollback)
+        except BaseException:
+            try:
+                self._remove_generated(plan.stage)
+            except OSError:
+                pass
+            raise
+
+    def _hydrate_missing_rollbacks(
+        self,
+        plans: list[_RootPlan],
+        pre_restore: VerifiedBackup,
+    ) -> bool:
+        """仅在 journal 表明原根已参与切换时，用 pre_restore 补齐丢失根。"""
+        hydrated = False
+        for plan in plans:
+            needs_fallback = (
+                plan.had_current
+                and not plan.rollback.exists()
+                and (plan.move_attempted or not plan.target.exists())
+            )
+            if needs_fallback:
+                self._hydrate_missing_rollback(plan, pre_restore)
+                hydrated = True
+        return hydrated
+
+    def recover_restore(self, restore_id: str) -> dict:
+        """显式解析硬退出恢复：完整目标则提交，其余状态回滚到原指纹。"""
+        with library_lock.exclusive():
+            with self._lock:
+                pending = self._pending_restore_ids()
+                if restore_id not in pending:
+                    _path, journal = self._load_restore_journal(restore_id)
+                    if journal["status"] not in _PENDING_RESTORE_STATUSES:
+                        return {
+                            "recovered": False,
+                            "action": "none",
+                            **self.get_restore_journal(restore_id),
+                        }
+                if pending != [restore_id]:
+                    raise BackupConflict(
+                        "恢复日志集合不唯一，禁止自动处理",
+                        code="restore_recovery_conflict",
+                        detail={"restore_ids": pending},
+                    )
+                journal_path, journal = self._load_restore_journal(restore_id)
+                pre_restore = self.get_verified(journal["pre_restore_backup_id"])
+                expected = journal["expected_current_fingerprint"]
+                try:
+                    target_backup = self.get_verified(journal["backup_id"])
+                    target = target_backup.manifest["source_fingerprint"]
+                except FileNotFoundError:
+                    target_backup = None
+                    target = None
+                if pre_restore.manifest["source_fingerprint"] != expected:
+                    raise BackupIntegrityError(
+                        "恢复前备份与 journal 预期指纹不一致",
+                    )
+                plans = self._plans_from_journal(journal)
+                if target_backup is None:
+                    raise BackupIntegrityError("恢复目标备份缺失")
+                for root, plan in zip(journal["roots"], plans, strict=True):
+                    label = plan.label
+                    if (
+                        root["had_current"]
+                        != pre_restore.manifest["root_states"][label]
+                        or root["desired"]
+                        != target_backup.manifest["root_states"][label]
+                    ):
+                        raise BackupIntegrityError(
+                            "恢复 journal 根状态与已验证备份不一致"
+                        )
+                current = self._scan_sources().fingerprint
+                recovered_from_pre_restore = False
+                if target is not None and current == target:
+                    action = "commit"
+                    status = "committed"
+                elif current == expected:
+                    action = "rollback"
+                    status = "rolled_back"
+                else:
+                    self._persist_journal(
+                        journal_path,
+                        restore_id=restore_id,
+                        backup_id=journal["backup_id"],
+                        pre_restore_backup_id=journal["pre_restore_backup_id"],
+                        expected_fingerprint=expected,
+                        status="recovering",
+                        plans=plans,
+                    )
+                    try:
+                        recovered_from_pre_restore = self._hydrate_missing_rollbacks(
+                            plans,
+                            pre_restore,
+                        )
+                        self._recover_plans_to_expected(plans)
+                        if self._scan_sources().fingerprint != expected:
+                            raise BackupOperationError(
+                                "恢复补偿后的活动数据指纹不匹配",
+                                code="restore_recovery_required",
+                            )
+                    except Exception as exc:
+                        try:
+                            self._persist_journal(
+                                journal_path,
+                                restore_id=restore_id,
+                                backup_id=journal["backup_id"],
+                                pre_restore_backup_id=journal["pre_restore_backup_id"],
+                                expected_fingerprint=expected,
+                                status="needs_recovery",
+                                plans=plans,
+                            )
+                        except Exception:
+                            pass
+                        if isinstance(exc, BackupError):
+                            raise
+                        raise BackupOperationError(
+                            "恢复补偿未完整结束",
+                            code="restore_recovery_required",
+                            backup_id=journal["backup_id"],
+                        ) from exc
+                    action = "rollback"
+                    status = "rolled_back"
+                self._persist_journal(
+                    journal_path,
+                    restore_id=restore_id,
+                    backup_id=journal["backup_id"],
+                    pre_restore_backup_id=journal["pre_restore_backup_id"],
+                    expected_fingerprint=expected,
+                    status=status,
+                    plans=plans,
+                )
+                self._cleanup_plans(plans)
+                return {
+                    "recovered": True,
+                    "action": action,
+                    "recovered_from_pre_restore": recovered_from_pre_restore,
+                    **self.get_restore_journal(restore_id),
+                }
 
     def _rollback_plans(self, plans: list[_RootPlan]) -> None:
         failures: list[BaseException] = []
@@ -980,6 +1494,21 @@ class BackupManager:
         expected_current_fingerprint: str,
         confirm_conflicts: bool = False,
     ) -> dict:
+        """在整库独占锁内执行多根恢复。"""
+        with library_lock.exclusive():
+            return self._restore_locked(
+                backup_id,
+                expected_current_fingerprint=expected_current_fingerprint,
+                confirm_conflicts=confirm_conflicts,
+            )
+
+    def _restore_locked(
+        self,
+        backup_id: str,
+        *,
+        expected_current_fingerprint: str,
+        confirm_conflicts: bool = False,
+    ) -> dict:
         if (
             not isinstance(expected_current_fingerprint, str)
             or not _SHA256_RE.fullmatch(expected_current_fingerprint)
@@ -988,6 +1517,7 @@ class BackupManager:
         if type(confirm_conflicts) is not bool:
             raise ValueError("confirm_conflicts 必须是布尔值")
         with self._lock:
+            self._assert_no_unresolved_restore()
             verified = self.get_verified(backup_id)
             self._validate_structured_payloads(verified)
             current = self._scan_sources()
@@ -1059,6 +1589,15 @@ class BackupManager:
                 for plan in plans:
                     if plan.target.exists():
                         plan.move_attempted = True
+                        self._persist_journal(
+                            journal_path,
+                            restore_id=restore_id,
+                            backup_id=backup_id,
+                            pre_restore_backup_id=pre_restore_backup_id,
+                            expected_fingerprint=expected_current_fingerprint,
+                            status="switching",
+                            plans=plans,
+                        )
                         self._replace_path(plan.target, plan.rollback)
                         plan.old_moved = True
                         self._persist_journal(
@@ -1072,6 +1611,15 @@ class BackupManager:
                         )
                     if plan.desired:
                         plan.install_attempted = True
+                        self._persist_journal(
+                            journal_path,
+                            restore_id=restore_id,
+                            backup_id=backup_id,
+                            pre_restore_backup_id=pre_restore_backup_id,
+                            expected_fingerprint=expected_current_fingerprint,
+                            status="switching",
+                            plans=plans,
+                        )
                         self._replace_path(plan.stage, plan.target)
                         plan.new_installed = True
                         self._persist_journal(
@@ -1095,7 +1643,7 @@ class BackupManager:
                     status="committed",
                     plans=plans,
                 )
-            except BaseException as exc:
+            except Exception as exc:
                 attempted_switch = any(
                     plan.move_attempted or plan.install_attempted
                     for plan in plans
@@ -1164,3 +1712,403 @@ class BackupManager:
                 "pre_restore_backup_id": pre_restore_backup_id,
                 "current_fingerprint": verified.manifest["source_fingerprint"],
             }
+
+    @staticmethod
+    def _canonical_sha256(payload: object) -> str:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _retention_plan_locked(self) -> dict:
+        listed = self.list_backups()
+        states: list[dict] = []
+        deletions: list[dict] = []
+        for item in listed:
+            backup_id = item["backup_id"]
+            if item.get("status") == "invalid":
+                path = self.backups_root / f"{backup_id}.zip"
+                _size, archive_sha256 = self._hash_stable_file(path)
+                states.append({
+                    "backup_id": backup_id,
+                    "status": "invalid",
+                    "code": item["code"],
+                    "archive_sha256": archive_sha256,
+                })
+                continue
+            path = self._backup_path(backup_id)
+            _size, archive_sha256 = self._hash_stable_file(path)
+            state = {
+                "backup_id": backup_id,
+                "status": "valid",
+                "created_at": item["created_at"],
+                "expired": item["expired"],
+                "expired_reasons": list(item["expired_reasons"]),
+                "archive_sha256": archive_sha256,
+            }
+            states.append(state)
+            if item["expired"]:
+                deletions.append({
+                    "backup_id": backup_id,
+                    "created_at": item["created_at"],
+                    "expired_reasons": list(item["expired_reasons"]),
+                    "archive_sha256": archive_sha256,
+                })
+        canonical = {
+            "policy": {
+                "retention_days": self.retention_days,
+                "retention_count": self.retention_count,
+            },
+            "backup_states": states,
+            "deletions": deletions,
+        }
+        return {
+            **canonical,
+            "plan_fingerprint": self._canonical_sha256(canonical),
+            "generated_at": _utc_now().isoformat(),
+            "delete_count": len(deletions),
+        }
+
+    def plan_retention(self) -> dict:
+        """生成纯读取保留计划；不会删除或改写任何 ZIP。"""
+        with self._lock:
+            return self._retention_plan_locked()
+
+    def _persist_operation_record(
+        self,
+        directory_name: str,
+        filename: str,
+        record: dict,
+    ) -> Path:
+        root = self.backups_root / directory_name
+        if _has_reparse_in_chain(root):
+            raise BackupIntegrityError("备份操作记录目录不能是 reparse point")
+        self.backups_root.mkdir(parents=True, exist_ok=True)
+        root.mkdir(parents=True, exist_ok=True)
+        if _has_reparse_in_chain(root):
+            raise BackupIntegrityError("备份操作记录目录不能是 reparse point")
+        path = root / filename
+        if path.parent != root or _is_reparse(path):
+            raise BackupIntegrityError("备份操作记录路径越界")
+        _atomic_json(path, record)
+        return path
+
+    def _delete_backup_path(self, path: Path) -> None:
+        path.unlink()
+
+    def apply_retention(
+        self,
+        *,
+        plan_fingerprint: str,
+        confirm: bool,
+    ) -> dict:
+        """持计划指纹和显式确认执行过期 ZIP 清理。"""
+        if not isinstance(plan_fingerprint, str) or not _SHA256_RE.fullmatch(plan_fingerprint):
+            raise ValueError("plan_fingerprint 必须是 SHA-256")
+        if type(confirm) is not bool:
+            raise ValueError("confirm 必须是布尔值")
+        if not confirm:
+            raise BackupConflict(
+                "保留清理需要显式确认",
+                code="confirmation_required",
+                detail={"requires_confirmation": True},
+            )
+        with library_lock.exclusive():
+            with self._lock:
+                self._assert_no_unresolved_restore()
+                plan = self._retention_plan_locked()
+                if plan["plan_fingerprint"] != plan_fingerprint:
+                    raise BackupConflict(
+                        "保留计划已变化",
+                        code="retention_plan_changed",
+                        detail={
+                            "expected_plan_fingerprint": plan_fingerprint,
+                            "current_plan_fingerprint": plan["plan_fingerprint"],
+                        },
+                    )
+                operation_id = str(uuid4())
+                deleted: list[str] = []
+                for index, item in enumerate(plan["deletions"]):
+                    backup_id = item["backup_id"]
+                    path = self._backup_path(backup_id)
+                    self.get_verified(backup_id)
+                    _size, archive_sha256 = self._hash_stable_file(path)
+                    if archive_sha256 != item["archive_sha256"]:
+                        raise BackupConflict(
+                            "保留计划中的 ZIP 已变化",
+                            code="retention_plan_changed",
+                        )
+                    audit_base = f"{operation_id}-{index:04d}-{backup_id}"
+                    self._persist_operation_record(
+                        ".retention-audit",
+                        f"{audit_base}-intent.json",
+                        {
+                            "record_version": 1,
+                            "operation_id": operation_id,
+                            "action": "delete_intent",
+                            "backup_id": backup_id,
+                            "plan_fingerprint": plan_fingerprint,
+                            "archive_sha256": archive_sha256,
+                            "persisted_at": _utc_now().isoformat(),
+                        },
+                    )
+                    try:
+                        self._delete_backup_path(path)
+                    except OSError as exc:
+                        raise BackupOperationError(
+                            "过期备份删除失败，审计意图已持久化",
+                            code="retention_delete_failed",
+                            backup_id=backup_id,
+                        ) from exc
+                    self._persist_operation_record(
+                        ".retention-audit",
+                        f"{audit_base}-deleted.json",
+                        {
+                            "record_version": 1,
+                            "operation_id": operation_id,
+                            "action": "deleted",
+                            "backup_id": backup_id,
+                            "plan_fingerprint": plan_fingerprint,
+                            "archive_sha256": archive_sha256,
+                            "persisted_at": _utc_now().isoformat(),
+                        },
+                    )
+                    deleted.append(backup_id)
+                return {
+                    "applied": True,
+                    "operation_id": operation_id,
+                    "plan_fingerprint": plan_fingerprint,
+                    "deleted_backup_ids": deleted,
+                }
+
+    def _drill_path(self, drill_id: str) -> Path:
+        drill_id = self._validate_drill_id(drill_id)
+        root = _absolute(self.backups_root / ".drills")
+        path = _absolute(root / f"{drill_id}.json")
+        if path.parent != root:
+            raise ValueError("drill_id 路径越界")
+        return path
+
+    def _write_drill_record(self, drill_id: str, record: dict) -> None:
+        self._persist_operation_record(
+            ".drills",
+            f"{self._validate_drill_id(drill_id)}.json",
+            record,
+        )
+
+    def drill(self, backup_id: str) -> dict:
+        """临时解包并扫描备份，不切换活动数据根。"""
+        backup_id = self._validate_backup_id(backup_id)
+        drill_id = str(uuid4())
+        started_at = _utc_now().isoformat()
+        with library_lock.exclusive():
+            with self._lock:
+                self._assert_no_unresolved_restore()
+                active_before = self._scan_sources().fingerprint
+                workspace_root = _absolute(self.backups_root / ".drill-workspaces")
+                workspace = _absolute(workspace_root / drill_id)
+                workspace_cleaned = not os.path.lexists(workspace)
+                try:
+                    verified = self.get_verified(backup_id)
+                    self._validate_structured_payloads(verified)
+                    manifest = verified.manifest
+                    if workspace.parent != workspace_root:
+                        raise BackupIntegrityError("演练临时目录路径越界")
+                    for active in (self.projects_root, self.prompts_dir, self.settings_path):
+                        if workspace.is_relative_to(active) or active.is_relative_to(workspace):
+                            raise BackupIntegrityError("演练临时目录与活动数据根重叠")
+                    if _has_reparse_in_chain(self.backups_root):
+                        raise BackupIntegrityError("备份目录不能是 reparse point")
+                    self.backups_root.mkdir(parents=True, exist_ok=True)
+                    workspace_root.mkdir(exist_ok=True)
+                    if _has_reparse_in_chain(workspace_root) or os.path.lexists(workspace):
+                        raise BackupIntegrityError("演练临时目录无效")
+                    workspace.mkdir()
+                    try:
+                        projects = workspace / "projects"
+                        prompts = workspace / "prompts"
+                        settings = workspace / "settings.json"
+                        if manifest["root_states"]["projects"]:
+                            projects.mkdir()
+                        if manifest["root_states"]["prompts"]:
+                            prompts.mkdir()
+                        with zipfile.ZipFile(verified.path, mode="r") as archive:
+                            for item in manifest["items"]:
+                                pure = PurePosixPath(item["path"])
+                                if item["path"] == "settings.json":
+                                    target = settings
+                                elif pure.parts[0] == "projects":
+                                    target = projects.joinpath(*pure.parts[1:])
+                                elif pure.parts[0] == "prompts":
+                                    target = prompts.joinpath(*pure.parts[1:])
+                                else:
+                                    raise BackupIntegrityError("演练成员不属于白名单根")
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                digest = hashlib.sha256()
+                                size = 0
+                                with archive.open(item["path"], "r") as source, target.open("xb") as output:
+                                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                                        size += len(chunk)
+                                        digest.update(chunk)
+                                        output.write(chunk)
+                                if size != item["size"] or digest.hexdigest() != item["sha256"]:
+                                    raise BackupIntegrityError("演练解包文件校验失败")
+                        scanner = BackupManager(
+                            workspace / "archives",
+                            projects,
+                            prompts,
+                            settings,
+                            retention_days=self.retention_days,
+                            retention_count=self.retention_count,
+                        )
+                        unpacked = scanner._scan_sources()
+                        if unpacked.fingerprint != manifest["source_fingerprint"]:
+                            raise BackupIntegrityError("演练解包后的数据指纹不匹配")
+                    finally:
+                        try:
+                            if os.path.lexists(workspace) and not _is_reparse(workspace):
+                                shutil.rmtree(workspace)
+                        except OSError:
+                            pass
+                        workspace_cleaned = not os.path.lexists(workspace)
+                    if not workspace_cleaned:
+                        raise BackupOperationError(
+                            "演练临时目录清理失败",
+                            code="backup_drill_cleanup_failed",
+                            backup_id=backup_id,
+                        )
+                    active_after = self._scan_sources().fingerprint
+                    if active_after != active_before:
+                        raise BackupConflict(
+                            "演练期间活动数据发生变化",
+                            code="source_changed",
+                        )
+                    record = {
+                        "record_version": DRILL_RECORD_VERSION,
+                        "drill_id": drill_id,
+                        "backup_id": backup_id,
+                        "status": "passed",
+                        "backup_fingerprint": manifest["source_fingerprint"],
+                        "active_fingerprint": active_after,
+                        "checked_file_count": len(manifest["items"]),
+                        "started_at": started_at,
+                        "completed_at": _utc_now().isoformat(),
+                        "workspace_cleaned": workspace_cleaned,
+                        "error": None,
+                    }
+                    self._write_drill_record(drill_id, record)
+                    return record
+                except Exception as exc:
+                    detail = (
+                        exc.as_detail()
+                        if isinstance(exc, BackupError)
+                        else {"code": "backup_drill_failed", "message": "备份恢复演练失败"}
+                    )
+                    record = {
+                        "record_version": DRILL_RECORD_VERSION,
+                        "drill_id": drill_id,
+                        "backup_id": str(backup_id),
+                        "status": "failed",
+                        "backup_fingerprint": None,
+                        "active_fingerprint": active_before,
+                        "checked_file_count": 0,
+                        "started_at": started_at,
+                        "completed_at": _utc_now().isoformat(),
+                        "workspace_cleaned": workspace_cleaned,
+                        "error": detail,
+                    }
+                    try:
+                        self._write_drill_record(drill_id, record)
+                    except Exception as record_error:
+                        raise BackupOperationError(
+                            "备份演练失败且结果记录无法持久化",
+                            code="backup_drill_record_failed",
+                            backup_id=str(backup_id),
+                        ) from record_error
+                    raise
+
+    def get_drill(self, drill_id: str) -> dict:
+        with self._lock:
+            path = self._drill_path(drill_id)
+            if _has_reparse_in_chain(path.parent) or _is_reparse(path):
+                raise BackupIntegrityError("演练记录不能是 reparse point")
+            if not path.is_file():
+                raise FileNotFoundError(f"演练记录不存在: {drill_id}")
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise BackupIntegrityError("演练记录无法读取") from exc
+            required = {
+                "record_version",
+                "drill_id",
+                "backup_id",
+                "status",
+                "backup_fingerprint",
+                "active_fingerprint",
+                "checked_file_count",
+                "started_at",
+                "completed_at",
+                "workspace_cleaned",
+                "error",
+            }
+            if not isinstance(record, dict) or set(record) != required:
+                raise BackupIntegrityError("演练记录结构无效")
+            if record["record_version"] != DRILL_RECORD_VERSION:
+                raise BackupIntegrityError("演练记录版本不兼容")
+            if record["drill_id"] != self._validate_drill_id(drill_id):
+                raise BackupIntegrityError("演练记录 ID 与文件名不一致")
+            try:
+                self._validate_backup_id(record["backup_id"])
+            except ValueError as exc:
+                raise BackupIntegrityError("演练记录的 backup_id 无效") from exc
+            if record["status"] not in {"passed", "failed"}:
+                raise BackupIntegrityError("演练记录状态无效")
+            for time_field in ("started_at", "completed_at"):
+                try:
+                    timestamp = datetime.fromisoformat(record[time_field])
+                except (TypeError, ValueError) as exc:
+                    raise BackupIntegrityError("演练记录时间无效") from exc
+                if timestamp.tzinfo is None:
+                    raise BackupIntegrityError("演练记录时间必须包含时区")
+            if (
+                isinstance(record["checked_file_count"], bool)
+                or not isinstance(record["checked_file_count"], int)
+                or record["checked_file_count"] < 0
+                or type(record["workspace_cleaned"]) is not bool
+            ):
+                raise BackupIntegrityError("演练记录计数或清理状态无效")
+            for fingerprint_field in ("backup_fingerprint", "active_fingerprint"):
+                value = record[fingerprint_field]
+                if value is not None and (
+                    not isinstance(value, str) or not _SHA256_RE.fullmatch(value)
+                ):
+                    raise BackupIntegrityError("演练记录指纹无效")
+            error = record["error"]
+            if error is not None and (
+                not isinstance(error, dict)
+                or set(error) - {"code", "message", "backup_id"}
+                or not isinstance(error.get("code"), str)
+                or not isinstance(error.get("message"), str)
+            ):
+                raise BackupIntegrityError("演练记录错误结构无效")
+            return record
+
+    def list_drills(self) -> list[dict]:
+        with self._lock:
+            root = self.backups_root / ".drills"
+            if _has_reparse_in_chain(root):
+                raise BackupIntegrityError("演练记录目录不能是 reparse point")
+            if not root.exists():
+                return []
+            if not root.is_dir():
+                raise BackupIntegrityError("演练记录路径必须是目录")
+            records: list[dict] = []
+            for path in sorted(root.iterdir()):
+                if _is_reparse(path) or not path.is_file() or path.suffix != ".json":
+                    raise BackupIntegrityError("演练记录目录包含非法条目")
+                records.append(self.get_drill(path.stem))
+            records.sort(key=lambda item: item["completed_at"], reverse=True)
+            return records

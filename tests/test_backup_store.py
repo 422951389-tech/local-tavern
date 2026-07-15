@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -220,3 +221,43 @@ def test_expired_policy_only_marks_backups_and_never_deletes(tmp_path):
     assert by_id[backup_id(first)]["expired"] is True
     assert by_id[backup_id(second)]["expired"] is False
     assert file_manifest(seeded["backups_root"]) == zip_before
+
+
+def test_project_names_are_not_excluded_and_only_internal_receipts_are_skipped(
+    tmp_path,
+):
+    seeded = seed_backup_library(tmp_path)
+    expected_payloads = {}
+    for project in ("backup", "logs", "cache"):
+        path = seeded["projects_root"] / project / "saves" / "main.json"
+        payload = json.dumps(
+            {"project": project, "session_id": "main", "revision": 0},
+            ensure_ascii=False,
+        ).encode()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        expected_payloads[project] = payload
+    receipt = seeded["projects_root"] / ".migration-receipts" / "owned.rcpt"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_bytes(b"internal ownership receipt")
+
+    created = seeded["manager"].create_backup()
+    manifest = seeded["manager"].get_verified(backup_id(created)).manifest
+    archive_paths = {item["path"] for item in manifest["items"]}
+
+    for project in expected_payloads:
+        assert f"projects/{project}/saves/main.json" in archive_paths
+        shutil.rmtree(seeded["projects_root"] / project)
+    assert not any(".migration-receipts" in path for path in archive_paths)
+
+    dry_run = seeded["manager"].dry_run(backup_id(created))
+    seeded["manager"].restore(
+        backup_id(created),
+        expected_current_fingerprint=dry_run["current_fingerprint"],
+        confirm_conflicts=True,
+    )
+
+    for project, payload in expected_payloads.items():
+        restored = seeded["projects_root"] / project / "saves" / "main.json"
+        assert restored.read_bytes() == payload
+    assert not receipt.exists()

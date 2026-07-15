@@ -46,6 +46,19 @@ def _configured_int(
     return value
 
 
+def _configured_bool(env_name: str, default: bool) -> bool:
+    """读取显式布尔环境变量，拒绝含糊文本。"""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    normalized = raw.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{env_name} 必须是 true/false 或 1/0")
+
+
 # 项目根目录与关键子路径。
 # 测试进程在导入应用前注入 TAVERN_* 路径，生产环境不设变量时行为不变。
 BASE_DIR = _configured_path("TAVERN_BASE_DIR", Path("C:/local-tavern"))
@@ -77,6 +90,28 @@ BACKUP_RETENTION_COUNT = _configured_int(
     10,
     minimum=1,
     maximum=1000,
+)
+BACKUP_SCHEDULE_ENABLED = _configured_bool(
+    "TAVERN_BACKUP_SCHEDULE_ENABLED",
+    True,
+)
+BACKUP_INTERVAL_HOURS = _configured_int(
+    "TAVERN_BACKUP_INTERVAL_HOURS",
+    24,
+    minimum=1,
+    maximum=24 * 365,
+)
+BACKUP_DRILL_INTERVAL_DAYS = _configured_int(
+    "TAVERN_BACKUP_DRILL_INTERVAL_DAYS",
+    7,
+    minimum=1,
+    maximum=365,
+)
+BACKUP_SCHEDULER_POLL_SECONDS = _configured_int(
+    "TAVERN_BACKUP_SCHEDULER_POLL_SECONDS",
+    900,
+    minimum=60,
+    maximum=24 * 60 * 60,
 )
 
 OLLAMA_HOST = os.environ.get("TAVERN_OLLAMA_HOST", "http://localhost:11434").strip().rstrip("/")
