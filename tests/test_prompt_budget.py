@@ -314,15 +314,49 @@ def test_production_prompt_uses_only_the_zero_one_or_many_real_characters(charac
 
 def test_current_and_latest_default_production_templates_have_no_named_ghosts():
     prompt_dir = REPO_ROOT / "prompts"
-    paths = [prompt_dir / "system.md", prompt_dir / "group_chat.md"]
-    for name in ("system", "group_chat"):
+    paths = [
+        prompt_dir / "system.md",
+        prompt_dir / "group_chat.md",
+        prompt_dir / "summary.md",
+    ]
+    for name in ("system", "group_chat", "summary"):
         backups = sorted((prompt_dir / ".default").glob(f"{name}.md.v*-bak"))
         assert backups, f"{name} 缺少版本化默认模板"
         paths.append(backups[-1])
+        assert (prompt_dir / f"{name}.md").read_bytes() == backups[-1].read_bytes()
 
     for path in paths:
         content = path.read_text(encoding="utf-8")
         assert not any(ghost in content for ghost in FORBIDDEN_GHOSTS), path
+
+
+def test_summary_time_and_only_valid_content_enter_prompt_once(tmp_path):
+    assembler = _test_assembler(tmp_path)
+    assembly = _assemble(
+        assembler,
+        summaries=[
+            {
+                "id": "valid-summary",
+                "status": "completed",
+                "content_status": "valid",
+                "text": "VALID_SUMMARY_TEXT",
+                "time": "VALID_SUMMARY_TIME",
+                "facts": [],
+                "relations": [],
+            },
+            {
+                "id": "empty-pending",
+                "status": "pending",
+                "content_status": "empty",
+                "text": "SHOULD_NOT_ENTER_PROMPT",
+            },
+        ],
+        context_limit=1_048_576,
+    )
+    content = _all_content(assembly)
+    assert content.count("VALID_SUMMARY_TEXT") == 1
+    assert content.count("VALID_SUMMARY_TIME") == 1
+    assert "SHOULD_NOT_ENTER_PROMPT" not in content
 
 
 @pytest.mark.asyncio

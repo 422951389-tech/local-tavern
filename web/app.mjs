@@ -10,7 +10,8 @@ import { createProjectService } from './projects.mjs';
 import { createSaveService } from './saves.mjs';
 import { createTurnPayload, createTurnPersistence } from './chat.mjs';
 import { createSummaryService, summaryPatchFromForm } from './summaries.mjs';
-import { createPromptService } from './prompt-editor.mjs';
+import { renderSummaryPanelView } from './summary-panel.mjs';
+import { createPromptService, promptTabTargetIndex } from './prompt-editor.mjs';
 import { affinityBar, createMessageElement } from './render.mjs';
 
 // 本地酒馆 — 前端逻辑 v2（项目+存档双层架构）
@@ -88,6 +89,8 @@ const state = {
     isStreaming: false,
     navigationBusy: false,
     activeTurn: null,
+    selectedSummaryId: null,
+    summaryPanelExpanded: false,
     modelParams: {
         temperature: 0.8,
         top_p: 0.9,
@@ -114,6 +117,7 @@ const sessionRefs = new SessionRefTracker(state.currentProject, state.currentSav
 let committedSessionRef = sessionRefs.capture();
 let activeController = null;   // 当前 turn SSE 的 AbortController；业务取消必须调用服务端 cancel API
 const latestRequest = { projects: 0, projectStats: 0, saves: 0 };
+const summaryWatchers = new Map();
 
 function currentRevision(ref = captureSessionRef()) {
     if (!isCurrentSessionRef(ref) || !sessionBelongsToRef(state.session, ref)) return 0;
@@ -147,14 +151,24 @@ function setNavigationUiState(active) {
 }
 
 function beginSessionTransition(project, save = null) {
+    cancelSummaryWatchers();
+    state.selectedSummaryId = null;
+    state.summaryPanelExpanded = false;
     setNavigationUiState(true);
     return sessionRefs.advance(project, save);
 }
 
 function rollbackSessionTransition(candidateRef) {
     if (isCurrentSessionRef(candidateRef)) {
-        sessionRefs.advance(committedSessionRef.project, committedSessionRef.save);
+        const restoredRef = sessionRefs.advance(
+            committedSessionRef.project,
+            committedSessionRef.save,
+        );
+        committedSessionRef = restoredRef;
         setNavigationUiState(false);
+        if (sessionBelongsToRef(state.session, restoredRef)) {
+            watchPendingSummaries(restoredRef, state.session);
+        }
     }
 }
 
@@ -200,7 +214,31 @@ function commitSessionState(session, ref) {
     const modelSelect = document.getElementById('model-select');
     if (modelSelect && commit.currentModel) modelSelect.value = commit.currentModel;
     renderSaveListControls();
+    watchPendingSummaries(ref, commit.session);
     if (isTurnActiveForRef(ref)) setTurnUiState(true, Boolean(state.activeTurn && state.activeTurn.cancelling));
+    return true;
+}
+
+function commitSummaryRefresh(session, ref) {
+    const commit = buildSessionCommit({
+        session,
+        ref,
+        currentRef: captureSessionRef(),
+        currentSession: state.session,
+        saveList: state.saveList,
+    });
+    if (!commit.accepted) return false;
+    const summariesUnchanged = state.session
+        && state.session.revision === commit.session.revision
+        && JSON.stringify(state.session.summaries || [])
+            === JSON.stringify(commit.session.summaries || []);
+    if (summariesUnchanged) return true;
+    state.session = commit.session;
+    state.saveList = commit.saveList;
+    const stream = document.getElementById('chat-stream');
+    const lastAssistant = stream && stream.querySelector('.msg.assistant:last-of-type');
+    if (lastAssistant) renderSummaryPanel(lastAssistant, commit.session);
+    watchPendingSummaries(ref, commit.session);
     return true;
 }
 
@@ -1015,183 +1053,172 @@ function renderParsedResponse(parsed) {
 }
 
 function renderSummaryPanel(lastAssistant, sess) {
-    // 在该 AI 消息后挂可折叠「📋 剧情记忆」面板，展示最新一段短期总结或失败提示
-    if (!lastAssistant || !lastAssistant.parentNode) return;
-    const summaries = (sess && sess.summaries) || [];
-    const err = (sess && sess.summary_error) || '';
-    if (!summaries.length && !err) return;
-
-    // 移除已存在的旧面板（折叠面板位于 AI 消息后的兄弟节点）
-    const existing = lastAssistant.nextElementSibling;
-    if (existing && existing.classList && existing.classList.contains('summary-panel')) {
-        existing.remove();
-    }
-
-    const panel = document.createElement('div');
-    panel.className = 'summary-panel collapsed';
-    lastAssistant.parentNode.insertBefore(panel, lastAssistant.nextSibling);
-
-    const header = document.createElement('div');
-    header.className = 'summary-panel-header';
-    const toggle = document.createElement('span');
-    toggle.className = 'summary-toggle';
-    toggle.textContent = '▶';
-    header.appendChild(toggle);
-    const title = document.createElement('span');
-    title.style.cssText = 'flex:1;margin-left:8px;font-size:12px;color:var(--text-dim)';
-    title.textContent = err ? '📋 剧情记忆（⚠️ 本轮总结失败）' : '📋 剧情记忆（最近一段梗概）';
-    header.appendChild(title);
-    if (summaries.length) {
-        const newest = summaries[summaries.length - 1];
-        const index = summaries.length - 1;
-        const btnGroup = document.createElement('span');
-        btnGroup.style.cssText = 'display:flex;gap:4px';
-
-        const editBtn = document.createElement('button');
-        editBtn.className = 'summary-edit-btn';
-        editBtn.title = '编辑这段总结';
-        editBtn.textContent = '✏️';
-        editBtn.addEventListener('click', () => enterSummaryEditMode(panel, newest, index));
-        btnGroup.appendChild(editBtn);
-
-        const regenBtn = document.createElement('button');
-        regenBtn.className = 'summary-regen-btn';
-        regenBtn.title = '重新生成最新这段总结';
-        regenBtn.textContent = '🔄重生成';
-        regenBtn.addEventListener('click', () => regenerateLastSummary(panel, sess));
-        btnGroup.appendChild(regenBtn);
-
-        header.appendChild(btnGroup);
-    }
-    header.addEventListener('click', (e) => {
-        if (e.target.classList.contains('summary-regen-btn')) return;
-        if (e.target.classList.contains('summary-edit-btn')) return;
-        panel.classList.toggle('collapsed');
-        toggle.textContent = panel.classList.contains('collapsed') ? '▶' : '▼';
+    const result = renderSummaryPanelView({
+        document,
+        anchor: lastAssistant,
+        session: sess,
+        selectedId: state.selectedSummaryId,
+        expanded: state.summaryPanelExpanded,
+        disabled: state.navigationBusy || state.isStreaming || !canPerformAction(
+            'summary',
+            state.activeTurn && state.activeTurn.status,
+        ),
+        onSelect: summaryId => {
+            state.selectedSummaryId = summaryId;
+            state.summaryPanelExpanded = true;
+            renderSummaryPanel(lastAssistant, state.session);
+        },
+        onExpandedChange: expanded => { state.summaryPanelExpanded = expanded; },
+        onEdit: summary => showSummaryEditor(summary),
+        onRegenerate: summary => { void regenerateSummary(summary); },
+        onOpenSource: summary => {
+            if (summary.source_snapshot_id) {
+                void showSnapshotPreview(summary.source_snapshot_id, captureSessionRef());
+            }
+        },
     });
-    panel.appendChild(header);
-
-    const body = document.createElement('div');
-    body.className = 'summary-panel-body';
-    if (err) {
-        const errDiv = document.createElement('div');
-        errDiv.className = 'summary-error';
-        errDiv.textContent = '⚠️ ' + err;
-        body.appendChild(errDiv);
-    }
-    if (summaries.length) {
-        const newest = summaries[summaries.length - 1];
-        if (newest.failed || newest.error) {
-            // 失败占位段：明确提示该段总结生成失败、原文已落 trim 快照，不要拿占位文案当正文误导
-            const failDiv = document.createElement('div');
-            failDiv.className = 'summary-error';
-            failDiv.textContent = '⚠️ 该段总结生成失败，原文已存入trim快照（可点🔄重生成重试）';
-            body.appendChild(failDiv);
-            if (newest.created_at) {
-                const t = document.createElement('div');
-                t.style.cssText = 'margin-top:6px;font-size:11px;color:var(--text-dim)';
-                t.textContent = '生成于 ' + newest.created_at.slice(0, 16).replace('T', ' ');
-                body.appendChild(t);
-            }
-        } else {
-            const main = document.createElement('div');
-            main.style.cssText = 'margin-bottom:6px';
-            main.textContent = '前情提要：' + (newest.text || '（空）');
-            body.appendChild(main);
-            if (newest.time) body.appendChild(makeSummaryLine('🕐 时间线', newest.time));
-            if (newest.facts && newest.facts.length) {
-                const f = document.createElement('div'); f.style.cssText = 'margin-top:4px';
-                f.textContent = '关键事件：';
-                newest.facts.forEach(x => { const li = document.createElement('div'); li.style.cssText = 'padding-left:12px;color:var(--text-dim)'; li.textContent = '· ' + x; f.appendChild(li); });
-                body.appendChild(f);
-            }
-            if (newest.relations && newest.relations.length) {
-                const f = document.createElement('div'); f.style.cssText = 'margin-top:4px';
-                f.textContent = '角色关系：';
-                newest.relations.forEach(x => { const li = document.createElement('div'); li.style.cssText = 'padding-left:12px;color:var(--text-dim)'; li.textContent = '· ' + x; f.appendChild(li); });
-                body.appendChild(f);
-            }
-            if (newest.created_at) {
-                const t = document.createElement('div');
-                t.style.cssText = 'margin-top:6px;font-size:11px;color:var(--text-dim)';
-                t.textContent = '生成于 ' + newest.created_at.slice(0, 16).replace('T', ' ');
-                body.appendChild(t);
-            }
-        }
-    }
-    panel.appendChild(body);
-}
-
-function makeSummaryLine(label, val) {
-    const d = document.createElement('div');
-    d.style.cssText = 'margin-top:2px;color:var(--text-dim)';
-    d.textContent = label + '：' + val;
-    return d;
+    state.selectedSummaryId = result ? result.selectedId : null;
 }
 
 function escapeHtml(str) {
     return TavernSecurity.escapeHtml(str);
 }
 
-function enterSummaryEditMode(panel, summary, index) {
-    const body = panel.querySelector('.summary-panel-body');
-    if (!body) return;
-    panel.classList.remove('collapsed');
+function appendSummaryEditorField(form, summaryId, config) {
+    const row = document.createElement('div');
+    row.className = 'summary-edit-row';
+    const id = `summary-${summaryId}-${config.field}`;
+    const label = document.createElement('label');
+    label.className = 'summary-edit-label';
+    label.htmlFor = id;
+    label.textContent = config.label;
+    const input = document.createElement(config.multiline ? 'textarea' : 'input');
+    input.id = id;
+    input.className = 'summary-edit-input';
+    input.dataset.field = config.field;
+    input.value = config.value || '';
+    if (config.multiline) input.rows = config.rows || 3;
+    if (config.maxLength) input.maxLength = config.maxLength;
+    row.appendChild(label);
+    row.appendChild(input);
+    form.appendChild(row);
+}
 
-    body.innerHTML = `
-        <div style="margin-bottom:6px">
-            <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:2px">前情提要</label>
-            <textarea class="summary-edit-input" data-field="text" style="width:100%;min-height:50px">${escapeHtml(summary.text || '')}</textarea>
-        </div>
-        <div style="margin-bottom:6px">
-            <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:2px">时间线</label>
-            <input class="summary-edit-input" data-field="time" style="width:100%" value="${escapeHtml(summary.time || '')}" />
-        </div>
-        <div style="margin-bottom:6px">
-            <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:2px">关键事件（每行一条）</label>
-            <textarea class="summary-edit-input" data-field="facts" style="width:100%;min-height:40px">${escapeHtml((summary.facts || []).join('\n'))}</textarea>
-        </div>
-        <div style="margin-bottom:6px">
-            <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:2px">角色关系（每行一条）</label>
-            <textarea class="summary-edit-input" data-field="relations" style="width:100%;min-height:40px">${escapeHtml((summary.relations || []).join('\n'))}</textarea>
-        </div>
-        <div style="display:flex;gap:6px;margin-top:8px">
-            <button class="summary-save-btn">💾 保存</button>
-            <button class="summary-cancel-btn">取消</button>
-        </div>
-    `;
-
-    body.querySelector('.summary-save-btn').addEventListener('click', () => saveEdit(panel, index, body));
-    body.querySelector('.summary-cancel-btn').addEventListener('click', () => {
-        const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
-        if (lastAI && state.session) renderSummaryPanel(lastAI, state.session);
+function showSummaryEditor(summary) {
+    if (!summary || !summary.id) return;
+    if (!canPerformAction('summary', state.activeTurn && state.activeTurn.status)) {
+        showToast('当前对话正在生成，摘要暂不可编辑');
+        return;
+    }
+    state.selectedSummaryId = summary.id;
+    const form = document.createElement('div');
+    form.className = 'summary-edit-form';
+    const safeId = summary.id.replace(/[^a-zA-Z0-9_-]/g, '');
+    appendSummaryEditorField(form, safeId, {
+        field: 'text', label: '前情提要（必填，最多 2000 字）',
+        value: summary.text || '', multiline: true, rows: 5, maxLength: 2000,
+    });
+    appendSummaryEditorField(form, safeId, {
+        field: 'time', label: '时间线（最多 300 字）',
+        value: summary.time || '', multiline: false, maxLength: 300,
+    });
+    appendSummaryEditorField(form, safeId, {
+        field: 'facts', label: '关键事件（每行一条，最多 5 条）',
+        value: (summary.facts || []).join('\n'), multiline: true, rows: 4,
+    });
+    appendSummaryEditorField(form, safeId, {
+        field: 'relations', label: '角色关系（每行一条，最多 5 条）',
+        value: (summary.relations || []).join('\n'), multiline: true, rows: 4,
+    });
+    showModal({
+        title: '编辑剧情记忆',
+        body: form,
+        footer: {
+            confirmText: '保存',
+            pendingText: '保存中…',
+            cancelText: '取消',
+            onConfirm: async () => {
+                const ref = captureSessionRef();
+                await summaryService.update(ref, summary.id, summaryPatchFromForm(form));
+                return true;
+            },
+        },
     });
 }
 
-async function saveEdit(panel, index, body) {
+function cancelSummaryWatchers() {
+    for (const watcher of summaryWatchers.values()) watcher.cancelled = true;
+    summaryWatchers.clear();
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function watchSummaryGeneration(ref, summaryId, generationId) {
+    const previous = summaryWatchers.get(summaryId);
+    if (previous) previous.cancelled = true;
+    const watcher = { cancelled: false };
+    summaryWatchers.set(summaryId, watcher);
+    const deadline = Date.now() + 180000;
     try {
-        await summaryService.update(captureSessionRef(), index, summaryPatchFromForm(body));
-        await reloadCurrentSession();
-        const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
-        if (lastAI) renderSummaryPanel(lastAI, state.session);
-    } catch (e) {
-        alert('保存失败: ' + e.message);
+        while (!watcher.cancelled && isCurrentSessionRef(ref)) {
+            await delay(400);
+            if (watcher.cancelled || !isCurrentSessionRef(ref)) return;
+            const fresh = await fetchSession(ref);
+            if (watcher.cancelled || !isCurrentSessionRef(ref)) return;
+            commitSummaryRefresh(fresh, ref);
+            const summary = (fresh.summaries || []).find(item => item.id === summaryId);
+            if (!summary || summary.generation_id !== generationId) return;
+            if (summary.status !== 'pending' || summary.generation_active === false) return;
+            if (Date.now() >= deadline) {
+                showToast('摘要仍在后台生成，可稍后查看状态', 3500);
+                return;
+            }
+        }
+    } catch (error) {
+        if (!watcher.cancelled && isCurrentSessionRef(ref)) {
+            showToast(`刷新摘要状态失败：${errorDetail(error)}`, 3500);
+        }
+    } finally {
+        if (summaryWatchers.get(summaryId) === watcher) summaryWatchers.delete(summaryId);
     }
 }
 
-async function regenerateLastSummary(panel, sess) {
-    if (!confirm('重新生成最新这段剧情总结？（会调一次本地模型）')) return;
-    const btn = panel.querySelector('.summary-regen-btn');
-    if (btn) btn.disabled = true;
+function watchPendingSummaries(ref, session) {
+    for (const summary of (session && session.summaries) || []) {
+        if (
+            !summary
+            || summary.status !== 'pending'
+            || typeof summary.id !== 'string'
+            || typeof summary.generation_id !== 'string'
+            || summary.generation_active === false
+            || summaryWatchers.has(summary.id)
+        ) continue;
+        void watchSummaryGeneration(ref, summary.id, summary.generation_id);
+    }
+}
+
+async function regenerateSummary(summary) {
+    if (!summary || !summary.id) return;
+    if (!canPerformAction('summary', state.activeTurn && state.activeTurn.status)) {
+        showToast('当前对话正在生成，摘要暂不可重生成');
+        return;
+    }
+    const action = summary.status === 'failed'
+        || (summary.status === 'pending' && summary.generation_active === false)
+        ? '重试生成'
+        : '重新生成';
+    if (!confirm(`${action}第 ${((state.session.summaries || []).findIndex(item => item.id === summary.id) + 1)} 段剧情记忆？这会调用一次本地模型。`)) return;
+    const ref = captureSessionRef();
+    state.selectedSummaryId = summary.id;
     try {
-        const res = await summaryService.regenerate(captureSessionRef());
-        if (res.error) { alert('重新生成失败: ' + res.error); if (btn) btn.disabled = false; return; }
-        // sessionWrite 已原子提交并重绘完整 Session。
-        const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
-        if (lastAI) renderSummaryPanel(lastAI, state.session);
-    } catch (e) {
-        alert('请求失败: ' + e.message);
-        if (btn) btn.disabled = false;
+        const accepted = await summaryService.regenerate(ref, summary.id);
+        if (accepted && accepted.generation_id && !summaryWatchers.has(summary.id)) {
+            void watchSummaryGeneration(ref, summary.id, accepted.generation_id);
+        }
+    } catch (error) {
+        showToast(`${action}失败：${errorDetail(error)}`, 3500);
     }
 }
 
@@ -1245,13 +1272,15 @@ function setTurnUiState(active, cancelling = false) {
         '#project-btn', '#tab-saves', '#model-select', '#reset-btn',
         '#save-new-inline', '#save-rename-inline', '#save-delete-inline',
         '#save-import-inline', '#history-btn',
-        '.msg-action-btn', '.msg-checkbox', '.summary-save-btn', '.summary-regen-btn',
+        '.msg-action-btn', '.msg-checkbox',
         '.history-restore', '.ce-save', '.ce-delete',
     ];
     document.querySelectorAll(selectors.join(',')).forEach(element => {
         if ('disabled' in element) element.disabled = active;
         element.setAttribute('aria-disabled', String(active));
     });
+    const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
+    if (lastAI && state.session) renderSummaryPanel(lastAI, state.session);
 }
 
 function makeProvisionalTurn(ref) {
@@ -2236,53 +2265,153 @@ async function showPromptsEditor() {
     try {
         const data = await promptService.load();
         const body = document.createElement('div');
-        body.innerHTML = `
-            <div class="modal-tabs">
-                <button class="modal-tab active" data-tab="system">系统提示</button>
-                <button class="modal-tab" data-tab="group_chat">群聊模板</button>
-            </div>
-            <div class="form-row"><textarea id="prompt-textarea" rows="18">${escapeHtml(data.system || '')}</textarea></div>
-            <div class="form-actions">
-                <button class="modal-btn" id="prompt-save">保存</button>
-                <button class="modal-btn" id="prompt-reset">恢复默认</button>
-                <span style="color:var(--text-dim);font-size:11px;margin-left:auto" id="prompt-status"></span>
-            </div>`;
+        const drafts = {
+            system: data.system || '',
+            group_chat: data.group_chat || '',
+            summary: data.summary || '',
+        };
+        const tabConfig = [
+            ['system', '系统提示'],
+            ['group_chat', '群聊模板'],
+            ['summary', '摘要模板'],
+        ];
+        const tabsContainer = document.createElement('div');
+        tabsContainer.className = 'modal-tabs';
+        tabsContainer.setAttribute('role', 'tablist');
+        tabsContainer.setAttribute('aria-label', '提示词类型');
+        const editorRow = document.createElement('div');
+        editorRow.className = 'form-row prompt-editor-row';
+        const editorLabel = document.createElement('label');
+        editorLabel.htmlFor = 'prompt-textarea';
+        editorLabel.className = 'sr-only';
+        editorLabel.textContent = '提示词内容';
+        const textarea = document.createElement('textarea');
+        textarea.id = 'prompt-textarea';
+        textarea.rows = 18;
+        textarea.value = drafts.system;
+        editorRow.appendChild(editorLabel);
+        editorRow.appendChild(textarea);
+        const editorPanel = document.createElement('div');
+        editorPanel.id = 'prompt-editor-panel';
+        editorPanel.setAttribute('role', 'tabpanel');
+        editorPanel.setAttribute('aria-labelledby', 'prompt-tab-system');
+        editorPanel.appendChild(editorRow);
+
+        const actions = document.createElement('div');
+        actions.className = 'form-actions prompt-editor-actions';
+        const saveButton = document.createElement('button');
+        saveButton.type = 'button';
+        saveButton.className = 'modal-btn';
+        saveButton.id = 'prompt-save';
+        saveButton.textContent = '保存';
+        const resetButton = document.createElement('button');
+        resetButton.type = 'button';
+        resetButton.className = 'modal-btn';
+        resetButton.id = 'prompt-reset';
+        resetButton.textContent = '恢复默认';
+        const statusEl = document.createElement('span');
+        statusEl.id = 'prompt-status';
+        statusEl.className = 'prompt-status';
+        statusEl.setAttribute('role', 'status');
+        statusEl.setAttribute('aria-live', 'polite');
+        actions.appendChild(saveButton);
+        actions.appendChild(resetButton);
+        actions.appendChild(statusEl);
+        body.appendChild(tabsContainer);
+        body.appendChild(editorPanel);
+        body.appendChild(actions);
         showModal({ title: '编辑提示词', body });
 
-        const tabs = body.querySelectorAll('.modal-tab');
-        const textarea = body.querySelector('#prompt-textarea');
         let currentTab = 'system';
+        let pending = false;
+        const tabs = [];
 
-        tabs.forEach(tab => {
-            tab.addEventListener('click', () => {
-                tabs.forEach(t => t.classList.remove('active'));
-                tab.classList.add('active');
-                currentTab = tab.dataset.tab;
-                textarea.value = data[currentTab] || '';
+        function setPromptPending(value) {
+            pending = Boolean(value);
+            modalController.setPending(pending);
+            textarea.disabled = pending;
+            saveButton.disabled = pending;
+            resetButton.disabled = pending;
+            tabs.forEach(tab => { tab.disabled = pending; });
+        }
+
+        function activateTab(name) {
+            if (pending || name === currentTab) return;
+            drafts[currentTab] = textarea.value;
+            currentTab = name;
+            textarea.value = drafts[currentTab];
+            editorPanel.setAttribute('aria-labelledby', `prompt-tab-${currentTab}`);
+            tabs.forEach(tab => {
+                const active = tab.dataset.tab === currentTab;
+                tab.classList.toggle('active', active);
+                tab.setAttribute('aria-selected', String(active));
+                tab.tabIndex = active ? 0 : -1;
             });
+        }
+
+        tabConfig.forEach(([name, label], index) => {
+            const tab = document.createElement('button');
+            tab.type = 'button';
+            tab.id = `prompt-tab-${name}`;
+            tab.className = `modal-tab${index === 0 ? ' active' : ''}`;
+            tab.dataset.tab = name;
+            tab.textContent = label;
+            tab.setAttribute('role', 'tab');
+            tab.setAttribute('aria-selected', String(index === 0));
+            tab.setAttribute('aria-controls', 'prompt-editor-panel');
+            tab.tabIndex = index === 0 ? 0 : -1;
+            tab.addEventListener('click', () => activateTab(name));
+            tab.addEventListener('keydown', event => {
+                if (pending) return;
+                const currentIndex = tabs.indexOf(tab);
+                const targetIndex = promptTabTargetIndex(
+                    event.key,
+                    currentIndex,
+                    tabConfig.length,
+                );
+                if (targetIndex === null) return;
+                event.preventDefault();
+                const target = tabs[targetIndex];
+                if (!target) return;
+                activateTab(target.dataset.tab);
+                target.focus();
+            });
+            tabs.push(tab);
+            tabsContainer.appendChild(tab);
         });
 
-        body.querySelector('#prompt-save').addEventListener('click', async () => {
-            const statusEl = body.querySelector('#prompt-status');
+        saveButton.addEventListener('click', async () => {
+            if (pending) return;
+            drafts[currentTab] = textarea.value;
             statusEl.textContent = '保存中…';
+            setPromptPending(true);
             try {
-                await promptService.save(currentTab, textarea.value);
+                await promptService.save(currentTab, drafts[currentTab]);
                 statusEl.textContent = '✓ 已保存，下次对话生效';
                 setTimeout(() => { statusEl.textContent = ''; }, 3000);
             } catch (error) {
                 statusEl.textContent = '✗ ' + errorDetail(error);
+            } finally {
+                setPromptPending(false);
+                textarea.focus();
             }
         });
 
-        body.querySelector('#prompt-reset').addEventListener('click', async () => {
+        resetButton.addEventListener('click', async () => {
+            if (pending) return;
             if (!confirm('恢复为默认提示词？当前编辑内容会丢失。')) return;
+            statusEl.textContent = '恢复中…';
+            setPromptPending(true);
             try {
                 const fresh = await promptService.reset(currentTab);
-                data[currentTab] = fresh[currentTab]; textarea.value = fresh[currentTab] || '';
-                const statusEl = body.querySelector('#prompt-status');
+                drafts[currentTab] = fresh[currentTab] || '';
+                textarea.value = drafts[currentTab];
                 statusEl.textContent = '✓ 已恢复默认'; setTimeout(() => { statusEl.textContent = ''; }, 3000);
             } catch (error) {
-                body.querySelector('#prompt-status').textContent = '✗ ' + errorDetail(error);
+                statusEl.textContent = '✗ ' + errorDetail(error);
+            } finally {
+                setPromptPending(false);
+                textarea.focus();
             }
         });
     } catch (error) {

@@ -24,6 +24,10 @@ from core.prompt_assembler import (
     PromptTemplateInvalid,
 )
 from core.response_parser import parse_response, check_voice_confusion
+from core.summary_lifecycle import (
+    schedule_summary_generation,
+    shutdown_summary_tasks,
+)
 from core.session_manager import (
     RevisionConflict,
     aload_session,
@@ -46,17 +50,11 @@ from routes.common import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-_summary_tasks: set[asyncio.Task] = set()
 _prompt_assembler = PromptAssembler()
 
 
 async def shutdown_chat_background_tasks() -> None:
-    tasks = [task for task in _summary_tasks if not task.done()]
-    for task in tasks:
-        task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    _summary_tasks.clear()
+    await shutdown_summary_tasks()
 
 
 def _validated_parameters(req: ChatRequest | RegenerateRequest) -> dict:
@@ -245,6 +243,8 @@ def _finalize_turn_messages(
     thinking: str,
     status: str,
     error: dict | None,
+    *,
+    trim: bool = True,
 ) -> tuple[dict, dict | None, list[dict]]:
     user_message = next(
         (
@@ -282,7 +282,11 @@ def _finalize_turn_messages(
                 created_at=created_at,
             ),
         )
-    dropped = trim_history(session, max_messages=MAX_MESSAGES_IN_SAVE)
+    dropped = (
+        trim_history(session, max_messages=MAX_MESSAGES_IN_SAVE)
+        if trim
+        else []
+    )
     return user_message, assistant_message, dropped
 
 
@@ -331,7 +335,7 @@ async def _commit_partial(
     error: dict,
 ) -> dict | None:
     session = deepcopy(prepared["session"])
-    _user, _assistant, dropped = _finalize_turn_messages(
+    _user, _assistant, _dropped = _finalize_turn_messages(
         session,
         prepared,
         turn_id,
@@ -339,13 +343,13 @@ async def _commit_partial(
         thinking,
         status,
         error,
+        trim=False,
     )
 
     def commit_partial(current: dict, context) -> None:
+        del context
         current.clear()
         current.update(deepcopy(session))
-        if dropped:
-            context.snapshot("trim", trim_snapshot_payload(dropped))
 
     mutation = await mutate_session(
         prepared["project"],
@@ -471,6 +475,7 @@ async def _commit_completed(
 
     session["current_model"] = prepared["model"]
     summary_id = str(uuid4()) if dropped else None
+    summary_generation_id = str(uuid4()) if dropped else None
 
     def commit_chat(current: dict, context) -> str | None:
         current.clear()
@@ -478,17 +483,22 @@ async def _commit_completed(
         if dropped:
             snapshot_path = context.snapshot(
                 "trim",
-                trim_snapshot_payload(dropped),
+                trim_snapshot_payload(dropped, summary_id=summary_id),
             )
             current.setdefault("summaries", []).append({
                 "id": summary_id,
                 "source_snapshot_id": snapshot_path.name,
+                "source_status": "available",
                 "status": "pending",
+                "content_status": "empty",
+                "generation_id": summary_generation_id,
+                "generation_attempt": 1,
                 "text": "",
                 "time": "",
                 "facts": [],
                 "relations": [],
                 "created_at": datetime.now().astimezone().isoformat(),
+                "requested_at": datetime.now().astimezone().isoformat(),
                 "error": None,
             })
             return snapshot_path.name
@@ -510,118 +520,14 @@ async def _commit_completed(
         "completed",
         session_revision=mutation.session["revision"],
     )
-    if dropped and summary_id:
-        task = asyncio.create_task(
-            _generate_summary_task(
-                prepared["project"],
-                prepared["save"],
-                prepared["model"],
-                summary_id,
-                dropped,
-            ),
-            name=f"summary-{summary_id}",
-        )
-        _summary_tasks.add(task)
-        task.add_done_callback(_summary_tasks.discard)
-
-
-async def _mutate_summary_by_id(
-    project: str,
-    save: str,
-    summary_id: str,
-    replacement: dict,
-    *,
-    error_text: str,
-) -> bool:
-    from core.active_turns import ActiveTurnConflict
-
-    for _attempt in range(3):
-        session = await aload_session(project, save)
-        target = next(
-            (
-                candidate
-                for candidate in session.get("summaries", [])
-                if candidate.get("id") == summary_id
-            ),
-            None,
-        )
-        if target is None or target.get("status") != "pending":
-            return True
-
-        def replace_summary(current: dict, context) -> None:
-            del context
-            item = next(
-                (
-                    candidate
-                    for candidate in current.setdefault("summaries", [])
-                    if candidate.get("id") == summary_id
-                ),
-                None,
-            )
-            if item is None or item.get("status") != "pending":
-                return
-            item.update(deepcopy(replacement))
-            current["summary_error"] = error_text
-
-        try:
-            await mutate_session(
-                project,
-                save,
-                session.get("revision", 0),
-                replace_summary,
-            )
-            return True
-        except RevisionConflict:
-            continue
-        except ActiveTurnConflict:
-            return False
-    return False
-
-
-async def _generate_summary_task(
-    project: str,
-    save: str,
-    model: str,
-    summary_id: str,
-    dropped: list[dict],
-) -> None:
-    try:
-        raw = await get_client().summarize_once(model, dropped)
-        from core.summary_parser import parse_summary
-
-        parsed_summary = parse_summary(raw)
-        updated = {
-            "status": "completed",
-            "text": parsed_summary["text"],
-            "time": parsed_summary["time"],
-            "facts": parsed_summary["facts"],
-            "relations": parsed_summary["relations"],
-            "completed_at": datetime.now().astimezone().isoformat(),
-            "error": None,
-        }
-        applied = await _mutate_summary_by_id(
-            project,
-            save,
+    if dropped and summary_id and summary_generation_id:
+        schedule_summary_generation(
+            prepared["project"],
+            prepared["save"],
+            prepared["model"],
             summary_id,
-            updated,
-            error_text="",
-        )
-        if not applied:
-            logger.info("总结 %s 保持 pending，等待无 active turn 时重试", summary_id)
-    except Exception as exc:
-        logger.warning("短期总结失败，不影响基础对话: %s", exc)
-        failed = {
-            "status": "failed",
-            "failed": True,
-            "completed_at": datetime.now().astimezone().isoformat(),
-            "error": str(exc),
-        }
-        await _mutate_summary_by_id(
-            project,
-            save,
-            summary_id,
-            failed,
-            error_text=f"总结生成失败: {exc}",
+            summary_generation_id,
+            dropped,
         )
 
 

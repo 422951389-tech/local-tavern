@@ -695,17 +695,17 @@ test('摘要与 Prompt 服务精确代理 sessionWrite 和 ApiClient', async () 
         return Promise.resolve({ revision: 8 });
     }, { summary: '/api/summary', summaryRegen: '/api/summary/regenerate' });
     const ref = { project: '项目 A', save: '存档 A', epoch: 2 };
-    await summary.update(ref, 4, patch);
-    await summary.regenerate(ref, 4);
-    await summary.regenerate(ref);
+    const summaryId = '797f1fe4-0e9a-4b95-b7ff-e729df22e4aa';
+    await summary.update(ref, summaryId, patch);
+    await summary.regenerate(ref, summaryId);
+    assert.throws(() => summary.regenerate(ref), /稳定 summary_id/);
     assert.deepEqual(writes, [
-        ['/api/summary', 'PATCH', { project: '项目 A', save: '存档 A', index: 4, ...patch }, '编辑摘要'],
-        ['/api/summary/regenerate', 'POST', { project: '项目 A', save: '存档 A', summary_index: 4 }, '重生成摘要'],
-        ['/api/summary/regenerate', 'POST', { project: '项目 A', save: '存档 A' }, '重生成摘要'],
+        ['/api/summary', 'PATCH', { project: '项目 A', save: '存档 A', summary_id: summaryId, ...patch }, '编辑摘要'],
+        ['/api/summary/regenerate', 'POST', { project: '项目 A', save: '存档 A', summary_id: summaryId }, '重生成摘要'],
     ]);
 
     const calls = [];
-    const promptBody = { system: 'system text', group_chat: 'group text' };
+    const promptBody = { system: 'system text', group_chat: 'group text', summary: 'summary text' };
     const promptClient = {
         async get(path, options) {
             calls.push(['GET', path]);
@@ -727,12 +727,12 @@ test('摘要与 Prompt 服务精确代理 sessionWrite 和 ApiClient', async () 
         promptReset: name => `/api/prompts/${name}/reset`,
     });
     assert.strictEqual(await prompts.load(), promptBody);
-    await prompts.save('system', 'new text');
-    assert.strictEqual(await prompts.reset('system'), promptBody);
+    await prompts.save('summary', 'new summary text');
+    assert.strictEqual(await prompts.reset('summary'), promptBody);
     assert.deepEqual(calls, [
         ['GET', '/api/prompts'],
-        ['PUT', '/api/prompts/system', { content: 'new text' }],
-        ['POST', '/api/prompts/system/reset'],
+        ['PUT', '/api/prompts/summary', { content: 'new summary text' }],
+        ['POST', '/api/prompts/summary/reset'],
         ['GET', '/api/prompts'],
     ]);
 });

@@ -15,9 +15,14 @@ from pydantic import (
     StrictStr,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
-from core.path_policy import PathPolicyError, validate_file_id
+from core.path_policy import (
+    PathPolicyError,
+    validate_file_id,
+    validate_snapshot_filename,
+)
 
 
 MAX_IMPORT_BYTES = 8 * 1024 * 1024
@@ -29,6 +34,9 @@ MAX_SUMMARIES = 2_000
 
 ShortText = Annotated[StrictStr, Field(max_length=MAX_SHORT_TEXT)]
 MessageText = Annotated[StrictStr, Field(max_length=MAX_MESSAGE_TEXT)]
+SummaryText = Annotated[StrictStr, Field(max_length=2_000)]
+SummaryTime = Annotated[StrictStr, Field(max_length=300)]
+SummaryItem = Annotated[StrictStr, Field(min_length=1, max_length=200)]
 Affinity = Annotated[StrictInt | StrictFloat, Field(ge=0, le=100)]
 Revision = Annotated[StrictInt, Field(ge=0)]
 
@@ -83,12 +91,28 @@ class ImportedCharacterState(ImportModel):
 
 
 class ImportedSummary(ImportModel):
-    text: MessageText = ""
-    time: ShortText = ""
-    facts: list[MessageText] = Field(default_factory=list, max_length=1_000)
-    relations: list[MessageText] = Field(default_factory=list, max_length=1_000)
+    id: StrictStr = ""
+    source_snapshot_id: StrictStr | None = None
+    status: Literal["pending", "completed", "failed"] = "completed"
+    generation_id: StrictStr | None = None
+    generation_attempt: Annotated[StrictInt, Field(ge=0)] = 0
+    text: SummaryText = ""
+    time: SummaryTime = ""
+    facts: list[SummaryItem] = Field(default_factory=list, max_length=5)
+    relations: list[SummaryItem] = Field(default_factory=list, max_length=5)
     created_at: ShortText = ""
     failed: StrictBool = False
+    error: ShortText | None = None
+
+    @field_validator("id", "generation_id")
+    @classmethod
+    def validate_optional_uuid(cls, value: str | None) -> str | None:
+        if not value:
+            return value
+        try:
+            return str(UUID(value))
+        except ValueError as exc:
+            raise ValueError("摘要 id 与 generation_id 必须是 UUID") from exc
 
 
 class ImportedSession(ImportModel):
@@ -135,6 +159,32 @@ class ImportedSession(ImportModel):
             except PathPolicyError as exc:
                 raise ValueError(str(exc)) from exc
         return value
+
+    @model_validator(mode="after")
+    def validate_summary_identity(self) -> "ImportedSession":
+        seen_ids: set[str] = set()
+        seen_sources: set[str] = set()
+        for summary in self.summaries:
+            if summary.id:
+                if summary.id in seen_ids:
+                    raise ValueError("摘要 id 不能重复")
+                seen_ids.add(summary.id)
+            source = summary.source_snapshot_id
+            if not source:
+                continue
+            try:
+                _filename, kind = validate_snapshot_filename(
+                    self.session_id,
+                    source,
+                )
+            except PathPolicyError as exc:
+                raise ValueError(f"摘要 source_snapshot_id 无效: {exc}") from exc
+            if kind != "trim":
+                raise ValueError("摘要 source_snapshot_id 必须指向 trim 快照")
+            if source in seen_sources:
+                raise ValueError("多个摘要不能绑定同一个 trim 快照")
+            seen_sources.add(source)
+        return self
 
 
 def validate_import_json(json_str: object) -> dict:

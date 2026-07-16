@@ -118,6 +118,41 @@ async def test_chat_eof_without_done_preserves_partial_as_failed(
 
 
 @pytest.mark.asyncio
+async def test_failed_long_turn_keeps_history_without_orphan_trim(
+    app_client, fake_ollama, seed_project
+):
+    project = seed_project("qa_failed_long_no_trim")
+    initial = new_session(project, "失败长对话")
+    initial["current_model"] = "fake-model:latest"
+    for index in range(40):
+        append_history(
+            initial,
+            "user" if index % 2 == 0 else "assistant",
+            f"历史-{index}",
+        )
+    created = await get_session_store().create(project, "失败长对话", initial)
+    fake_ollama.configure("error")
+
+    response = await app_client.post("/api/chat", json={
+        "project": project,
+        "save": "失败长对话",
+        "user_input": "这轮失败但不丢历史",
+        "model": "fake-model:latest",
+        "expected_revision": created["revision"],
+    })
+
+    assert response.status_code == 200
+    session = get_session_store().read_sync(project, "失败长对话")
+    assert len(session["message_history"]) == 41
+    assert session["message_history"][-1]["status"] == "failed"
+    assert session["summaries"] == []
+    history_dir = get_session_store().history_dir(project)
+    assert not history_dir.exists() or list(
+        history_dir.glob("失败长对话.trim.*.json")
+    ) == []
+
+
+@pytest.mark.asyncio
 async def test_active_turn_blocks_model_switch_and_completes_without_overwrite(
     app_client, fake_ollama, seed_project
 ):

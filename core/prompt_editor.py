@@ -13,7 +13,7 @@ from core.session_store import atomic_write
 
 DEFAULT_DIR = PROMPTS_DIR / ".default"
 
-VALID_NAMES = ("system", "group_chat")
+VALID_NAMES = ("system", "group_chat", "summary")
 _PROMPT_WRITE_LOCK = threading.RLock()
 
 

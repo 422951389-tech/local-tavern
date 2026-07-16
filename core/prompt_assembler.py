@@ -38,7 +38,7 @@ _SUMMARY_FIELDS = (
     "id",
     "created_at",
     "text",
-    "timeline",
+    "time",
     "facts",
     "relations",
     "status",
@@ -213,6 +213,8 @@ class PromptAssembler:
         seen: set[str] = set()
         for index, summary in enumerate(summaries or []):
             if not isinstance(summary, dict) or not summary.get("text"):
+                continue
+            if summary.get("content_status") == "empty":
                 continue
             summary_id = _source_id(summary.get("id"), f"summary-{index + 1}")
             if summary_id in seen:

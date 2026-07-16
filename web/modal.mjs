@@ -137,7 +137,15 @@ export function createModalController(elements, options = {}) {
         }
     }
 
-    return Object.freeze({ bind, show, hide, confirm, setError, isPending: () => pending });
+    return Object.freeze({
+        bind,
+        show,
+        hide,
+        confirm,
+        setError,
+        setPending,
+        isPending: () => pending,
+    });
 }
 
 export function modalElementsFromDocument(documentRef = globalThis.document) {

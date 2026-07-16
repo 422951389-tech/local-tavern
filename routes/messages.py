@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from datetime import datetime
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -19,6 +20,14 @@ from core.session_manager import (
     snapshot_session,
     toggle_pinned,
 )
+from core.summary_lifecycle import (
+    SummaryValidationError,
+    annotate_summary_task_state,
+    is_summary_generation_active,
+    recompute_summary_error,
+    schedule_summary_generation,
+    validated_summary_patch,
+)
 from routes.common import (
     MessageAction,
     _expected_revision,
@@ -29,6 +38,61 @@ from routes.common import (
 
 
 router = APIRouter()
+
+
+def _required_summary_id(body: dict) -> str:
+    value = body.get("summary_id")
+    if not isinstance(value, str) or not value:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "summary_id_required",
+                "message": "摘要命令必须提供稳定 summary_id",
+            },
+        )
+    try:
+        return str(UUID(value))
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "summary_id_invalid",
+                "message": "summary_id 必须是 UUID",
+            },
+        ) from exc
+
+
+def _require_summary_request_body(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "summary_request_invalid",
+                "message": "摘要请求体必须是 JSON 对象",
+            },
+        )
+    return value
+
+
+def _find_summary(session: dict, summary_id: str) -> dict:
+    target = next(
+        (
+            item
+            for item in session.get("summaries", [])
+            if item.get("id") == summary_id
+        ),
+        None,
+    )
+    if target is None:
+        raise HTTPException(
+            404,
+            detail={
+                "code": "summary_not_found",
+                "message": "指定摘要不存在",
+                "summary_id": summary_id,
+            },
+        )
+    return target
 
 
 def _validate_snapshot_owner(
@@ -61,7 +125,10 @@ async def api_get_session(
     project: str = Query("默认项目"),
     save: str = Query("默认存档"),
 ):
-    return await aload_session(_norm_project(project), _norm_save(save))
+    project = _norm_project(project)
+    save = _norm_save(save)
+    session = await aload_session(project, save)
+    return annotate_summary_task_state(session, project, save)
 
 
 @router.patch("/api/session")
@@ -291,29 +358,126 @@ async def api_restore_snapshot(req: Request):
         _raise_revision_conflict(exc)
 
 
-@router.post("/api/session/summary/regenerate")
+@router.post("/api/session/summary/regenerate", status_code=202)
 async def api_regenerate_summary(req: Request):
-    body = await req.json()
+    body = _require_summary_request_body(await req.json())
     project = _norm_project(body.get("project", "默认项目"))
     save = _norm_save(body.get("save", "默认存档"))
     expected_revision = _expected_revision(body)
+    summary_id = _required_summary_id(body)
     session = await aload_session(project, save)
     _precheck_revision(session, expected_revision)
-    if not session.get("summaries"):
-        raise HTTPException(400, "尚无已生成的总结可重生成（summaries 为空）")
+    target = _find_summary(session, summary_id)
+    current_generation_id = target.get("generation_id")
+    if target.get("status") == "pending" and is_summary_generation_active(
+        project,
+        save,
+        summary_id,
+        current_generation_id if isinstance(current_generation_id, str) else None,
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "code": "summary_generation_pending",
+                "message": "该摘要正在生成，请等待当前任务完成",
+                "summary_id": summary_id,
+            },
+        )
 
-    history_dir = _saves_dir(project) / ".history"
-    trim_files = (
-        sorted(history_dir.glob(f"{save}.trim.*.json"), reverse=True)
-        if history_dir.exists()
-        else []
-    )
-    if not trim_files:
-        raise HTTPException(404, "无可用的 trim 快照，无法重生成总结")
-    snapshot = json.loads(trim_files[0].read_text(encoding="utf-8"))
+    source_snapshot_id = target.get("source_snapshot_id")
+    if not isinstance(source_snapshot_id, str) or not source_snapshot_id:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "summary_source_unlinked",
+                "message": "该摘要没有绑定原文 trim 快照，不能重生成",
+                "summary_id": summary_id,
+            },
+        )
+    if sum(
+        1
+        for item in session.get("summaries", [])
+        if item.get("source_snapshot_id") == source_snapshot_id
+    ) != 1:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "summary_source_ambiguous",
+                "message": "多个摘要绑定了同一原文 trim 快照",
+                "summary_id": summary_id,
+            },
+        )
+    try:
+        snapshot_path, snapshot_type = resolve_snapshot_path(
+            project,
+            save,
+            source_snapshot_id,
+            allowed_types=("trim",),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "summary_source_invalid",
+                "message": "摘要绑定的原文快照标识无效",
+                "summary_id": summary_id,
+            },
+        ) from exc
+    if not snapshot_path.is_file():
+        raise HTTPException(
+            409,
+            detail={
+                "code": "summary_source_missing",
+                "message": "摘要绑定的原文 trim 快照已缺失",
+                "summary_id": summary_id,
+                "source_snapshot_id": source_snapshot_id,
+            },
+        )
+    try:
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "summary_source_corrupt",
+                "message": "摘要绑定的原文 trim 快照无法读取",
+                "summary_id": summary_id,
+            },
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise HTTPException(
+            422,
+            detail={
+                "code": "summary_source_corrupt",
+                "message": "摘要绑定的原文 trim 快照格式无效",
+                "summary_id": summary_id,
+            },
+        )
+    _validate_snapshot_owner(snapshot, project, save, snapshot_type)
+    snapshot_summary_id = snapshot.get("summary_id")
+    if snapshot_summary_id != summary_id:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "summary_source_mismatch",
+                "message": "原文 trim 快照绑定了其他摘要",
+                "summary_id": summary_id,
+            },
+        )
     dropped = snapshot.get("dropped_messages", [])
-    if not dropped:
-        raise HTTPException(400, "trim 快照中无被截消息，无法重生成总结")
+    if (
+        not isinstance(dropped, list)
+        or not dropped
+        or any(not isinstance(item, dict) for item in dropped)
+    ):
+        raise HTTPException(
+            422,
+            detail={
+                "code": "summary_source_empty",
+                "message": "摘要绑定的 trim 快照没有有效被截消息",
+                "summary_id": summary_id,
+            },
+        )
 
     model = session.get("current_model", "")
     if not model:
@@ -322,81 +486,77 @@ async def api_regenerate_summary(req: Request):
     if not model:
         raise HTTPException(400, "存档未指定模型，无法重生成总结")
 
-    try:
-        raw = await get_client().summarize_once(model, dropped)
-        from core.summary_parser import parse_summary
+    generation_id = str(uuid4())
+    requested_at = datetime.now().astimezone().isoformat()
 
-        parsed = parse_summary(raw)
-    except Exception as exc:
-        error_text = str(exc)
-
-        def record_error(current: dict, context) -> None:
-            current["summary_error"] = f"重生成总结失败: {error_text}"
-
-        try:
-            failed = await mutate_session(
-                project,
-                save,
-                expected_revision,
-                record_error,
-            )
-        except RevisionConflict as conflict:
-            _raise_revision_conflict(conflict)
-        return {"error": error_text, "session": failed.session}
-
-    new_item = {
-        "text": parsed["text"],
-        "time": parsed["time"],
-        "facts": parsed["facts"],
-        "relations": parsed["relations"],
-        "created_at": datetime.now().isoformat(),
-    }
-
-    def replace_summary(current: dict, context) -> None:
-        summaries = current.setdefault("summaries", [])
-        if not summaries:
-            raise HTTPException(409, "总结已被其他操作移除")
-        summaries[-1] = deepcopy(new_item)
-        current["summary_error"] = ""
+    def mark_pending(current: dict, context) -> dict:
+        del context
+        item = _find_summary(current, summary_id)
+        attempt = item.get("generation_attempt", 0)
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+            attempt = 0
+        item.update({
+            "status": "pending",
+            "generation_id": generation_id,
+            "generation_attempt": attempt + 1,
+            "requested_at": requested_at,
+            "source_status": "available",
+            "error": None,
+        })
+        item.pop("failed", None)
+        recompute_summary_error(current)
+        return deepcopy(item)
 
     try:
         mutation = await mutate_session(
             project,
             save,
             expected_revision,
-            replace_summary,
+            mark_pending,
         )
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
-    return {"ok": True, "session": mutation.session}
+    schedule_summary_generation(
+        project,
+        save,
+        model,
+        summary_id,
+        generation_id,
+        dropped,
+    )
+    public_session = annotate_summary_task_state(
+        mutation.session,
+        project,
+        save,
+    )
+    return {
+        "accepted": True,
+        "summary_id": summary_id,
+        "generation_id": generation_id,
+        "session": public_session,
+    }
 
 
 @router.patch("/api/session/summary")
 async def api_patch_summary(req: Request):
-    body = await req.json()
+    body = _require_summary_request_body(await req.json())
     project = _norm_project(body.get("project", "默认项目"))
     save = _norm_save(body.get("save", "默认存档"))
     expected_revision = _expected_revision(body)
-    index = body.get("index")
-    if isinstance(index, bool) or not isinstance(index, int):
-        raise HTTPException(400, "缺少或无效 index")
+    summary_id = _required_summary_id(body)
 
     def patch_summary(session: dict, context) -> None:
-        summaries = session.setdefault("summaries", [])
-        if index < 0 or index >= len(summaries):
-            raise HTTPException(400, f"index {index} 超出 summaries 范围 ({len(summaries)})")
-        target = summaries[index]
-        if body.get("text") is not None:
-            target["text"] = body["text"]
-        if body.get("time") is not None:
-            target["time"] = body["time"]
-        if isinstance(body.get("facts"), list):
-            target["facts"] = [str(fact)[:200] for fact in body["facts"]]
-        if isinstance(body.get("relations"), list):
-            target["relations"] = [str(relation)[:200] for relation in body["relations"]]
+        del context
+        target = _find_summary(session, summary_id)
+        updated = validated_summary_patch(body, target)
+        target.update(updated)
+        target["status"] = "completed"
+        target["content_status"] = "valid"
         target.pop("failed", None)
-        target.pop("error", None)
-        target["edited_at"] = datetime.now().isoformat()
+        target.pop("generation_id", None)
+        target["error"] = None
+        target["edited_at"] = datetime.now().astimezone().isoformat()
+        recompute_summary_error(session)
 
     try:
         mutation = await mutate_session(
@@ -407,4 +567,6 @@ async def api_patch_summary(req: Request):
         )
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
+    except SummaryValidationError as exc:
+        raise HTTPException(422, detail=exc.as_detail()) from exc
     return {"ok": True, "session": mutation.session}

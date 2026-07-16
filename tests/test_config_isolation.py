@@ -27,7 +27,10 @@ def test_all_mutable_paths_use_the_pytest_sandbox(isolated_paths):
 @pytest.mark.asyncio
 async def test_settings_and_prompts_write_only_to_sandbox(app_client, isolated_paths):
     real_system = isolated_paths["real_prompts"] / "system.md"
+    real_summary = isolated_paths["real_prompts"] / "summary.md"
     real_hash_before = hashlib.sha256(real_system.read_bytes()).hexdigest()
+    real_summary_hash_before = hashlib.sha256(real_summary.read_bytes()).hexdigest()
+    original_summary = (isolated_paths["prompts"] / "summary.md").read_text(encoding="utf-8")
 
     response = await app_client.put("/api/settings", json={"temperature": 0.25, "ignored": "x"})
     assert response.status_code == 200
@@ -38,3 +41,18 @@ async def test_settings_and_prompts_write_only_to_sandbox(app_client, isolated_p
     assert response.status_code == 200
     assert (isolated_paths["prompts"] / "system.md").read_text(encoding="utf-8") == "隔离后的系统提示词"
     assert hashlib.sha256(real_system.read_bytes()).hexdigest() == real_hash_before
+
+    prompts = await app_client.get("/api/prompts")
+    assert prompts.status_code == 200
+    assert set(prompts.json()) == {"system", "group_chat", "summary"}
+    saved = await app_client.put(
+        "/api/prompts/summary",
+        json={"content": "隔离后的摘要模板"},
+    )
+    assert saved.status_code == 200
+    assert (isolated_paths["prompts"] / "summary.md").read_text(encoding="utf-8") == "隔离后的摘要模板"
+    reset = await app_client.post("/api/prompts/summary/reset")
+    assert reset.status_code == 200
+    assert reset.json()["content"] == original_summary
+    assert (isolated_paths["prompts"] / "summary.md").read_text(encoding="utf-8") == original_summary
+    assert hashlib.sha256(real_summary.read_bytes()).hexdigest() == real_summary_hash_before

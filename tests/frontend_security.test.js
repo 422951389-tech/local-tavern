@@ -62,10 +62,12 @@ test('session writes use ApiClient, immutable refs and persistent turn APIs', ()
     assert.match(app, /turnClient\.cancel\(/);
     assert.match(app, /SessionRefTracker/);
     assert.equal((app.match(/\bfetch\s*\(/g) || []).length, 0);
-    assert.equal((app.match(/state\.session\s*=/g) || []).length, 1);
+    assert.equal((app.match(/state\.session\s*=/g) || []).length, 2);
+    assert.match(app, /function commitSessionState\(/);
+    assert.match(app, /function commitSummaryRefresh\(/);
     assert.doesNotMatch(app, /chat:\s*['"]\/api\/chat['"]/);
     assert.equal((app.match(/function enterMessageEditMode\s*\(/g) || []).length, 1);
-    assert.equal((app.match(/function enterSummaryEditMode\s*\(/g) || []).length, 1);
+    assert.equal((app.match(/function showSummaryEditor\s*\(/g) || []).length, 1);
     assert.doesNotMatch(app, /function enterEditMode\s*\(/);
 });
 
@@ -96,6 +98,20 @@ test('message actions build stable references from message_id only', () => {
     assert.match(bindings, /const messageRef\s*=\s*\{\s*message_id:\s*messageId\s*\}\s*;/);
     assert.doesNotMatch(bindings, /dataset\.index|\bidxRaw\b|\bindex\s*:/);
     assert.doesNotMatch(bindings, /message_id:\s*messageId\s*\|\|/);
+});
+
+test('summary actions use summary_id only and expose accessible lifecycle controls', () => {
+    const root = path.resolve(__dirname, '..');
+    const service = fs.readFileSync(path.join(root, 'web', 'summaries.mjs'), 'utf8');
+    const panel = fs.readFileSync(path.join(root, 'web', 'summary-panel.mjs'), 'utf8');
+    const css = fs.readFileSync(path.join(root, 'web', 'style.css'), 'utf8');
+    assert.match(service, /summary_id:\s*requireSummaryId\(summaryId\)/);
+    assert.doesNotMatch(service, /summary_index|\bindex\s*:/);
+    assert.match(panel, /aria-expanded/);
+    assert.match(panel, /aria-busy/);
+    assert.match(panel, /source_status/);
+    assert.match(css, /min-height:\s*44px/);
+    assert.match(css, /:focus-visible/);
 });
 
 test('frontend modules have no duplicate named function declarations', () => {

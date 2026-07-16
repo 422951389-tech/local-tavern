@@ -23,6 +23,7 @@ from core.path_policy import (
     resolve_session_path,
     resolve_under,
     validate_file_id,
+    validate_snapshot_filename,
 )
 from core.recovery_store import (
     DataCorruptionError,
@@ -35,6 +36,7 @@ from core.recovery_store import (
 
 T = TypeVar("T")
 LEGACY_MESSAGE_NAMESPACE = UUID("5ed9739c-d4a1-4baa-92a9-0e105fdd72a1")
+LEGACY_SUMMARY_NAMESPACE = UUID("1322c1c3-22f9-4cad-94f1-4c12ca7dfb21")
 
 
 def _run_with_library_shared(callback: Callable[..., T], *args, **kwargs) -> T:
@@ -130,12 +132,84 @@ def _legacy_message_uuid(
     return str(uuid5(LEGACY_MESSAGE_NAMESPACE, seed))
 
 
+def _legacy_summary_uuid(
+    project: str,
+    save_id: str,
+    index: int,
+    summary: dict,
+    *,
+    salt: int = 0,
+) -> str:
+    stable_fields = {
+        "project": project,
+        "save": save_id,
+        "index": index,
+        "source_snapshot_id": str(summary.get("source_snapshot_id", "")),
+        "created_at": str(summary.get("created_at", "")),
+        "text": str(summary.get("text", "")),
+        "salt": salt,
+    }
+    seed = json.dumps(stable_fields, ensure_ascii=False, sort_keys=True)
+    return str(uuid5(LEGACY_SUMMARY_NAMESPACE, seed))
+
+
 def normalize_session(session: dict, project: str, save_id: str) -> dict:
     """只改内存副本；为旧存档补 revision、默认字段和稳定消息 UUID。"""
     session["project"] = project
     session["session_id"] = save_id
     session["revision"] = _coerce_revision(session.get("revision", 0))
-    session.setdefault("summaries", [])
+    summaries = session.setdefault("summaries", [])
+    if not isinstance(summaries, list):
+        summaries = []
+        session["summaries"] = summaries
+    seen_summary_ids: set[str] = set()
+    for index, raw_summary in enumerate(tuple(summaries)):
+        if not isinstance(raw_summary, dict):
+            raw_summary = {
+                "text": str(raw_summary) if raw_summary is not None else "",
+            }
+            summaries[index] = raw_summary
+        summary_id = _valid_uuid(raw_summary.get("id"))
+        if summary_id is None or summary_id in seen_summary_ids:
+            salt = 0
+            summary_id = _legacy_summary_uuid(
+                project,
+                save_id,
+                index,
+                raw_summary,
+                salt=salt,
+            )
+            while summary_id in seen_summary_ids:
+                salt += 1
+                summary_id = _legacy_summary_uuid(
+                    project,
+                    save_id,
+                    index,
+                    raw_summary,
+                    salt=salt,
+                )
+        raw_summary["id"] = summary_id
+        seen_summary_ids.add(summary_id)
+
+        source_snapshot_id = raw_summary.get("source_snapshot_id")
+        if not isinstance(source_snapshot_id, str) or not source_snapshot_id:
+            raw_summary["source_snapshot_id"] = None
+        status = raw_summary.get("status")
+        if status not in {"pending", "completed", "failed"}:
+            status = "failed" if raw_summary.get("failed") or raw_summary.get("error") else "completed"
+            raw_summary["status"] = status
+        raw_summary.setdefault("text", "")
+        raw_summary.setdefault("time", "")
+        raw_summary.setdefault("facts", [])
+        raw_summary.setdefault("relations", [])
+        raw_summary.setdefault("error", None)
+        if raw_summary.get("content_status") not in {"valid", "empty"}:
+            raw_summary["content_status"] = (
+                "valid" if isinstance(raw_summary.get("text"), str) and raw_summary.get("text") else "empty"
+            )
+        attempt = raw_summary.get("generation_attempt", 0)
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+            raw_summary["generation_attempt"] = 0
     session.setdefault("summary_error", "")
     history = session.setdefault("message_history", [])
     seen: set[str] = set()
@@ -345,7 +419,36 @@ class SessionStore:
                 entity_id=save_id,
                 reason="JSON 顶层必须是对象",
             )
-        return normalize_session(data, project, save_id)
+        normalized = normalize_session(data, project, save_id)
+        self._refresh_summary_source_status_sync(normalized, project, save_id)
+        return normalized
+
+    def _refresh_summary_source_status_sync(
+        self,
+        session: dict,
+        project: str,
+        save_id: str,
+    ) -> None:
+        """只在内存副本标注原文映射；纯读取不回写 Session。"""
+        history_dir = self.history_dir(project)
+        for summary in session.get("summaries", []):
+            source_id = summary.get("source_snapshot_id")
+            if not isinstance(source_id, str) or not source_id:
+                summary["source_status"] = "unlinked"
+                continue
+            try:
+                filename, kind = validate_snapshot_filename(save_id, source_id)
+            except ValueError:
+                summary["source_status"] = "invalid"
+                continue
+            if kind != "trim":
+                summary["source_status"] = "invalid"
+                continue
+            summary["source_status"] = (
+                "available"
+                if (history_dir / filename).is_file()
+                else "missing"
+            )
 
     def read_sync(self, project: str, save_id: str) -> dict | None:
         return self._read_sync(project, save_id)
@@ -405,7 +508,13 @@ class SessionStore:
 
     @staticmethod
     def _serialize_session(session: dict) -> str:
-        return json.dumps(session, ensure_ascii=False, indent=2)
+        payload = deepcopy(session)
+        for summary in payload.get("summaries", []):
+            if not isinstance(summary, dict):
+                continue
+            summary.pop("source_status", None)
+            summary.pop("generation_active", None)
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _write_snapshot_sync(
         self,

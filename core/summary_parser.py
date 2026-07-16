@@ -1,13 +1,13 @@
 """短期总结解析器
 
 把 ollama_client.summarize_once 产出的纯文本解析成结构化字段：
-  - text:       前情提要（纯文本，必出，解析失败也兜底回退为原文）
+  - text:       前情提要（纯文本；解析失败时回退为完整原文）
   - time:       时间线一句话（可空）
   - facts:      关键事件列表（可空数组）
   - relations:  角色关系/立场列表（可空数组）
 
-设计原则：本地模型不可靠，所有结构化字段都是"尽力解析"，解析不出就留空；
-text 一定有值，至少回退为模型原文，保证前端折叠面板永远有内容可显示。
+设计原则：解析只负责无损结构化，不截断、不补占位符；长度、数量和必填语义
+由 summary_lifecycle 的统一验证器决定，违规输出必须进入 failed。
 """
 import re
 from typing import Optional
@@ -20,7 +20,6 @@ def parse_summary(raw: str) -> dict:
     """
     out = {"text": "", "time": "", "facts": [], "relations": []}
     if not raw or not raw.strip():
-        out["text"] = "（总结为空）"
         return out
 
     text = raw.strip()
@@ -83,10 +82,7 @@ def _extract_list(text: str, header_pat: str) -> list:
         line = re.sub(r"^\d+[.、)]\s*", "", line)
         line = line.strip()
         if line and line not in ("无", "无。", "—", "-"):
-            # D5：单项长度上限（防止幻觉输出垃圾撑爆面板）
-            items.append(line[:200])
-        if len(items) >= 5:
-            break
+            items.append(line)
     return items
 
 
@@ -102,7 +98,4 @@ def _clean_fallback_text(text: str) -> str:
             continue
         lines.append(s)
     cleaned = " ".join(lines) if lines else text
-    # 限制长度避免兜底文本过长
-    if len(cleaned) > 600:
-        cleaned = cleaned[:600] + "…"
     return cleaned

@@ -224,11 +224,18 @@ def trim_history(
     return dropped
 
 
-def trim_snapshot_payload(dropped: list[dict]) -> dict:
-    return {
+def trim_snapshot_payload(
+    dropped: list[dict],
+    *,
+    summary_id: str | None = None,
+) -> dict:
+    payload = {
         "dropped_count": len(dropped),
         "dropped_messages": deepcopy(dropped),
     }
+    if summary_id:
+        payload["summary_id"] = summary_id
+    return payload
 
 
 def list_trim_snapshots(project: str, save_id: str = DEFAULT_SAVE) -> list[dict]:

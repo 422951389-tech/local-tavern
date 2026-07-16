@@ -58,7 +58,7 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
 
         module_names = (
             "app", "modal", "message-editor", "card-editor", "projects",
-            "saves", "chat", "summaries", "prompt-editor", "render",
+            "saves", "chat", "summaries", "summary-panel", "prompt-editor", "render",
         )
         for name in module_names:
             with self.subTest(module=name):

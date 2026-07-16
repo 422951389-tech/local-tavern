@@ -3,7 +3,7 @@
 > **目的**：让下一个 AI 协作者在不询问用户的情况下，能完整理解这个项目并继续工作。
 > **创建日期**：2026-06-27
 > **最后更新**：2026-07-16
-> **当前状态**：阶段 A、B、C completed；阶段 D 的 PROMPT-1 completed，当前进入 MEMORY-1
+> **当前状态**：阶段 A、B、C completed；阶段 D 的 PROMPT-1、MEMORY-1 completed，当前进入 WORLD-1
 > **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
 
 ---
@@ -76,6 +76,8 @@ C:\local-tavern\
 │   ├── session_manager.py     # 存档管理 + 多时间线（260+ 行）
 │   ├── prompt_assembler.py    # ★ PROMPT-1：来源单次注入、总预算、裁剪诊断
 │   ├── token_estimator.py     # ★ PROMPT-1：可替换的保守 token 估算协议
+│   ├── summary_lifecycle.py   # ★ MEMORY-1：稳定 ID、严格校验、异步生成与代际收口
+│   ├── session_store.py       # revision/CAS、旧摘要稳定迁移、来源状态派生
 │   ├── prompt_builder.py      # 旧调用兼容层；运行时路由不使用
 │   ├── response_parser.py     # AI 回复解析（168 行）
 │   └── prompt_editor.py       # 提示词读写/恢复默认（65 行）
@@ -83,7 +85,8 @@ C:\local-tavern\
 ├── prompts/                   # Prompt 模板（Markdown，可在线编辑）
 │   ├── system.md              # 全局系统提示（格式铁律）
 │   ├── group_chat.md          # 群聊轮次模板（注入上下文）
-│   └── .default/              # 默认备份；最新 v20260716 版本与当前单次注入模板一致
+│   ├── summary.md             # 短期记忆总结模板，可在线编辑
+│   └── .default/              # 默认备份；system/group_chat/summary 均有最新版本
 │
 ├── data/
 │   ├── characters/            # 角色卡（YAML，用户填）
@@ -151,6 +154,9 @@ C:\local-tavern\
 | **前端无构建** | 避免 npm 依赖，用户双击 start.bat 就跑 |
 | **提示词模板 Markdown** | `PromptAssembler` 每轮重读；system 只放静态规则，group 中六类运行时数据槽各恰好一次 |
 | **.default/ 备份目录** | 用户改坏提示词能一键恢复 |
+| **摘要稳定 UUID + trim 双向绑定** | 编辑和重生成按 `summary_id` 精确定位；每段只读取自己的 `source_snapshot_id`，不回退最新快照 |
+| **摘要状态与内容有效性分离** | `pending/completed/failed` 描述生成任务，`content_status` 决定正文能否进入 Prompt；失败重试不丢旧有效正文 |
+| **生成代际令牌** | 后台结果只写回相同 `generation_id` 的 pending 段，人工编辑、新重试和乱序任务不会被旧结果覆盖 |
 
 ---
 
@@ -167,7 +173,7 @@ C:\local-tavern\
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/prompts` | 读全部 3 个 prompt |
-| PUT | `/api/prompts/{name}` | 保存 prompt（name ∈ system/group_chat/status_update） |
+| PUT | `/api/prompts/{name}` | 保存 prompt（name ∈ system/group_chat/summary） |
 | POST | `/api/prompts/{name}/reset` | 恢复默认 |
 
 ### 会话管理（多时间线）
@@ -177,23 +183,28 @@ C:\local-tavern\
 | POST | `/api/sessions` | 创建新会话（body: `{name}`） |
 | POST | `/api/sessions/rename` | 重命名（body: `{session_id, new_name}`） |
 | POST | `/api/sessions/delete` | 删除（body: `{session_id}`，至少保留 1 个） |
-| GET | `/api/sessions/export?session_id=xxx` | 导出会话 JSON |
+| GET | `/api/sessions/export?project=...&save=...` | 导出会话 JSON |
 | POST | `/api/sessions/import` | 导入（body: `{json_str, name?}`） |
 
 ### 单个会话
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/session?session_id=xxx` | 读会话 |
+| GET | `/api/session?project=...&save=...` | 读会话（含摘要来源与进程内生成状态） |
 | POST | `/api/session/reset` | 重置当前会话（清空历史、保留会话） |
-| PATCH | `/api/session?session_id=xxx` | 消息操作，body: `{action, index?, content?, in_prompt?}`，action ∈ `delete`/`edit`/`toggle_in_prompt`/`truncate`/`snapshot` |
-| GET | `/api/session/history?session_id=xxx` | 列出历史快照 |
-| POST | `/api/session/restore` | 从快照恢复（body: `{session_id, filename}`） |
+| PATCH | `/api/session?project=...&save=...` | 按稳定 `message_id` 执行消息编辑、删除、钉选与 Prompt 开关 |
+| GET | `/api/session/history?project=...&save=...` | 列出历史快照 |
+| POST | `/api/session/restore` | 从普通/reset 快照恢复（trim 仅供摘要原文查看） |
+| PATCH | `/api/session/summary` | 按稳定 `summary_id` 严格编辑任意摘要段 |
+| POST | `/api/session/summary/regenerate` | 按绑定 trim 快照异步重生成，返回 202 |
 
 ### 模型切换与聊天
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/model/switch` | 切换当前模型（body: `{model}`） |
-| POST | `/api/chat` | 主聊天（流式 SSE），body: `{user_input, session_id?, model?}` |
+| POST | `/api/chat/turns` | 接受持久回合并返回 `turn_id`（202） |
+| GET | `/api/chat/turns/{turn_id}/events` | 可断线续接的 SSE 事件流 |
+| POST | `/api/chat/turns/{turn_id}/cancel` | 幂等取消持久回合 |
+| POST | `/api/chat` | 兼容旧调用的同步 SSE 入口 |
 
 ---
 
@@ -205,8 +216,9 @@ C:\local-tavern\
 2. **`core/prompt_assembler.py` + `core/token_estimator.py`** —— Prompt 总预算、裁剪顺序、诊断与估算规则
 3. **`core/response_parser.py`** —— 解析 AI 输出的正则，加字段改这里
 4. **`routes/chat.py` 与 `core/chat_turns.py`** —— 持久回合 API 与后台生成状态机
-5. **`web/app.mjs` 与 `web/*.mjs`** —— 前端组合、领域服务与持久 SSE 回合处理
-6. **`data/characters/_template.yaml`** —— 角色卡字段定义
+5. **`core/summary_lifecycle.py` 与 `routes/messages.py`** —— 摘要严格校验、来源绑定、失败重试与并发收口
+6. **`web/app.mjs`、`web/summary-panel.mjs` 与 `web/*.mjs`** —— 前端组合、任意摘要段操作与持久 SSE 回合处理
+7. **`data/characters/_template.yaml`** —— 角色卡字段定义
 
 ---
 
@@ -291,13 +303,15 @@ active: true              # 是否默认出场
 | **删光全部会话** | 误操作 | 后端保护：至少保留 1 个会话 |
 | **提示词改坏或重复数据槽** | 发送前返回 `prompt_template_invalid` 422 | 六类运行时数据槽必须各恰好一次；`.default/` 最新备份可恢复 |
 | **Prompt 超预算** | 发送前返回 `prompt_budget_exceeded` 422 | 诊断只含来源、稳定 ID、估算量、保留/裁剪原因，不含正文；不会创建 turn、快照或 pending user |
+| **摘要一直显示生成中** | 服务重启后磁盘仍是 pending，但进程内任务不存在 | GET 响应的 `generation_active=false` 会显示“生成已中断”；用户可按原 `summary_id` 与原快照重试 |
+| **摘要原文快照缺失/错属** | 重生成返回稳定 `summary_source_*` 错误 | 不扫描、不回退最新 trim，也不会调用模型；前端仍保留现有有效正文 |
 | **GBK 编码报错** | PowerShell/curl 处理中文 | 用 UTF-8 模式 (`python -X utf8`)；测试用 PowerShell `Invoke-WebRequest` |
 
 ---
 
 ## 10. 待办 / 未实现
 
-完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。当前依赖顺序为 `MEMORY-1 → WORLD-1 → ROLE-1 → 阶段 E`。
+完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。当前依赖顺序为 `WORLD-1 → ROLE-1 → 阶段 E`。
 
 ---
 
@@ -315,7 +329,7 @@ active: true              # 是否默认出场
 2. **日常使用**：
    - 顶部下拉切换会话（多时间线）
    - 消息 hover 可删/编辑/重生成
-   - 顶部 ⚙ 提示词 可编辑 system/group_chat/status_update
+   - 顶部 ⚙ 提示词可编辑 system/group_chat/summary；摘要面板可按段查看原文、编辑、重生成或重试
    - 关闭浏览器再开会话仍在（自动保存）
 
 ---
@@ -342,6 +356,7 @@ active: true              # 是否默认出场
 | `core/character_loader.py` | 90 |
 | `core/session_manager.py` | ~260 |
 | `core/prompt_assembler.py` / `core/token_estimator.py` | Prompt 预算与估算 |
+| `core/summary_lifecycle.py` | 摘要验证、后台生成、失败重试与代际 CAS |
 | `core/prompt_builder.py` | 兼容入口 |
 | `core/response_parser.py` | 168 |
 | `core/prompt_editor.py` | 65 |
@@ -372,6 +387,6 @@ active: true              # 是否默认出场
 
 ---
 
-**最后更新**：2026-07-16  PROMPT-1 总预算、单次注入与安全诊断
+**最后更新**：2026-07-16  MEMORY-1 可追溯摘要、精确重生成与在线模板
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目
