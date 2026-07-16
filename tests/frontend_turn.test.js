@@ -89,6 +89,40 @@ test('TurnClient resumes with after cursor and validates SSE ids', async () => {
     assert.deepEqual(events.map(event => event.id), [3, 4]);
 });
 
+test('TurnClient regenerate posts the atomic command and reuses turn schema validation', async () => {
+    const requests = [];
+    let responsePayload = publicTurn();
+    const api = new ApiClient({
+        fetchImpl: async (url, options) => {
+            requests.push({ url, options });
+            return new Response(JSON.stringify(responsePayload), {
+                status: 202,
+                headers: { 'Content-Type': 'application/json' },
+            });
+        },
+    });
+    const client = new TurnClient(api);
+    const payload = {
+        message_id: '22222222-2222-4222-8222-222222222222',
+        project: 'project-a',
+        save: 'save-a',
+        expected_revision: 7,
+    };
+
+    const turn = await client.regenerate(payload);
+    assert.equal(turn.turn_id, publicTurn().turn_id);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, '/api/chat/turns/regenerate');
+    assert.equal(requests[0].options.method, 'POST');
+    assert.deepEqual(JSON.parse(requests[0].options.body), payload);
+
+    responsePayload = { status: 'pending' };
+    await assert.rejects(
+        client.regenerate(payload),
+        error => error && error.code === 'invalid_response_schema',
+    );
+});
+
 test('TurnClient coalesces double cancel and respects completed winning the race', async () => {
     let calls = 0;
     let resolveRequest;

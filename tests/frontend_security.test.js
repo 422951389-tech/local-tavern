@@ -7,6 +7,14 @@ const test = require('node:test');
 
 const security = require('../web/security.js');
 
+function sourceBetween(source, startMarker, endMarker) {
+    const start = source.indexOf(startMarker);
+    assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
+    const end = source.indexOf(endMarker, start + startMarker.length);
+    assert.notEqual(end, -1, `missing source marker: ${endMarker}`);
+    return source.slice(start, end);
+}
+
 test('malicious markup is escaped and never returned as an element', () => {
     const input = '<img src=x onerror="globalThis.pwned=true"><script>alert(1)</script>';
     const escaped = security.escapeHtml(input);
@@ -48,7 +56,6 @@ test('session writes use ApiClient, immutable refs and persistent turn APIs', ()
     assert.match(app, /const expectedRevision = currentRevision\(requestRef\)/);
     assert.match(app, /expected_revision:\s*expectedRevision/);
     assert.match(app, /dataset\.messageId/);
-    assert.match(app, /message_id:\s*messageId\s*\|\|\s*undefined/);
     assert.match(app, /new TurnClient\(apiClient\)/);
     assert.match(app, /turnClient\.events\(/);
     assert.match(app, /turnClient\.cancel\(/);
@@ -59,4 +66,33 @@ test('session writes use ApiClient, immutable refs and persistent turn APIs', ()
     assert.equal((app.match(/function enterMessageEditMode\s*\(/g) || []).length, 1);
     assert.equal((app.match(/function enterSummaryEditMode\s*\(/g) || []).length, 1);
     assert.doesNotMatch(app, /function enterEditMode\s*\(/);
+});
+
+test('regenerate is one atomic turn command with no client-side history surgery', () => {
+    const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.js'), 'utf8');
+    const regenerate = sourceBetween(
+        app,
+        'async function regenerateFrom(messageRef)',
+        'async function reloadCurrentSession',
+    );
+
+    assert.equal((regenerate.match(/turnClient\.regenerate\s*\(/g) || []).length, 1);
+    assert.doesNotMatch(regenerate, /sessionWrite\s*\(/);
+    assert.doesNotMatch(regenerate, /\b(?:snapshot|truncate)\b/);
+    assert.doesNotMatch(regenerate, /message_history|\.reverse\s*\(|\.find\s*\(/);
+    assert.doesNotMatch(regenerate, /sendMessage\s*\(/);
+});
+
+test('message actions build stable references from message_id only', () => {
+    const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.js'), 'utf8');
+    const bindings = sourceBetween(
+        app,
+        'function bindMessageActions(msgEl)',
+        'async function togglePin',
+    );
+
+    assert.match(bindings, /const messageId\s*=\s*msgEl\.dataset\.messageId/);
+    assert.match(bindings, /const messageRef\s*=\s*\{\s*message_id:\s*messageId\s*\}\s*;/);
+    assert.doesNotMatch(bindings, /dataset\.index|\bidxRaw\b|\bindex\s*:/);
+    assert.doesNotMatch(bindings, /message_id:\s*messageId\s*\|\|/);
 });

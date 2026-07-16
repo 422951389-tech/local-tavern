@@ -110,6 +110,13 @@
             });
         }
 
+        regenerate(payload, options = {}) {
+            return this.api.post('/api/chat/turns/regenerate', payload, {
+                ...options,
+                schema: validateTurn,
+            });
+        }
+
         get(turnId, options = {}) {
             return this.api.get(`/api/chat/turns/${encodeURIComponent(turnId)}`, {
                 ...options,

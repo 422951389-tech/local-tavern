@@ -99,13 +99,20 @@ async def api_patch_session(
     }
     if req.action not in allowed_actions:
         raise HTTPException(400, f"未知 action: {req.action}")
+    if not req.message_id:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "message_id_required",
+                "message": "消息命令必须提供稳定 message_id",
+            },
+        )
 
     def apply_action(session: dict, context) -> dict:
         try:
             position, message = resolve_message(
                 session,
                 message_id=req.message_id,
-                index=req.index,
             )
         except IndexError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -113,21 +120,30 @@ async def api_patch_session(
         history = session.setdefault("message_history", [])
         result: dict = {}
         if req.action == "delete":
+            context.snapshot("snapshot", session)
             history.pop(position)
         elif req.action == "edit":
             if req.content is None:
                 raise HTTPException(400, "缺少 content")
             message["content"] = req.content
         elif req.action == "toggle_in_prompt":
-            message["in_prompt"] = bool(req.in_prompt)
+            if req.in_prompt is None:
+                raise HTTPException(400, "缺少 in_prompt")
+            message["in_prompt"] = req.in_prompt
         elif req.action == "truncate":
             context.snapshot("snapshot", session)
-            session["message_history"] = history[:position]
+            session["message_history"] = [
+                *history[:position],
+                *(
+                    item
+                    for item in history[position:]
+                    if item.get("pinned")
+                ),
+            ]
         elif req.action == "toggle_pinned":
             toggle_pinned(
                 session,
                 message_id=req.message_id,
-                index=req.index,
             )
             result["pinned_count"] = count_pinned(session)
             result["message_id"] = message.get("id")

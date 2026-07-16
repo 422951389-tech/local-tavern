@@ -1,8 +1,9 @@
 """server.py 与路由模块共享的依赖与工具函数。"""
 from typing import Annotated, Optional
+from uuid import UUID
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, StrictBool, StrictInt
+from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, field_validator
 
 from core.ollama_client import get_client
 from core.character_loader import list_characters, load_user_profile
@@ -35,6 +36,27 @@ class ChatRequest(BaseModel):
     top_k: Optional[int] = None
     num_predict: Optional[int] = None
     think: Optional[bool] = None
+
+
+class RegenerateRequest(BaseModel):
+    message_id: StrictStr
+    model: Optional[str] = None
+    project: str = "默认项目"
+    save: str = DEFAULT_SAVE
+    expected_revision: ExpectedRevision
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    num_predict: Optional[int] = None
+    think: Optional[bool] = None
+
+    @field_validator("message_id")
+    @classmethod
+    def validate_message_id(cls, value: str) -> str:
+        try:
+            return str(UUID(value))
+        except ValueError as exc:
+            raise ValueError("message_id 必须是 UUID") from exc
 
 
 class SessionResetRequest(BaseModel):
@@ -81,11 +103,20 @@ class RecoveryRestoreRequest(BaseModel):
 
 class MessageAction(BaseModel):
     action: str
-    index: Optional[int] = None
-    message_id: Optional[str] = None
+    message_id: Optional[StrictStr] = None
     content: Optional[str] = None
-    in_prompt: Optional[bool] = None
+    in_prompt: Optional[StrictBool] = None
     expected_revision: ExpectedRevision
+
+    @field_validator("message_id")
+    @classmethod
+    def validate_optional_message_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return str(UUID(value))
+        except ValueError as exc:
+            raise ValueError("message_id 必须是 UUID") from exc
 
 
 def _expected_revision(body: dict) -> int:

@@ -793,9 +793,9 @@ function renderAffinityBar(percent) {
 function renderHistory(history) {
     const stream = document.getElementById('chat-stream');
     stream.innerHTML = '';
-    history.forEach((msg, idx) => {
-        if (msg.role === 'user') appendUserMessage(msg.content, idx, msg);
-        else if (msg.role === 'assistant') appendAssistantMessage(msg.content, msg.thinking || '', idx, msg);
+    history.forEach((msg) => {
+        if (msg.role === 'user') appendUserMessage(msg.content, msg);
+        else if (msg.role === 'assistant') appendAssistantMessage(msg.content, msg.thinking || '', msg);
     });
     // 重渲染历史时，给最新一条 AI 消息补上「📋 剧情记忆」折叠面板（已有 summaries 才显示）
     const lastAI = stream.querySelector('.msg.assistant:last-of-type');
@@ -805,11 +805,10 @@ function renderHistory(history) {
 
 // ===== 消息追加 =====
 
-function appendUserMessage(text, index = null, msgData = null) {
+function appendUserMessage(text, msgData = null) {
     const stream = document.getElementById('chat-stream');
     const div = document.createElement('div');
     div.className = 'msg user';
-    div.dataset.index = index !== null ? index : '';
     div.dataset.messageId = msgData && msgData.id ? msgData.id : '';
     div.innerHTML = `
         <input type="checkbox" class="msg-checkbox" ${msgData && msgData.in_prompt === false ? '' : 'checked'} title="勾选 = 进 prompt">
@@ -826,11 +825,10 @@ function appendUserMessage(text, index = null, msgData = null) {
     scrollToBottom();
 }
 
-function appendAssistantMessage(content, thinking = '', index = null, msgData = null) {
+function appendAssistantMessage(content, thinking = '', msgData = null) {
     const stream = document.getElementById('chat-stream');
     const div = document.createElement('div');
     div.className = 'msg assistant';
-    div.dataset.index = index !== null ? index : '';
     div.dataset.messageId = msgData && msgData.id ? msgData.id : '';
     // 给 assistant 节点分配唯一 id，便于 SSE/regenerate 精确锁定目标（兜底 :last-child 选择器）
     div.id = div.id || `msg-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -865,14 +863,12 @@ function appendStreamThinking(chunk) {
 // ===== 消息操作 =====
 
 function bindMessageActions(msgEl) {
-    const idxRaw = msgEl.dataset.index;
-    const idx = (idxRaw === '' || idxRaw == null) ? -1 : parseInt(idxRaw);
     const messageId = msgEl.dataset.messageId || '';
-    if (!messageId && (!Number.isFinite(idx) || idx < 0)) {
-        console.warn('消息节点缺少 message UUID/index，已跳过绑定:', msgEl);
+    if (!messageId) {
+        console.warn('消息节点缺少 message UUID，已跳过绑定:', msgEl);
         return;
     }
-    const messageRef = { message_id: messageId || undefined, index: idx >= 0 ? idx : undefined };
+    const messageRef = { message_id: messageId };
     const checkbox = msgEl.querySelector('.msg-checkbox');
     checkbox.addEventListener('change', async (e) => {
         try {
@@ -988,14 +984,23 @@ async function editMessage(messageRef, newContent) {
 }
 
 async function regenerateFrom(messageRef) {
-    const url = `${API.session}?project=${encodeURIComponent(state.currentProject)}&save=${encodeURIComponent(state.currentSave)}`;
-    await sessionWrite(url, 'PATCH', { action: 'snapshot' }, '创建快照');
-    await sessionWrite(url, 'PATCH', { action: 'truncate', ...messageRef }, '截断消息');
-    await reloadCurrentSession();
-    const history = state.session.message_history || [];
-    const lastUserMsg = [...history].reverse().find(m => m.role === 'user');
-    if (!lastUserMsg) { alert('没有找到要重生成的用户消息'); return; }
-    await sendMessage(lastUserMsg.content, true);
+    if (!messageRef || !messageRef.message_id) {
+        throw new ApiError('重生成需要稳定 message_id', { code: 'message_id_required' });
+    }
+    if (state.navigationBusy || !canPerformAction('regenerate', state.activeTurn && state.activeTurn.status)) return;
+    const requestRef = captureSessionRef();
+    if (!sessionBelongsToRef(state.session, requestRef)) {
+        throw new ApiError('当前存档尚未加载完成', { code: 'stale_session_ref' });
+    }
+    prepareProvisionalTurn(requestRef);
+    await runTurnLifecycle(
+        turnClient.regenerate({
+            ...buildTurnPayload(requestRef),
+            message_id: messageRef.message_id,
+        }),
+        requestRef,
+        { failureLabel: '重生成' },
+    );
 }
 
 async function reloadCurrentSession(requestRef = captureSessionRef()) {
@@ -1570,39 +1575,39 @@ async function cancelActiveTurn() {
     }
 }
 
-async function sendMessage(text = null, isRegenerate = false) {
-    const input = document.getElementById('user-input');
-    const userText = text !== null ? String(text).trim() : input.value.trim();
-    if (!userText || state.navigationBusy || !canPerformAction('send', state.activeTurn && state.activeTurn.status)) return;
-    const requestRef = captureSessionRef();
-    if (!sessionBelongsToRef(state.session, requestRef)) {
-        showToast('当前存档尚未加载完成');
-        return;
-    }
-    const expectedRevision = currentRevision(requestRef);
+function buildTurnPayload(requestRef, userInput = undefined) {
+    const payload = {
+        project: requestRef.project,
+        save: requestRef.save,
+        model: state.session.current_model || document.getElementById('model-select').value || null,
+        expected_revision: currentRevision(requestRef),
+        temperature: state.modelParams.temperature,
+        top_p: state.modelParams.top_p,
+        top_k: state.modelParams.top_k,
+        num_predict: state.modelParams.num_predict,
+        think: state.modelParams.think,
+    };
+    if (userInput !== undefined) payload.user_input = userInput;
+    return payload;
+}
+
+function prepareProvisionalTurn(requestRef) {
     const thinking = document.getElementById('thinking-content');
     if (thinking) thinking.textContent = '';
     state.activeTurn = makeProvisionalTurn(requestRef);
     setTurnUiState(true, false);
+}
 
+async function runTurnLifecycle(turnRequest, requestRef, options = {}) {
+    const input = document.getElementById('user-input');
+    const failureLabel = options.failureLabel || '发送';
     try {
-        const turn = await turnClient.create({
-            user_input: userText,
-            project: requestRef.project,
-            save: requestRef.save,
-            model: state.session.current_model || document.getElementById('model-select').value || null,
-            expected_revision: expectedRevision,
-            temperature: state.modelParams.temperature,
-            top_p: state.modelParams.top_p,
-            top_k: state.modelParams.top_k,
-            num_predict: state.modelParams.num_predict,
-            think: state.modelParams.think,
-        });
+        const turn = await turnRequest;
         if (!isCurrentSessionRef(requestRef)) {
             throw new ApiError('发送期间存档引用已失效', { code: 'stale_session_ref' });
         }
         installActiveTurn(turn, requestRef);
-        if (!isRegenerate) input.value = '';
+        if (options.clearInput && input) input.value = '';
         try { await reloadCurrentSession(requestRef); } catch (error) {
             console.warn('同步 pending user 失败，继续读取持久 turn', error);
         }
@@ -1639,8 +1644,25 @@ async function sendMessage(text = null, isRegenerate = false) {
         state.activeTurn = null;
         activeController = null;
         setTurnUiState(false, false);
-        showToast(`发送失败：${errorDetail(error)}`, 4000);
+        showToast(`${failureLabel}失败：${errorDetail(error)}`, 4000);
     }
+}
+
+async function sendMessage(text = null) {
+    const input = document.getElementById('user-input');
+    const userText = text !== null ? String(text).trim() : input.value.trim();
+    if (!userText || state.navigationBusy || !canPerformAction('send', state.activeTurn && state.activeTurn.status)) return;
+    const requestRef = captureSessionRef();
+    if (!sessionBelongsToRef(state.session, requestRef)) {
+        showToast('当前存档尚未加载完成');
+        return;
+    }
+    prepareProvisionalTurn(requestRef);
+    await runTurnLifecycle(
+        turnClient.create(buildTurnPayload(requestRef, userText)),
+        requestRef,
+        { clearInput: true, failureLabel: '发送' },
+    );
 }
 
 // ===== Modal 框架 =====

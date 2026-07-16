@@ -93,43 +93,57 @@ def build_messages(
     char_state_str = json.dumps(characters_state, ensure_ascii=False, indent=2)
     group_content = group_content.replace("{{characters_state_json}}", char_state_str)
 
-    # 历史
-    if history:
-        history_lines = []
-        # 长期记忆：已压缩的剧情梗概（按时间正序，每段独立）
-        if summaries:
-            summary_lines = []
-            for s in summaries:
-                if not isinstance(s, dict):
-                    continue
-                text = s.get("text", "") or ""
-                if not text:
-                    continue
-                ts = (s.get("created_at") or "")[:10]
-                block = f"【前情提要({ts})】{text}"
-                for f in (s.get("facts") if isinstance(s.get("facts"), list) else [])[:5]:
-                    block += f"\n  · 关键事件: {f}"
-                if s.get("relations") and isinstance(s.get("relations"), list):
-                    block += "\n  · 角色关系: " + "；".join(s["relations"][:5])
-                summary_lines.append(block)
-            if summary_lines:
-                history_lines.append("===== 长期记忆（早期剧情梗概，已被压缩）=====")
-                history_lines.append("⚠️ 以下剧情梗概只作背景理解，不要原文复述，更不要当作当前正在发生的事。本轮对话已经推进到这些梗概之后。")
-                history_lines.append("\n---\n".join(summary_lines))
-        # 📌常驻：所有 pinned 消息（哪怕已被截轮、不在最近20条内）都常驻 prompt
-        all_pinned = [h for h in history if h.get("pinned")]
-        if all_pinned:
-            pinned_block = ["===== 📌常驻记忆（用户钉选，须始终记牢）====="]
-            for h in all_pinned:
-                role = h.get("role", "user")
-                pinned_block.append(f"[{role}|📌常驻]: {h.get('content','')}")
-            history_lines.append("\n".join(pinned_block))
-        # 近期历史不在文本块注入（避免与下方 messages 序列双重注入导致权重翻倍）。
-        # 近期对话走 messages 序列的单一注入（见函数末尾 history[-N:]），文本块只承载长期摘要 + 📌常驻。
-        if history_lines:
-            history_str = "\n\n".join(history_lines)
-        else:
-            history_str = "（无长期记忆/常驻，这是第一轮或近期对话走 messages 序列）"
+    # 消息 include 是总开关；false 即使 pinned 也绝不进入 Prompt。
+    eligible_history = [
+        item
+        for item in history
+        if isinstance(item, dict)
+        and item.get("role") in ("user", "assistant")
+        and item.get("in_prompt", True) is not False
+    ]
+    recent_n = MAX_TURNS_IN_PROMPT * 2
+    recent_history = eligible_history[-recent_n:]
+    older_history = (
+        eligible_history[:-recent_n]
+        if len(eligible_history) > recent_n
+        else []
+    )
+
+    history_lines = []
+    # 长期记忆：已压缩的剧情梗概（按时间正序，每段独立）
+    if summaries:
+        summary_lines = []
+        for s in summaries:
+            if not isinstance(s, dict):
+                continue
+            text = s.get("text", "") or ""
+            if not text:
+                continue
+            ts = (s.get("created_at") or "")[:10]
+            block = f"【前情提要({ts})】{text}"
+            for f in (s.get("facts") if isinstance(s.get("facts"), list) else [])[:5]:
+                block += f"\n  · 关键事件: {f}"
+            if s.get("relations") and isinstance(s.get("relations"), list):
+                block += "\n  · 角色关系: " + "；".join(s["relations"][:5])
+            summary_lines.append(block)
+        if summary_lines:
+            history_lines.append("===== 长期记忆（早期剧情梗概，已被压缩）=====")
+            history_lines.append("⚠️ 以下剧情梗概只作背景理解，不要原文复述，更不要当作当前正在发生的事。本轮对话已经推进到这些梗概之后。")
+            history_lines.append("\n---\n".join(summary_lines))
+
+    # 只有 recent 窗口以外的 pinned 进入常驻块；recent pinned 走结构化消息，避免双注入。
+    older_pinned = [item for item in older_history if item.get("pinned")]
+    if older_pinned:
+        pinned_block = ["===== 📌常驻记忆（用户钉选，须始终记牢）====="]
+        for item in older_pinned:
+            role = item.get("role", "user")
+            pinned_block.append(f"[{role}|📌常驻]: {item.get('content', '')}")
+        history_lines.append("\n".join(pinned_block))
+
+    if history_lines:
+        history_str = "\n\n".join(history_lines)
+    elif eligible_history:
+        history_str = "（无长期记忆/常驻，近期对话走 messages 序列）"
     else:
         history_str = "（无历史，这是第一轮对话）"
     group_content = group_content.replace("{{history}}", history_str)
@@ -145,14 +159,11 @@ def build_messages(
     # ===== 拼装 messages =====
     messages = [{"role": "system", "content": system_content}]
 
-    # 历史消息（之前已存在）—— recent 单一注入源：messages 序列
-    # MAX_TURNS_IN_PROMPT * 2 = 每轮 user+assistant 两条，给模型结构化的近期对话
-    recent_n = MAX_TURNS_IN_PROMPT * 2
-    for h in history[-recent_n:]:
+    # 历史消息（之前已存在）—— recent 单一注入源：messages 序列。
+    for h in recent_history:
         role = h.get("role", "user")
         content = h.get("content", "")
-        if role in ("user", "assistant"):
-            messages.append({"role": role, "content": content})
+        messages.append({"role": role, "content": content})
 
     # 本轮的 group_chat prompt 作为最后的 user 消息
     messages.append({"role": "user", "content": group_content})

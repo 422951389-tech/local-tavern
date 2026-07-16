@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 from core import active_turns
 from core.config import DATA_DIR
 from core.library_lock import library_lock
-from core.session_store import atomic_write
+from core.session_store import MutationResult, atomic_write
 
 
 ACTIVE_STATUSES = frozenset({"pending", "streaming"})
@@ -277,6 +277,7 @@ class TurnRuntime:
 
 
 TurnWorker = Callable[[TurnRuntime], Awaitable[None]]
+TurnAcceptor = Callable[[str, str], Awaitable[MutationResult[str]]]
 
 
 class TurnCoordinator:
@@ -307,7 +308,6 @@ class TurnCoordinator:
                 "created_at": turn.get("created_at") or completed_at,
                 "completed_at": completed_at,
             },
-            "pinned": False,
         }
 
     async def _recover_session(self, turn: dict, error: dict) -> int | None:
@@ -436,6 +436,7 @@ class TurnCoordinator:
         initial_session: dict,
         accepted_callback: Callable[[dict], None],
         worker: TurnWorker,
+        accept_command: TurnAcceptor | None = None,
     ) -> dict:
         turn_id = str(uuid4())
         created_at = _now()
@@ -462,17 +463,21 @@ class TurnCoordinator:
         async with self._lock:
             try:
                 stored = await _run_sync_critical(self.store.create, record)
-                from core.session_manager import get_session_store
+                if accept_command is None:
+                    from core.session_manager import get_session_store
 
-                acceptance = await _await_critical(get_session_store().accept_chat_turn(
-                    project,
-                    save,
-                    expected_revision,
-                    turn_id=turn_id,
-                    user_input=user_input,
-                    created_at=created_at,
-                    initial_session=initial_session,
-                ))
+                    acceptance_awaitable = get_session_store().accept_chat_turn(
+                        project,
+                        save,
+                        expected_revision,
+                        turn_id=turn_id,
+                        user_input=user_input,
+                        created_at=created_at,
+                        initial_session=initial_session,
+                    )
+                else:
+                    acceptance_awaitable = accept_command(turn_id, created_at)
+                acceptance = await _await_critical(acceptance_awaitable)
             except BaseException:
                 active_turns.unregister(project, save, turn_id)
                 with suppress(Exception):
@@ -480,7 +485,13 @@ class TurnCoordinator:
                 raise
             stored["accepted_revision"] = acceptance.session["revision"]
             stored["user_message_id"] = acceptance.value
-            stored = await _run_sync_critical(self.store.update, stored)
+            try:
+                stored = await _run_sync_critical(self.store.update, stored)
+            except (Exception, asyncio.CancelledError):
+                # Session 已接受后不能再向客户端伪装成“未接受”。首个事件会把
+                # 内存中的完整 turn 元数据重新写回；即使进程立即退出，pending
+                # user 的 turn_id 也足以让启动恢复流程确定性收口。
+                logger.exception("turn %s 接受元数据回写失败，继续启动 worker", turn_id)
             accepted_callback(deepcopy(acceptance.session))
             self._records[turn_id] = deepcopy(stored)
             task = asyncio.create_task(

@@ -13,18 +13,25 @@ from core.chat_turns import TurnNotFound, TurnRuntime, get_turn_coordinator
 from core.ollama_client import get_client
 from core.character_loader import load_character, load_user_profile, load_worldbook
 from core.config import MAX_MESSAGES_IN_SAVE
+from core.message_commands import (
+    MessageCommandError,
+    MessageNotFound,
+    plan_message_regeneration,
+)
 from core.prompt_builder import build_messages
 from core.response_parser import parse_response, check_voice_confusion
 from core.session_manager import (
     RevisionConflict,
     aload_session,
     append_history,
+    get_session_store,
     mutate_session,
     trim_history,
     trim_snapshot_payload,
 )
 from routes.common import (
     ChatRequest,
+    RegenerateRequest,
     _norm_save,
     _norm_project,
     _initialize_session_from_profiles,
@@ -47,7 +54,7 @@ async def shutdown_chat_background_tasks() -> None:
     _summary_tasks.clear()
 
 
-def _validated_parameters(req: ChatRequest) -> dict:
+def _validated_parameters(req: ChatRequest | RegenerateRequest) -> dict:
     params = {
         "temperature": 0.8,
         "num_predict": 4096,
@@ -108,13 +115,28 @@ def _validated_parameters(req: ChatRequest) -> dict:
     return params
 
 
-async def _prepare_turn(req: ChatRequest) -> dict:
-    user_text = (req.user_input or "").strip()
+async def _prepare_turn(
+    req: ChatRequest | RegenerateRequest,
+    *,
+    user_text_override: str | None = None,
+    session_override: dict | None = None,
+    history_override: list[dict] | None = None,
+) -> dict:
+    raw_user_text = (
+        user_text_override
+        if user_text_override is not None
+        else getattr(req, "user_input", "")
+    )
+    user_text = (raw_user_text or "").strip()
     if not user_text:
         raise HTTPException(400, "用户输入不能为空")
     project = _norm_project(req.project)
     save = _norm_save(req.save)
-    session = await aload_session(project, save)
+    session = (
+        deepcopy(session_override)
+        if session_override is not None
+        else await aload_session(project, save)
+    )
     current_revision = session.get("revision", 0)
     if current_revision != req.expected_revision:
         _raise_revision_conflict(
@@ -148,7 +170,11 @@ async def _prepare_turn(req: ChatRequest) -> dict:
     user_profile = load_user_profile(project)
     all_entries = load_worldbook(project)
     wb_entries = [e for e in all_entries if e.get("enabled", True)]
-    history = session.get("message_history", [])
+    history = (
+        deepcopy(history_override)
+        if history_override is not None
+        else session.get("message_history", [])
+    )
 
     return {
         "project": project,
@@ -189,7 +215,6 @@ def _message_metadata(
             "created_at": created_at,
             "completed_at": datetime.now().astimezone().isoformat(),
         },
-        "pinned": False,
         "in_prompt": in_prompt,
     }
 
@@ -794,9 +819,81 @@ async def _start_turn(req: ChatRequest) -> dict:
         _raise_revision_conflict(exc)
 
 
+def _raise_message_command_error(exc: MessageCommandError) -> None:
+    status_code = 404 if isinstance(exc, MessageNotFound) else 422
+    raise HTTPException(
+        status_code,
+        detail={"code": exc.code, "message": str(exc)},
+    ) from exc
+
+
+async def _start_regenerated_turn(req: RegenerateRequest) -> dict:
+    project = _norm_project(req.project)
+    save = _norm_save(req.save)
+    session = await aload_session(project, save)
+    current_revision = session.get("revision", 0)
+    if current_revision != req.expected_revision:
+        _raise_revision_conflict(
+            RevisionConflict(req.expected_revision, current_revision, session)
+        )
+    try:
+        plan = plan_message_regeneration(session, req.message_id)
+    except MessageCommandError as exc:
+        _raise_message_command_error(exc)
+
+    prepared = await _prepare_turn(
+        req,
+        user_text_override=plan.user_input,
+        session_override=session,
+        history_override=plan.prompt_history,
+    )
+    coordinator = get_turn_coordinator()
+    store = get_session_store()
+
+    async def accept_command(turn_id: str, created_at: str):
+        return await store.accept_regenerated_chat_turn(
+            prepared["project"],
+            prepared["save"],
+            prepared["expected_revision"],
+            turn_id=turn_id,
+            target_message_id=req.message_id,
+            expected_user_input=prepared["user_text"],
+            created_at=created_at,
+        )
+
+    def accepted(accepted_session: dict) -> None:
+        prepared["session"] = accepted_session
+        prepared["expected_revision"] = accepted_session["revision"]
+
+    try:
+        return await coordinator.start(
+            project=prepared["project"],
+            save=prepared["save"],
+            expected_revision=prepared["expected_revision"],
+            user_input=prepared["user_text"],
+            model=prepared["model"],
+            parameters=prepared["params"],
+            initial_session=prepared["session"],
+            accepted_callback=accepted,
+            worker=_turn_worker(prepared),
+            accept_command=accept_command,
+        )
+    except RevisionConflict as exc:
+        _raise_revision_conflict(exc)
+    except MessageCommandError as exc:
+        _raise_message_command_error(exc)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @router.post("/api/chat/turns", status_code=202)
 async def api_create_turn(req: ChatRequest):
     return await _start_turn(req)
+
+
+@router.post("/api/chat/turns/regenerate", status_code=202)
+async def api_regenerate_turn(req: RegenerateRequest):
+    return await _start_regenerated_turn(req)
 
 
 @router.get("/api/chat/turns/{turn_id}")

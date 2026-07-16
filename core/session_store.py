@@ -16,6 +16,7 @@ from uuid import UUID, uuid4, uuid5
 
 from core.active_turns import assert_write_allowed
 from core.library_lock import library_lock
+from core.message_commands import plan_message_regeneration
 from core.path_policy import (
     resolve_project_dir,
     resolve_saves_dir,
@@ -142,6 +143,7 @@ def normalize_session(session: dict, project: str, save_id: str) -> dict:
         if not isinstance(message, dict):
             continue
         message.setdefault("pinned", False)
+        message.setdefault("in_prompt", True)
         message_id = _valid_uuid(message.get("id"))
         if message_id is None or message_id in seen:
             message_id = _legacy_message_uuid(project, save_id, index, message)
@@ -516,6 +518,77 @@ class SessionStore:
                     return MutationResult(
                         session=working,
                         value=message_id,
+                    )
+
+                return await asyncio.to_thread(_run_with_library_shared, accept_sync)
+
+    async def accept_regenerated_chat_turn(
+        self,
+        project: str,
+        save_id: str,
+        expected_revision: int,
+        *,
+        turn_id: str,
+        target_message_id: str,
+        expected_user_input: str,
+        created_at: str,
+    ) -> MutationResult[str]:
+        """原子接受重生成：一次快照、语义截断、lease 与 pending user。"""
+        from core import active_turns
+
+        project_lock = await self.project_lock(project)
+        async with project_lock:
+            lock = await self.save_lock(project, save_id)
+            async with lock:
+                assert_write_allowed(project, save_id)
+
+                def accept_sync() -> MutationResult[str]:
+                    self._require_project_sync(project)
+                    current = self._read_sync(project, save_id)
+                    if current is None:
+                        raise FileNotFoundError(f"存档 {save_id} 不存在")
+                    self._check_revision(expected_revision, current)
+                    plan = plan_message_regeneration(current, target_message_id)
+                    if plan.user_input != expected_user_input:
+                        raise RuntimeError("重生成源消息在接受前发生变化")
+
+                    working = deepcopy(current)
+                    working["message_history"] = plan.pending_history(
+                        turn_id=turn_id,
+                        created_at=created_at,
+                    )
+                    working = normalize_session(working, project, save_id)
+                    working["revision"] = current["revision"] + 1
+                    working["updated_at"] = datetime.now().isoformat()
+
+                    snapshot_path: Path | None = None
+                    history_dir = self.history_dir(project)
+                    history_dir_existed = history_dir.exists()
+                    active_turns.register(project, save_id, turn_id)
+                    try:
+                        snapshot_path = self._write_snapshot_sync(
+                            project,
+                            save_id,
+                            "snapshot",
+                            current,
+                        )
+                        self._write_session_sync(working, project, save_id)
+                    except BaseException:
+                        active_turns.unregister(project, save_id, turn_id)
+                        if snapshot_path is not None:
+                            try:
+                                snapshot_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                        if not history_dir_existed:
+                            try:
+                                history_dir.rmdir()
+                            except OSError:
+                                pass
+                        raise
+                    return MutationResult(
+                        session=working,
+                        value=plan.source_message_id,
                     )
 
                 return await asyncio.to_thread(_run_with_library_shared, accept_sync)

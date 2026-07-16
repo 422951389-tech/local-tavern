@@ -192,18 +192,13 @@ def append_history(
 def resolve_message(
     session: dict,
     *,
-    message_id: str | None = None,
-    index: int | None = None,
+    message_id: str,
 ) -> tuple[int, dict]:
     history = session.setdefault("message_history", [])
-    if message_id:
-        for position, message in enumerate(history):
-            if message.get("id") == message_id:
-                return position, message
-        raise IndexError("消息 ID 不存在")
-    if index is None or index < 0 or index >= len(history):
-        raise IndexError("无效的 index")
-    return index, history[index]
+    for position, message in enumerate(history):
+        if message.get("id") == message_id:
+            return position, message
+    raise IndexError("消息 ID 不存在")
 
 
 def trim_history(
@@ -542,10 +537,9 @@ async def import_session(project: str, json_str: str, name: str = None) -> dict:
 def toggle_pinned(
     session: dict,
     *,
-    message_id: str | None = None,
-    index: int | None = None,
+    message_id: str,
 ) -> dict:
-    _, message = resolve_message(session, message_id=message_id, index=index)
+    _, message = resolve_message(session, message_id=message_id)
     message["pinned"] = not message.get("pinned", False)
     return message
 
