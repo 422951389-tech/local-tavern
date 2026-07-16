@@ -437,6 +437,7 @@ class TurnCoordinator:
         accepted_callback: Callable[[dict], None],
         worker: TurnWorker,
         accept_command: TurnAcceptor | None = None,
+        prompt_diagnostics: dict | None = None,
     ) -> dict:
         turn_id = str(uuid4())
         created_at = _now()
@@ -459,6 +460,8 @@ class TurnCoordinator:
             "thinking": "",
             "error": None,
         }
+        if prompt_diagnostics is not None:
+            record["prompt_diagnostics"] = deepcopy(prompt_diagnostics)
         await self.ensure_recovered()
         async with self._lock:
             try:

@@ -38,6 +38,13 @@ class FakeOllamaClient:
         self.delay = 0.0
         self.chat_calls: list[dict] = []
         self.summary_calls: list[dict] = []
+        self.context_limit_calls: list[str] = []
+        self.context_limits: dict[str, dict] = {
+            "fake-model:latest": {
+                "context_limit": 32768,
+                "source": "fake_model_metadata",
+            }
+        }
         self.closed = False
         self.block_before_first = False
         self.pause_after: int | None = None
@@ -86,6 +93,13 @@ class FakeOllamaClient:
     async def list_models(self) -> list[str]:
         return list(self.models)
 
+    async def get_context_limit(self, model: str) -> dict:
+        self.context_limit_calls.append(model)
+        return deepcopy(self.context_limits.get(model, {
+            "context_limit": 32768,
+            "source": "fake_fallback",
+        }))
+
     async def chat_stream(
         self,
         model: str,
@@ -95,12 +109,14 @@ class FakeOllamaClient:
         temperature: float = 0.8,
         top_p: float | None = None,
         top_k: int | None = None,
+        num_ctx: int | None = None,
     ) -> AsyncIterator[dict]:
         self.chat_calls.append({
             "model": model,
             "messages": deepcopy(messages),
             "think": think,
             "num_predict": num_predict,
+            "num_ctx": num_ctx,
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,

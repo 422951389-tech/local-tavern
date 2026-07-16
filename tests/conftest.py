@@ -36,8 +36,15 @@ os.environ["TAVERN_OLLAMA_HOST"] = "http://127.0.0.1:1"
 
 TEST_PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 for filename, content in {
-    "system.md": "系统测试模板\n{{character_list}}\n{{user_profile}}\n{{worldbook_entries}}\n{{format_example}}",
-    "group_chat.md": "{{history}}\n{{scene_meta_json}}\n{{characters_state_json}}\n用户：{{user_input}}",
+    "system.md": "系统测试模板：只使用已定义角色，不得创建角色。",
+    "group_chat.md": (
+        "场景={{scene_meta_json}}\n"
+        "用户={{user_profile_json}}\n"
+        "角色={{character_context}}\n"
+        "世界书={{worldbook_entries}}\n"
+        "历史={{history}}\n"
+        "本轮={{user_input}}"
+    ),
     "summary.md": "前情提要(必填,1-3句纯文本): ...",
 }.items():
     (TEST_PROMPTS_DIR / filename).write_text(content, encoding="utf-8")

@@ -2,8 +2,9 @@
 
 > **目的**：让下一个 AI 协作者在不询问用户的情况下，能完整理解这个项目并继续工作。
 > **创建日期**：2026-06-27
-> **最后更新**：2026-06-27
-> **当前状态**：v1 完成 + 增强功能完成（块 1-4 全部上线），浏览器可正常打开 http://localhost:8765
+> **最后更新**：2026-07-16
+> **当前状态**：阶段 A、B、C completed；阶段 D 的 PROMPT-1 completed，当前进入 MEMORY-1
+> **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
 
 ---
 
@@ -70,21 +71,19 @@ C:\local-tavern\
 ├── AI_CONTEXT.md              # ← 本文档（AI 协作者交接）
 │
 ├── core/                      # Python 核心模块
-│   ├── ollama_client.py       # Ollama 异步流式客户端（123 行）
+│   ├── ollama_client.py       # Ollama 流式客户端 + /api/show 上下文缓存
 │   ├── character_loader.py    # 角色/世界书/用户档案加载（90 行）
 │   ├── session_manager.py     # 存档管理 + 多时间线（260+ 行）
-│   ├── prompt_builder.py      # Prompt 拼装（145 行）
+│   ├── prompt_assembler.py    # ★ PROMPT-1：来源单次注入、总预算、裁剪诊断
+│   ├── token_estimator.py     # ★ PROMPT-1：可替换的保守 token 估算协议
+│   ├── prompt_builder.py      # 旧调用兼容层；运行时路由不使用
 │   ├── response_parser.py     # AI 回复解析（168 行）
 │   └── prompt_editor.py       # 提示词读写/恢复默认（65 行）
 │
 ├── prompts/                   # Prompt 模板（Markdown，可在线编辑）
 │   ├── system.md              # 全局系统提示（格式铁律）
 │   ├── group_chat.md          # 群聊轮次模板（注入上下文）
-│   ├── status_update.md       # 静默状态更新（v1 未启用）
-│   └── .default/              # 默认备份（首次启动自动生成）
-│       ├── system.md
-│       ├── group_chat.md
-│       └── status_update.md
+│   └── .default/              # 默认备份；最新 v20260716 版本与当前单次注入模板一致
 │
 ├── data/
 │   ├── characters/            # 角色卡（YAML，用户填）
@@ -121,9 +120,10 @@ C:\local-tavern\
    ↓
 [routes/chat.py: 持久化 turn API]
    ├─ load_session(session_id)
-   ├─ load_worldbook() + match_worldbook(user_input)  # 关键词触发
-   ├─ build_messages()  # 拼装 system + history + user_input
-   └─ OllamaClient.chat_stream()  # 流式调用
+   ├─ OllamaClient.get_context_limit()  # /api/show 缓存；故障时 4096 失败闭合
+   ├─ PromptAssembler.assemble()        # 单次注入 + 总预算 + 安全诊断
+   ├─ 预算通过后才创建 turn / 写 pending user
+   └─ OllamaClient.chat_stream(num_ctx=同一预算上限)  # 防止运行时窗口漂移
         ↓
    [Ollama: NDJSON 流式 chunk]
         ├─ type=thinking → 前端 thinking panel
@@ -144,10 +144,12 @@ C:\local-tavern\
 | **YAML 而非 JSON 存角色卡** | 用户要手填，YAML 注释 + 可读性更好 |
 | **原子写（tmp + rename）** | 断电/崩溃不会损坏存档 |
 | **asyncio.Lock 全局写锁** | 防并发请求互相覆盖 |
-| **history 限 20 轮（40 条）** | 控制 prompt 长度，不让首字延迟无限增长 |
+| **Prompt 10 轮/20 条，存档 40 条** | 数量上限维持不变，给快照与重生成留原文回溯余量 |
+| **总预算 = context_limit - num_predict - safety margin** | 所有可选来源逐块重算完整 messages，不能依赖 Ollama 静默截断 |
+| **运行 num_ctx 与预算上限同源** | `/api/chat.options.num_ctx` 使用本轮诊断中的 context_limit |
 | **thinking 模式默认开启** | 35B MoE 启用 thinking，质量更好 |
 | **前端无构建** | 避免 npm 依赖，用户双击 start.bat 就跑 |
-| **提示词模板 Markdown** | 程序员友好，运行时 `prompt_builder.py` 每次重读（改完下轮生效） |
+| **提示词模板 Markdown** | `PromptAssembler` 每轮重读；system 只放静态规则，group 中六类运行时数据槽各恰好一次 |
 | **.default/ 备份目录** | 用户改坏提示词能一键恢复 |
 
 ---
@@ -200,7 +202,7 @@ C:\local-tavern\
 按重要性排：
 
 1. **`prompts/system.md`** —— AI 行为铁律，改格式/规则改这里
-2. **`core/prompt_builder.py`** —— prompt 怎么拼装，变量替换逻辑
+2. **`core/prompt_assembler.py` + `core/token_estimator.py`** —— Prompt 总预算、裁剪顺序、诊断与估算规则
 3. **`core/response_parser.py`** —— 解析 AI 输出的正则，加字段改这里
 4. **`routes/chat.py` 与 `core/chat_turns.py`** —— 持久回合 API 与后台生成状态机
 5. **`web/app.mjs` 与 `web/*.mjs`** —— 前端组合、领域服务与持久 SSE 回合处理
@@ -270,7 +272,7 @@ active: true              # 是否默认出场
 
 **强制点**：每轮回复必须含：
 1. **场景元数据条**（📍 开头，至少含 location）
-2. **至少 2 个出场角色的完整状态卡**（🎭 开头）
+2. **0 到 min(3, 当前活跃角色数) 个真实出场角色状态卡**（🎭 开头）；无活跃角色时严禁创建角色
 3. **3 个不同风格的行动建议**（💡 行动建议 开头）
 
 `response_parser.py` 的正则假设上述格式。如改格式，**必须同步改 parser**。
@@ -287,23 +289,15 @@ active: true              # 是否默认出场
 | **存档并发写损坏** | 两个请求同时触发保存 | `asyncio.Lock` 串行化；`_atomic_write` 原子写 |
 | **重生成逻辑死循环** | 反复重生失败 | 重生成前自动 snapshot 到 `.history/`，可手动恢复 |
 | **删光全部会话** | 误操作 | 后端保护：至少保留 1 个会话 |
-| **提示词改坏** | 输出完全乱 | `.default/` 备份 + Web 一键恢复 |
+| **提示词改坏或重复数据槽** | 发送前返回 `prompt_template_invalid` 422 | 六类运行时数据槽必须各恰好一次；`.default/` 最新备份可恢复 |
+| **Prompt 超预算** | 发送前返回 `prompt_budget_exceeded` 422 | 诊断只含来源、稳定 ID、估算量、保留/裁剪原因，不含正文；不会创建 turn、快照或 pending user |
 | **GBK 编码报错** | PowerShell/curl 处理中文 | 用 UTF-8 模式 (`python -X utf8`)；测试用 PowerShell `Invoke-WebRequest` |
 
 ---
 
 ## 10. 待办 / 未实现
 
-按重要性：
-
-| 优先级 | 项 | 说明 |
-|--------|-----|------|
-| 中 | 模型参数面板（temperature, top_p 等） | Ollama 客户端已支持，server.py 硬编码；缺前端 UI |
-| 中 | 角色/世界书创建 Web 表单 | 现在只能手填 YAML |
-| 中 | 存档版本历史 UI | API 已实现（snapshot/list/restore），前端没"🕐 历史"按钮 |
-| 低 | 状态卡扩展 | `status_update.md` 模板已有，server 没实现静默调用 |
-| 低 | 多 LLM 分工（GM 用 35B + NPC 用 14B） | 可做但用户没要求 |
-| 低 | TTS / SD 图像 | 用户没要求 |
+完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。当前依赖顺序为 `MEMORY-1 → WORLD-1 → ROLE-1 → 阶段 E`。
 
 ---
 
@@ -344,10 +338,11 @@ active: true              # 是否默认出场
 | 文件 | 行数 |
 |------|------|
 | `server.py` | ~500 |
-| `core/ollama_client.py` | 123 |
+| `core/ollama_client.py` | Ollama 流式、上下文发现与缓存 |
 | `core/character_loader.py` | 90 |
 | `core/session_manager.py` | ~260 |
-| `core/prompt_builder.py` | 145 |
+| `core/prompt_assembler.py` / `core/token_estimator.py` | Prompt 预算与估算 |
+| `core/prompt_builder.py` | 兼容入口 |
 | `core/response_parser.py` | 168 |
 | `core/prompt_editor.py` | 65 |
 | `prompts/system.md` | 69 |
@@ -369,7 +364,7 @@ active: true              # 是否默认出场
 ## 14. 下次接手时建议先做的事
 
 1. **读 `prompts/system.md`** — 理解 AI 行为约束
-2. **读 `core/prompt_builder.py` + `core/response_parser.py`** — 理解数据流
+2. **读 `core/prompt_assembler.py` + `core/response_parser.py`** — 理解预算化 Prompt 与解析数据流
 3. **启动 server**（`cd C:\local-tavern && python -m uvicorn server:app --port 8765`），看 `http://localhost:8765`
 4. **确认 Ollama 在跑**（`ollama ps`）
 5. **如果用户说"X 不工作"**，先 curl 测 API → 看 server 日志 → 看前端 console
@@ -377,6 +372,6 @@ active: true              # 是否默认出场
 
 ---
 
-**最后更新**：2026-07-16  FE-2 原生 ES modules
+**最后更新**：2026-07-16  PROMPT-1 总预算、单次注入与安全诊断
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目

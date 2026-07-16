@@ -58,7 +58,17 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
     turn_id = turn["turn_id"]
     assert turn["status"] == "pending"
     assert turn["accepted_revision"] == 1
+    diagnostics = turn["prompt_diagnostics"]
+    assert diagnostics["context_limit_source"] == "fake_model_metadata"
+    assert diagnostics["estimated_prompt_tokens"] <= diagnostics["input_budget_tokens"]
+    assert all(
+        set(source) == {"source", "id", "estimated_tokens", "kept", "reason"}
+        for source in diagnostics["sources"]
+    )
+    assert "持久 turn 测试" not in json.dumps(diagnostics, ensure_ascii=False)
     await asyncio.wait_for(fake_ollama.entered.wait(), timeout=1)
+    assert turn["parameters"]["num_ctx"] == diagnostics["context_limit"]
+    assert fake_ollama.chat_calls[-1]["num_ctx"] == diagnostics["context_limit"]
 
     pending_session = (await app_client.get("/api/session", params={
         "project": project,
@@ -79,6 +89,7 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
     assert terminal["status"] == "completed"
     assert terminal["error"] is None
     assert terminal["session_revision"] == 2
+    assert terminal["prompt_diagnostics"] == diagnostics
 
     stream = await app_client.get(f"/api/chat/turns/{turn_id}/events")
     assert stream.status_code == 200

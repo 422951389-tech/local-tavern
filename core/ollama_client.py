@@ -6,14 +6,20 @@
 - 错误重试
 - 模型切换
 """
+import asyncio
 import json
 import logging
 import re
+import time
 from typing import AsyncIterator, Optional
 
 import httpx
 
-from core.config import OLLAMA_HOST
+from core.config import (
+    MODEL_CONTEXT_CACHE_SECONDS,
+    OLLAMA_HOST,
+    PROMPT_CONTEXT_FALLBACK,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,8 @@ class OllamaClient:
         self.host = host
         self._client: Optional[httpx.AsyncClient] = None
         self._warned_json_parse = False
+        self._context_limit_cache: dict[str, tuple[float, dict]] = {}
+        self._context_limit_lock = asyncio.Lock()
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -50,6 +58,93 @@ class OllamaClient:
             logger.error("列出模型失败: %s", e)
             return []
 
+    @staticmethod
+    def _valid_context_limit(value: object) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if isinstance(value, float) and not value.is_integer():
+            return None
+        parsed = int(value)
+        if not 256 <= parsed <= 1_048_576:
+            return None
+        return parsed
+
+    @classmethod
+    def _context_limit_from_show(cls, payload: object) -> tuple[int, str] | None:
+        if not isinstance(payload, dict):
+            return None
+        model_info = payload.get("model_info")
+        info_limit: int | None = None
+        if isinstance(model_info, dict):
+            architecture = model_info.get("general.architecture")
+            if isinstance(architecture, str) and architecture:
+                info_limit = cls._valid_context_limit(
+                    model_info.get(f"{architecture}.context_length")
+                )
+            if info_limit is None:
+                candidates = [
+                    parsed
+                    for key, value in model_info.items()
+                    if isinstance(key, str)
+                    and key.endswith(".context_length")
+                    and not any(part in key.casefold() for part in ("vision", "clip"))
+                    and (parsed := cls._valid_context_limit(value)) is not None
+                ]
+                if candidates:
+                    info_limit = max(candidates)
+
+        parameter_limit: int | None = None
+        parameters = payload.get("parameters")
+        if isinstance(parameters, str):
+            match = re.search(r"(?m)^\s*num_ctx\s+([0-9]+)\s*$", parameters)
+            if match:
+                parameter_limit = cls._valid_context_limit(int(match.group(1)))
+
+        if parameter_limit is not None:
+            if info_limit is not None:
+                parameter_limit = min(parameter_limit, info_limit)
+            return parameter_limit, "ollama_show_parameters"
+        if info_limit is not None:
+            return info_limit, "ollama_show_model_info"
+        return None
+
+    async def get_context_limit(self, model: str) -> dict:
+        """读取并缓存模型上下文上限；任何元数据故障都返回配置回退值。"""
+
+        now = time.monotonic()
+        cached = self._context_limit_cache.get(model)
+        if cached and cached[0] > now:
+            return dict(cached[1])
+
+        async with self._context_limit_lock:
+            now = time.monotonic()
+            cached = self._context_limit_cache.get(model)
+            if cached and cached[0] > now:
+                return dict(cached[1])
+
+            result = {
+                "context_limit": PROMPT_CONTEXT_FALLBACK,
+                "source": "fallback_default",
+            }
+            client = await self._ensure_client()
+            try:
+                response = await client.post("/api/show", json={"model": model})
+                response.raise_for_status()
+                parsed = self._context_limit_from_show(response.json())
+                if parsed is not None:
+                    result = {"context_limit": parsed[0], "source": parsed[1]}
+            except Exception as exc:
+                logger.warning(
+                    "读取模型上下文上限失败，使用配置回退: %s",
+                    type(exc).__name__,
+                )
+
+            self._context_limit_cache[model] = (
+                now + MODEL_CONTEXT_CACHE_SECONDS,
+                dict(result),
+            )
+            return result
+
     async def chat_stream(
         self,
         model: str,
@@ -59,6 +154,7 @@ class OllamaClient:
         temperature: float = 0.8,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        num_ctx: Optional[int] = None,
     ) -> AsyncIterator[dict]:
         """流式调用 /api/chat
 
@@ -73,6 +169,8 @@ class OllamaClient:
             "num_predict": num_predict,
             "temperature": temperature,
         }
+        if num_ctx is not None:
+            options["num_ctx"] = num_ctx
         # top_p/top_k 仅在显式传入时透传，避免覆盖 Ollama 默认行为
         if top_p is not None:
             options["top_p"] = top_p

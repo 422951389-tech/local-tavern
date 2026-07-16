@@ -59,6 +59,28 @@ def _configured_bool(env_name: str, default: bool) -> bool:
     raise ValueError(f"{env_name} 必须是 true/false 或 1/0")
 
 
+# Prompt 总预算。模型上限优先由 Ollama /api/show 获取；获取失败时使用保守回退。
+# 输出预算与安全余量始终先从上下文上限中扣除，不能依赖 Ollama 静默截断输入。
+PROMPT_CONTEXT_FALLBACK = _configured_int(
+    "TAVERN_PROMPT_CONTEXT_FALLBACK",
+    4096,
+    minimum=4096,
+    maximum=1_048_576,
+)
+PROMPT_SAFETY_MARGIN = _configured_int(
+    "TAVERN_PROMPT_SAFETY_MARGIN",
+    1024,
+    minimum=128,
+    maximum=32768,
+)
+MODEL_CONTEXT_CACHE_SECONDS = _configured_int(
+    "TAVERN_MODEL_CONTEXT_CACHE_SECONDS",
+    300,
+    minimum=1,
+    maximum=86400,
+)
+
+
 # 项目根目录与关键子路径。
 # 测试进程在导入应用前注入 TAVERN_* 路径，生产环境不设变量时行为不变。
 BASE_DIR = _configured_path("TAVERN_BASE_DIR", Path("C:/local-tavern"))

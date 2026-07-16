@@ -18,7 +18,11 @@ from core.message_commands import (
     MessageNotFound,
     plan_message_regeneration,
 )
-from core.prompt_builder import build_messages
+from core.prompt_assembler import (
+    PromptAssembler,
+    PromptBudgetExceeded,
+    PromptTemplateInvalid,
+)
 from core.response_parser import parse_response, check_voice_confusion
 from core.session_manager import (
     RevisionConflict,
@@ -43,6 +47,7 @@ from routes.common import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 _summary_tasks: set[asyncio.Task] = set()
+_prompt_assembler = PromptAssembler()
 
 
 async def shutdown_chat_background_tasks() -> None:
@@ -150,7 +155,8 @@ async def _prepare_turn(
     if not model:
         raise HTTPException(400, "未指定模型")
 
-    available = await get_client().list_models()
+    ollama = get_client()
+    available = await ollama.list_models()
     if model not in available:
         raise HTTPException(400, f"模型 {model} 不可用。可用：{available}")
 
@@ -176,6 +182,26 @@ async def _prepare_turn(
         else session.get("message_history", [])
     )
 
+    context_info = await ollama.get_context_limit(model)
+    try:
+        assembly = _prompt_assembler.assemble(
+            user_input=user_text,
+            characters=characters,
+            characters_state=session.get("characters_state", {}),
+            scene_meta=session.get("scene_meta", {}),
+            user_profile=user_profile,
+            worldbook_entries=wb_entries,
+            history=history,
+            summaries=session.get("summaries", []),
+            context_limit=context_info["context_limit"],
+            context_limit_source=context_info["source"],
+            num_predict=params["num_predict"],
+        )
+    except (PromptBudgetExceeded, PromptTemplateInvalid) as exc:
+        raise HTTPException(422, detail=exc.as_detail()) from exc
+    # 与预算计算共用同一有效窗口，禁止 Ollama 按更小默认 num_ctx 静默截断。
+    params["num_ctx"] = assembly.diagnostics["context_limit"]
+
     return {
         "project": project,
         "save": save,
@@ -186,16 +212,8 @@ async def _prepare_turn(
         "session": deepcopy(session),
         "characters": characters,
         "char_name_to_cid": char_name_to_cid,
-        "messages": build_messages(
-            user_input=user_text,
-            characters=characters,
-            characters_state=session.get("characters_state", {}),
-            scene_meta=session.get("scene_meta", {}),
-            user_profile=user_profile,
-            worldbook_entries=wb_entries,
-            history=history,
-            summaries=session.get("summaries", []),
-        ),
+        "messages": assembly.messages,
+        "prompt_diagnostics": assembly.diagnostics,
     }
 
 
@@ -703,6 +721,7 @@ def _turn_worker(prepared: dict):
                 messages=prepared["messages"],
                 think=prepared["params"]["think"],
                 num_predict=prepared["params"]["num_predict"],
+                num_ctx=prepared["params"]["num_ctx"],
                 temperature=prepared["params"]["temperature"],
                 top_p=prepared["params"]["top_p"],
                 top_k=prepared["params"]["top_k"],
@@ -814,6 +833,7 @@ async def _start_turn(req: ChatRequest) -> dict:
             initial_session=prepared["session"],
             accepted_callback=accepted,
             worker=_turn_worker(prepared),
+            prompt_diagnostics=prepared["prompt_diagnostics"],
         )
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
@@ -877,6 +897,7 @@ async def _start_regenerated_turn(req: RegenerateRequest) -> dict:
             accepted_callback=accepted,
             worker=_turn_worker(prepared),
             accept_command=accept_command,
+            prompt_diagnostics=prepared["prompt_diagnostics"],
         )
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)

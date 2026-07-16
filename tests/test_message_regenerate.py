@@ -364,6 +364,56 @@ async def test_regenerate_is_one_snapshot_reuses_uuid_and_keeps_only_pinned_suff
     assert finalized_by_id[messages[3]["id"]]["pinned"] is True
 
 
+@pytest.mark.asyncio
+async def test_regenerate_budget_rejection_has_zero_turn_session_snapshot_or_model_write(
+    app_client,
+    fake_ollama,
+    seed_project,
+    monkeypatch,
+):
+    project = "regen_prompt_budget_rejection"
+    source_marker = "REGENERATE_BUDGET_SECRET_SENTINEL"
+    created, messages = await _seed_history(seed_project, project, [
+        {"role": "user", "content": source_marker},
+        {"role": "assistant", "content": "旧回复"},
+    ])
+    before_session = deepcopy(created)
+    before_snapshots = _snapshot_paths(project)
+    coordinator = get_turn_coordinator()
+    before_turn_ids = coordinator.store.list_turn_ids()
+    store = get_session_store()
+    original_write = store._write_session_sync
+    writes = 0
+
+    def count_write(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_write_session_sync", count_write)
+    fake_ollama.context_limits[MODEL] = {
+        "context_limit": 512,
+        "source": "fake_too_small",
+    }
+
+    response = await _regenerate(
+        app_client,
+        project=project,
+        message_id=messages[1]["id"],
+        expected_revision=created["revision"],
+    )
+
+    assert response.status_code == 422, response.text
+    assert _error_code(response) == "prompt_budget_exceeded"
+    assert source_marker not in response.text
+    assert writes == 0
+    assert fake_ollama.chat_calls == []
+    assert fake_ollama.summary_calls == []
+    assert get_session_store().read_sync(project, SAVE) == before_session
+    assert _snapshot_paths(project) == before_snapshots
+    assert coordinator.store.list_turn_ids() == before_turn_ids
+
+
 @pytest.mark.parametrize(
     ("case", "expected_status", "expected_code"),
     [
