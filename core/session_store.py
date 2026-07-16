@@ -32,6 +32,7 @@ from core.recovery_store import (
     RecoveryStore,
     sha256_file,
 )
+from core.worldbook_policy import MAX_MANUAL_WORLDBOOK_IDS
 
 
 T = TypeVar("T")
@@ -158,6 +159,19 @@ def normalize_session(session: dict, project: str, save_id: str) -> dict:
     session["project"] = project
     session["session_id"] = save_id
     session["revision"] = _coerce_revision(session.get("revision", 0))
+    manual_worldbook_ids = session.get("manual_worldbook_ids", [])
+    normalized_manual_ids: set[str] = set()
+    if isinstance(manual_worldbook_ids, list):
+        for entry_id in manual_worldbook_ids:
+            try:
+                normalized_manual_ids.add(
+                    validate_file_id(entry_id, label="手动世界书条目 ID")
+                )
+            except (TypeError, ValueError):
+                continue
+    session["manual_worldbook_ids"] = sorted(normalized_manual_ids)[
+        :MAX_MANUAL_WORLDBOOK_IDS
+    ]
     summaries = session.setdefault("summaries", [])
     if not isinstance(summaries, list):
         summaries = []

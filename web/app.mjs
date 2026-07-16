@@ -13,6 +13,11 @@ import { createSummaryService, summaryPatchFromForm } from './summaries.mjs';
 import { renderSummaryPanelView } from './summary-panel.mjs';
 import { createPromptService, promptTabTargetIndex } from './prompt-editor.mjs';
 import { affinityBar, createMessageElement } from './render.mjs';
+import {
+    createWorldbookEditor,
+    createWorldbookService,
+    sanitizeWorldbookDiagnostics,
+} from './worldbook.mjs';
 
 // 本地酒馆 — 前端逻辑 v2（项目+存档双层架构）
 // 流式对话、角色卡渲染、行动建议、会话管理、提示词编辑
@@ -66,10 +71,12 @@ const API = {
     summaryRegen: '/api/session/summary/regenerate',
     // 角色/世界书/用户
     characterSchema: '/api/schema/character',
+    worldbookSchema: '/api/schema/worldbook',
     characterSave: (id) => `/api/characters/${encodeURIComponent(id)}`,
     characterDelete: (id) => `/api/characters/${encodeURIComponent(id)}`,
     worldbookSave: (id) => `/api/worldbook/${encodeURIComponent(id)}`,
     worldbookDelete: (id) => `/api/worldbook/${encodeURIComponent(id)}`,
+    worldbookManual: '/api/session/worldbook/manual',
     userSave: '/api/user',
     userDelete: '/api/user',
     settings: '/api/settings',
@@ -91,6 +98,7 @@ const state = {
     activeTurn: null,
     selectedSummaryId: null,
     summaryPanelExpanded: false,
+    lastWorldbookDiagnostics: null,
     modelParams: {
         temperature: 0.8,
         top_p: 0.9,
@@ -104,6 +112,7 @@ const projectService = createProjectService(apiClient, API);
 const saveService = createSaveService(apiClient, API);
 const promptService = createPromptService(apiClient, API);
 const summaryService = createSummaryService(sessionWrite, API);
+const worldbookService = createWorldbookService(apiClient, sessionWrite, API);
 const turnPersistence = createTurnPersistence(sessionStorage);
 const modalController = createModalController(
     modalElementsFromDocument(document),
@@ -138,10 +147,54 @@ function isCurrentSessionRef(ref) {
     return sessionRefs.isCurrent(ref);
 }
 
+function rememberWorldbookDiagnostics(ref, promptDiagnostics) {
+    if (!ref || !isCurrentSessionRef(ref)) return [];
+    const entries = sanitizeWorldbookDiagnostics(promptDiagnostics);
+    state.lastWorldbookDiagnostics = Object.freeze({
+        project: ref.project,
+        save: ref.save,
+        epoch: ref.epoch,
+        entries: Object.freeze(entries),
+    });
+    return entries;
+}
+
+function worldbookDiagnosticsForRef(ref) {
+    const cached = state.lastWorldbookDiagnostics;
+    if (!cached || !ref) return [];
+    if (cached.project !== ref.project || cached.save !== ref.save || cached.epoch !== ref.epoch) return [];
+    return cached.entries;
+}
+
+function hasWorldbookDiagnosticsForRef(ref) {
+    const cached = state.lastWorldbookDiagnostics;
+    return Boolean(cached && ref
+        && cached.project === ref.project
+        && cached.save === ref.save
+        && cached.epoch === ref.epoch);
+}
+
+async function loadLatestWorldbookDiagnostics(ref) {
+    if (hasWorldbookDiagnosticsForRef(ref)) return worldbookDiagnosticsForRef(ref);
+    if (!isCurrentSessionRef(ref) || !sessionBelongsToRef(state.session, ref)) return [];
+    const latest = [...(state.session.message_history || [])].reverse().find(message => (
+        message && typeof message.turn_id === 'string' && message.turn_id
+    ));
+    if (!latest) return [];
+    try {
+        const turn = await turnClient.get(latest.turn_id);
+        if (!isCurrentSessionRef(ref) || turn.project !== ref.project || turn.save !== ref.save) return [];
+        return rememberWorldbookDiagnostics(ref, turn.prompt_diagnostics);
+    } catch (error) {
+        console.warn('读取上轮世界书诊断失败', error);
+        return [];
+    }
+}
+
 function setNavigationUiState(active) {
     state.navigationBusy = active;
     const blocked = active || Boolean(state.activeTurn && !state.activeTurn.terminal);
-    for (const id of ['project-btn', 'tab-saves', 'model-select', 'reset-btn']) {
+    for (const id of ['project-btn', 'tab-world', 'tab-saves', 'model-select', 'reset-btn']) {
         const element = document.getElementById(id);
         if (!element) continue;
         if ('disabled' in element) element.disabled = blocked;
@@ -154,6 +207,7 @@ function beginSessionTransition(project, save = null) {
     cancelSummaryWatchers();
     state.selectedSummaryId = null;
     state.summaryPanelExpanded = false;
+    state.lastWorldbookDiagnostics = null;
     setNavigationUiState(true);
     return sessionRefs.advance(project, save);
 }
@@ -1269,11 +1323,12 @@ function setTurnUiState(active, cancelling = false) {
     }
 
     const selectors = [
-        '#project-btn', '#tab-saves', '#model-select', '#reset-btn',
+        '#project-btn', '#tab-world', '#tab-saves', '#model-select', '#reset-btn',
         '#save-new-inline', '#save-rename-inline', '#save-delete-inline',
         '#save-import-inline', '#history-btn',
         '.msg-action-btn', '.msg-checkbox',
         '.history-restore', '.ce-save', '.ce-delete',
+        '.worldbook-write-control',
     ];
     document.querySelectorAll(selectors.join(',')).forEach(element => {
         if ('disabled' in element) element.disabled = active;
@@ -1323,6 +1378,7 @@ function installActiveTurn(turn, ref, options = {}) {
         targetEl: options.targetEl || null,
         cancelling: false,
     };
+    if (base.promptDiagnostics) rememberWorldbookDiagnostics(ref, base.promptDiagnostics);
     persistActiveTurn();
     setTurnUiState(true, false);
     return state.activeTurn;
@@ -1354,15 +1410,22 @@ function updateActiveTurnFromMeta(meta) {
     const active = state.activeTurn;
     if (!active || active.turnId !== meta.turn_id) return false;
     const terminal = TERMINAL_STATUSES.includes(meta.status);
+    const promptDiagnostics = meta.prompt_diagnostics
+        && typeof meta.prompt_diagnostics === 'object'
+        && !Array.isArray(meta.prompt_diagnostics)
+        ? meta.prompt_diagnostics
+        : active.promptDiagnostics;
     state.activeTurn = {
         ...active,
         status: meta.status,
         content: terminal && typeof meta.content === 'string' ? meta.content : active.content,
         thinking: terminal && typeof meta.thinking === 'string' ? meta.thinking : active.thinking,
         error: meta.error || null,
+        promptDiagnostics,
         terminal,
         terminalCount: terminal ? Math.max(1, active.terminalCount) : active.terminalCount,
     };
+    if (promptDiagnostics) rememberWorldbookDiagnostics(active.ref, promptDiagnostics);
     persistActiveTurn();
     renderActiveTurnBuffer();
     return true;
@@ -2032,30 +2095,75 @@ async function openCharactersEditor() {
 
 async function openWorldbookEditor() {
     const editorRef = captureSessionRef();
-    await createCardEditor({
-        title: '📖 世界书 — 当前世界观的设定',
-        listApi: `${API.worldbook}?project=${encodeURIComponent(editorRef.project)}`,
-        listKey: 'entries',
-        saveApi: (id) => `${API.worldbookSave(id)}?project=${encodeURIComponent(editorRef.project)}`,
-        deleteApi: (id) => `${API.worldbookDelete(id)}?project=${encodeURIComponent(editorRef.project)}`,
-        project: editorRef.project,
-        sessionRef: editorRef,
-        allowNew: true,
-        idField: 'id',
-        idLabel: '条目名（英文）',
-        prefix: 'world',
-        buildGroups: (w) => {
-            w = w || {};
-            const groups = [
-                { key: '_basic', label: '基本信息', builtin: true, fields: [
-                    { key: 'id', label: '条目名（英文）', type: 'text', builtin: true, required: true, placeholder: '比如：qinglong_shanghui' },
-                    { key: 'enabled', label: '启用此设定', type: 'checkbox', builtin: true, checkboxLabel: '勾选后 AI 就会加载这条设定' },
-                    { key: 'content', label: '设定内容', type: 'textarea', builtin: true, rows: 6, placeholder: 'AI 开局就会知道的设定...' },
-                ]},
-            ];
-            return groupsWithCustomFields(groups, w, { key: '_custom', label: '自定义字段' });
+    if (state.navigationBusy || !sessionBelongsToRef(state.session, editorRef)) {
+        showToast('当前存档尚未加载完成');
+        return;
+    }
+    if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+        showToast('当前存档正在生成，请先取消或等待完成');
+        return;
+    }
+    let entries;
+    let diagnostics;
+    let schema;
+    try {
+        [schema, entries, diagnostics] = await Promise.all([
+            worldbookService.schema(),
+            worldbookService.list(editorRef.project),
+            loadLatestWorldbookDiagnostics(editorRef),
+        ]);
+    } catch (error) {
+        showToast(`加载世界书失败：${errorDetail(error)}`, 3500);
+        return;
+    }
+    if (!isCurrentSessionRef(editorRef) || !sessionBelongsToRef(state.session, editorRef)) return;
+    // 加载期间 turn 可能已启动；DOM 尚不存在时全局禁用器无法覆盖新控件，
+    // 因此在构造编辑器前再次封闭竞态窗口。
+    if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+        showToast('加载世界书期间已开始生成，请等待完成后重试');
+        return;
+    }
+
+    const editor = createWorldbookEditor({
+        documentRef: document,
+        schema,
+        entries,
+        manualIds: state.session.manual_worldbook_ids || [],
+        diagnostics,
+        disabled: false,
+        onPendingChange: pending => modalController.setPending(pending),
+        confirmDelete: entryId => confirm(`确定删除世界书条目「${entryId}」吗？删除后将移入回收区，可以恢复。`),
+        onSaveEntry: async (data, context) => {
+            if (!isCurrentSessionRef(editorRef)) throw new Error('当前项目或存档已切换，请重新打开编辑器');
+            if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+                throw new Error('当前存档正在生成，请先取消或等待完成');
+            }
+            if (!context.isNew && context.originalId !== data.id) {
+                throw new Error('已有世界书 ID 不可直接修改');
+            }
+            await worldbookService.save(editorRef.project, data.id, data);
+            if (!isCurrentSessionRef(editorRef)) throw new Error('保存完成，但当前存档已切换');
+            return worldbookService.list(editorRef.project);
+        },
+        onDeleteEntry: async entryId => {
+            if (!isCurrentSessionRef(editorRef)) throw new Error('当前项目或存档已切换，请重新打开编辑器');
+            if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+                throw new Error('当前存档正在生成，请先取消或等待完成');
+            }
+            const result = await worldbookService.remove(editorRef.project, entryId);
+            if (!isCurrentSessionRef(editorRef)) throw new Error('删除完成，但当前存档已切换');
+            const returnedSession = sessionFromResult(result);
+            if (returnedSession && sessionBelongsToRef(returnedSession, editorRef)) {
+                commitSessionState(returnedSession, editorRef);
+            }
+            return worldbookService.list(editorRef.project);
+        },
+        onSaveManual: async entryIds => {
+            if (!isCurrentSessionRef(editorRef)) throw new Error('当前项目或存档已切换，请重新打开编辑器');
+            return worldbookService.saveManual(editorRef, entryIds);
         },
     });
+    showModal({ title: '📖 世界书 — 触发与预算', body: editor.root });
 }
 
 async function openUserEditor() {

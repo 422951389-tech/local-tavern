@@ -1,6 +1,7 @@
 """PROMPT-1：单次来源注入、总预算与原子拒绝契约。"""
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
@@ -51,6 +52,7 @@ def _assemble(
     characters: list[dict] | None = None,
     characters_state: dict | None = None,
     worldbook_entries: list[dict] | None = None,
+    manual_worldbook_ids: list[str] | None = None,
     history: list[dict] | None = None,
     summaries: list[dict] | None = None,
     user_input: str = "INPUT",
@@ -70,6 +72,7 @@ def _assemble(
         context_limit=context_limit,
         context_limit_source="test_context_limit",
         num_predict=num_predict,
+        manual_worldbook_ids=manual_worldbook_ids,
         safety_margin=safety_margin,
     )
 
@@ -284,6 +287,133 @@ def test_optional_growth_is_trimmed_with_body_free_diagnostics(tmp_path):
         ), source_name
 
 
+def test_worldbook_activation_controls_injection_and_body_free_diagnostics(tmp_path):
+    assembler = _test_assembler(tmp_path)
+    assembly = _assemble(
+        assembler,
+        user_input="RAW_USER_CONTEXT trigger",
+        worldbook_entries=[
+            {
+                "id": "legacy",
+                "content": "LEGACY_BODY",
+                "keys": ["LEGACY_CONTROL_SENTINEL"],
+                "constant": False,
+                "position": "CONTROL_POSITION_SENTINEL",
+            },
+            {
+                "id": "keyword_hit",
+                "activation": "keywords",
+                "keywords": ["trigger"],
+                "priority": 10,
+                "content": "KEYWORD_HIT_BODY",
+            },
+            {
+                "id": "keyword_miss",
+                "activation": "keywords",
+                "keywords": ["absent"],
+                "content": "KEYWORD_MISS_BODY",
+            },
+            {
+                "id": "manual_on",
+                "activation": "manual",
+                "content": "MANUAL_ON_BODY",
+            },
+            {
+                "id": "manual_off",
+                "activation": "manual",
+                "content": "MANUAL_OFF_BODY",
+            },
+            {
+                "id": "disabled",
+                "activation": "always",
+                "enabled": False,
+                "content": "DISABLED_BODY",
+            },
+        ],
+        manual_worldbook_ids=["manual_on"],
+    )
+
+    content = _all_content(assembly)
+    for marker in ("LEGACY_BODY", "KEYWORD_HIT_BODY", "MANUAL_ON_BODY"):
+        assert content.count(marker) == 1
+    for marker in ("KEYWORD_MISS_BODY", "MANUAL_OFF_BODY", "DISABLED_BODY"):
+        assert marker not in content
+    assert "LEGACY_CONTROL_SENTINEL" not in content
+    assert "CONTROL_POSITION_SENTINEL" not in content
+
+    diagnostics = assembly.diagnostics
+    assert diagnostics["schema_version"] == 2
+    assert all(set(source) == SOURCE_KEYS for source in diagnostics["sources"])
+    matches = {item["id"]: item for item in diagnostics["worldbook_matches"]}
+    assert matches["legacy"]["trigger"] == "legacy_always"
+    assert matches["keyword_hit"]["matched_keywords"] == ["trigger"]
+    assert matches["keyword_hit"]["matched_sources"] == [{
+        "scope": "current_input",
+        "ref": "current_input",
+        "turn_distance": 0,
+    }]
+    assert matches["manual_on"]["kept"] is True
+    assert matches["keyword_miss"]["reason"] == "keyword_not_matched"
+    assert matches["manual_off"]["reason"] == "manual_not_selected"
+    assert matches["disabled"]["reason"] == "disabled"
+    serialized = json.dumps(diagnostics, ensure_ascii=False)
+    assert "RAW_USER_CONTEXT trigger" not in serialized
+    for marker in (
+        "LEGACY_BODY",
+        "KEYWORD_HIT_BODY",
+        "KEYWORD_MISS_BODY",
+        "MANUAL_ON_BODY",
+        "MANUAL_OFF_BODY",
+        "DISABLED_BODY",
+    ):
+        assert marker not in serialized
+
+
+def test_ranked_large_worldbook_can_fail_then_smaller_candidate_uses_budget(tmp_path):
+    assembler = _test_assembler(tmp_path)
+    small = {
+        "id": "small",
+        "activation": "always",
+        "priority": 0,
+        "content": "SMALL_BODY",
+    }
+    large = {
+        "id": "large",
+        "activation": "always",
+        "priority": 100,
+        "content": "LARGE_BODY_" + ("X" * 2_000),
+    }
+    num_predict = 64
+    safety_margin = 128
+    small_only = _assemble(
+        assembler,
+        worldbook_entries=[small],
+        num_predict=num_predict,
+        safety_margin=safety_margin,
+    )
+    exact_small_budget = small_only.diagnostics["estimated_prompt_tokens"]
+
+    assembly = _assemble(
+        assembler,
+        # 反转输入顺序，证明业务排序不依赖文件/数组顺序。
+        worldbook_entries=[small, large],
+        context_limit=exact_small_budget + num_predict + safety_margin,
+        num_predict=num_predict,
+        safety_margin=safety_margin,
+    )
+
+    content = _all_content(assembly)
+    assert "LARGE_BODY" not in content
+    assert content.count("SMALL_BODY") == 1
+    matches = {item["id"]: item for item in assembly.diagnostics["worldbook_matches"]}
+    assert matches["large"]["rank"] == 1
+    assert matches["large"]["kept"] is False
+    assert matches["large"]["reason"] == "budget_exceeded"
+    assert matches["small"]["rank"] == 2
+    assert matches["small"]["kept"] is True
+    assert assembly.diagnostics["estimated_prompt_tokens"] <= exact_small_budget
+
+
 @pytest.mark.parametrize("character_count", [0, 1, 4], ids=["zero", "one", "many"])
 def test_production_prompt_uses_only_the_zero_one_or_many_real_characters(character_count):
     assembler = PromptAssembler(prompts_dir=REPO_ROOT / "prompts")
@@ -357,6 +487,119 @@ def test_summary_time_and_only_valid_content_enter_prompt_once(tmp_path):
     assert content.count("VALID_SUMMARY_TEXT") == 1
     assert content.count("VALID_SUMMARY_TIME") == 1
     assert "SHOULD_NOT_ENTER_PROMPT" not in content
+
+
+@pytest.mark.asyncio
+async def test_prepare_turn_uses_manual_worldbook_ids_from_effective_session(
+    fake_ollama,
+    seed_project,
+    monkeypatch,
+):
+    from routes.chat import _prepare_turn
+    from routes.common import ChatRequest, RegenerateRequest
+
+    project = seed_project("worldbook_effective_session")
+    store = get_session_store()
+    initial = store.read_sync(project, SAVE)
+
+    def seed_manual_selection(session: dict, context) -> None:
+        del context
+        session["current_model"] = MODEL
+        session["manual_worldbook_ids"] = ["manual_a"]
+
+    seeded = await mutate_session(
+        project,
+        SAVE,
+        initial["revision"],
+        seed_manual_selection,
+    )
+    entries = [
+        {"id": "manual_a", "activation": "manual", "content": "MANUAL_A_BODY"},
+        {"id": "manual_b", "activation": "manual", "content": "MANUAL_B_BODY"},
+    ]
+    monkeypatch.setattr("routes.chat.load_worldbook", lambda _project: deepcopy(entries))
+
+    prepared = await _prepare_turn(ChatRequest(
+        project=project,
+        save=SAVE,
+        user_input="普通发送",
+        model=MODEL,
+        expected_revision=seeded.session["revision"],
+    ))
+    content = "\n".join(message["content"] for message in prepared["messages"])
+    assert content.count("MANUAL_A_BODY") == 1
+    assert "MANUAL_B_BODY" not in content
+
+    override = deepcopy(seeded.session)
+    override["manual_worldbook_ids"] = ["manual_b"]
+    regenerated = await _prepare_turn(
+        RegenerateRequest(
+            project=project,
+            save=SAVE,
+            message_id=str(uuid4()),
+            model=MODEL,
+            expected_revision=seeded.session["revision"],
+        ),
+        user_text_override="重生成输入",
+        session_override=override,
+        history_override=[],
+    )
+    regenerated_content = "\n".join(
+        message["content"] for message in regenerated["messages"]
+    )
+    assert "MANUAL_A_BODY" not in regenerated_content
+    assert regenerated_content.count("MANUAL_B_BODY") == 1
+    assert fake_ollama.chat_calls == []
+    assert store.read_sync(project, SAVE) == seeded.session
+
+
+@pytest.mark.asyncio
+async def test_dormant_manual_worldbook_id_is_ignored_without_session_write(
+    fake_ollama,
+    seed_project,
+    monkeypatch,
+):
+    from routes.chat import _prepare_turn
+    from routes.common import ChatRequest
+
+    project = seed_project("worldbook_manual_reject")
+    store = get_session_store()
+    current = store.read_sync(project, SAVE)
+
+    def seed_invalid_reference(session: dict, context) -> None:
+        del context
+        session["current_model"] = MODEL
+        session["manual_worldbook_ids"] = ["deleted_manual_entry"]
+
+    seeded = await mutate_session(
+        project,
+        SAVE,
+        current["revision"],
+        seed_invalid_reference,
+    )
+    before_session = deepcopy(seeded.session)
+    write_calls: list[tuple[str, str]] = []
+    original_write = store._write_session_sync
+
+    def write_spy(session: dict, write_project: str, save_id: str) -> None:
+        write_calls.append((write_project, save_id))
+        original_write(session, write_project, save_id)
+
+    monkeypatch.setattr(store, "_write_session_sync", write_spy)
+    monkeypatch.setattr("routes.chat.load_worldbook", lambda _project: [])
+
+    prepared = await _prepare_turn(ChatRequest(
+        project=project,
+        save=SAVE,
+        user_input="dormant manual 引用不阻塞新 turn",
+        model=MODEL,
+        expected_revision=before_session["revision"],
+    ))
+
+    assert prepared["prompt_diagnostics"]["worldbook_matches"] == []
+    assert store.read_sync(project, SAVE) == before_session
+    assert fake_ollama.chat_calls == []
+    assert write_calls == []
 
 
 @pytest.mark.asyncio

@@ -311,17 +311,20 @@ class RecoveryStore:
         entity_type: str,
         project: str,
         entity_id: str,
+        suffix: str = ".yaml",
     ) -> str:
         project = cls._validate_owner_id(project, label="project")
         if entity_type not in YAML_ENTITY_TYPES:
             raise ValueError("不支持的 YAML 实体类型")
+        if suffix not in ({".yaml", ".yml"} if entity_type == "worldbook" else {".yaml"}):
+            raise RecoveryIntegrityError("YAML 恢复项扩展名与实体类型不一致")
         if entity_type == "user":
             if entity_id != "user":
                 raise RecoveryIntegrityError("user 恢复项归属不一致")
             return PurePosixPath(project, "user.yaml").as_posix()
         entity_id = cls._validate_owner_id(entity_id, label="entity_id")
         directory = "characters" if entity_type == "character" else "worldbook"
-        return PurePosixPath(project, directory, f"{entity_id}.yaml").as_posix()
+        return PurePosixPath(project, directory, f"{entity_id}{suffix}").as_posix()
 
     def _entry_dir(self, category: str, recovery_id: str) -> Path:
         category = self._validate_category(category)
@@ -529,10 +532,14 @@ class RecoveryStore:
                 ):
                     raise RecoveryIntegrityError("session 恢复项包含跨归属文件")
         elif entity_type in YAML_ENTITY_TYPES and category == "quarantine":
+            source_relpath = manifest.get("source_relpath")
+            if not isinstance(source_relpath, str):
+                raise RecoveryIntegrityError("YAML 隔离项主路径无效")
             primary = self.yaml_source_relpath(
                 entity_type=entity_type,
                 project=project,
                 entity_id=entity_id,
+                suffix=PurePosixPath(source_relpath).suffix,
             )
             if manifest.get("operation") != "parse_failure":
                 raise RecoveryIntegrityError("YAML 隔离项 operation 无效")
@@ -565,11 +572,15 @@ class RecoveryStore:
                         raise RecoveryIntegrityError("user 恢复项归属不一致")
                     primary = PurePosixPath(project, "user.yaml").as_posix()
                 else:
-                    primary = PurePosixPath(
-                        project,
-                        "worldbook",
-                        f"{entity_id}.yaml",
-                    ).as_posix()
+                    source_relpath = manifest.get("source_relpath")
+                    if not isinstance(source_relpath, str):
+                        raise RecoveryIntegrityError("世界书恢复项主路径无效")
+                    primary = self.yaml_source_relpath(
+                        entity_type="worldbook",
+                        project=project,
+                        entity_id=entity_id,
+                        suffix=PurePosixPath(source_relpath).suffix,
+                    )
                 if manifest.get("source_relpath") != primary:
                     raise RecoveryIntegrityError("恢复项主路径与实体归属不一致")
                 session_prefix = PurePosixPath(project, "saves").as_posix() + "/"
@@ -737,10 +748,16 @@ class RecoveryStore:
                 f"{entity_id}.json",
             ).as_posix()
         else:
+            source_suffix = (
+                Path(source_path).suffix.casefold()
+                if entity_type == "worldbook"
+                else ".yaml"
+            )
             expected_relpath = self.yaml_source_relpath(
                 entity_type=entity_type,
                 project=project,
                 entity_id=entity_id,
+                suffix=source_suffix,
             )
         source_path = Path(source_path)
         if self._source_relative(source_path) != expected_relpath:
@@ -1002,11 +1019,23 @@ class RecoveryStore:
                 entity_type=entity_type,
                 project=manifest["project"],
                 entity_id=manifest["entity_id"],
+                suffix=PurePosixPath(
+                    str(manifest.get("source_relpath", ""))
+                ).suffix,
             )
             if source_relpath != manifest.get("source_relpath"):
                 raise RecoveryIntegrityError("YAML 恢复目标与 manifest 归属不一致")
             item = self.item_for_source(verified, source_relpath)
             target = self.project_target_path(manifest["project"], source_relpath)
+            if entity_type == "worldbook":
+                sibling_suffix = (
+                    ".yml" if target.suffix.casefold() == ".yaml" else ".yaml"
+                )
+                if target.with_suffix(sibling_suffix).exists():
+                    raise RecoveryConflict(
+                        "世界书另一扩展目标已存在",
+                        code="target_exists",
+                    )
             if manifest["status"] == "restored":
                 if target.is_file() and sha256_file(target) == item["sha256"]:
                     return {

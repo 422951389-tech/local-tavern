@@ -53,6 +53,8 @@
             thinking: typeof turn.thinking === 'string' ? turn.thinking : '',
             parsed: null,
             error: turn.error || null,
+            // Prompt 诊断不参与持久指针；由具体视图继续做字段白名单脱敏。
+            promptDiagnostics: isObject(turn.prompt_diagnostics) ? turn.prompt_diagnostics : null,
             terminal: TERMINAL_STATUSES.includes(turn.status),
             terminalCount: TERMINAL_STATUSES.includes(turn.status) ? 1 : 0,
         };

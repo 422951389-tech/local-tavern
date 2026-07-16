@@ -4,16 +4,23 @@ from __future__ import annotations
 from core import prompt_builder
 
 
-def _build(history: list[dict]) -> list[dict]:
+def _build(
+    history: list[dict],
+    *,
+    user_input: str = "CURRENT_USER_INPUT",
+    worldbook_entries: list[dict] | None = None,
+    manual_worldbook_ids: list[str] | None = None,
+) -> list[dict]:
     return prompt_builder.build_messages(
-        user_input="CURRENT_USER_INPUT",
+        user_input=user_input,
         characters=[],
         characters_state={},
         scene_meta={},
         user_profile={},
-        worldbook_entries=[],
+        worldbook_entries=worldbook_entries or [],
         history=history,
         summaries=[],
+        manual_worldbook_ids=manual_worldbook_ids,
     )
 
 
@@ -69,3 +76,36 @@ def test_recent_and_older_pinned_messages_are_each_injected_exactly_once():
 
     assert _occurrences(messages, older_marker) == 1
     assert _occurrences(messages, recent_marker) == 1
+
+
+def test_compat_builder_uses_keyword_and_manual_activation_without_control_fields():
+    messages = _build(
+        [],
+        user_input="前往灯塔",
+        worldbook_entries=[
+            {
+                "id": "keyword",
+                "activation": "keywords",
+                "keywords": ["灯塔"],
+                "content": "KEYWORD_WORLD_BODY",
+            },
+            {
+                "id": "manual",
+                "activation": "manual",
+                "content": "MANUAL_WORLD_BODY",
+            },
+            {
+                "id": "manual_off",
+                "activation": "manual",
+                "content": "MANUAL_OFF_WORLD_BODY",
+            },
+        ],
+        manual_worldbook_ids=["manual"],
+    )
+
+    assert _occurrences(messages, "KEYWORD_WORLD_BODY") == 1
+    assert _occurrences(messages, "MANUAL_WORLD_BODY") == 1
+    assert _occurrences(messages, "MANUAL_OFF_WORLD_BODY") == 0
+    assert _occurrences(messages, '"activation"') == 0
+    assert _occurrences(messages, '"keywords"') == 0
+    assert _occurrences(messages, '"priority"') == 0

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 import yaml
 
+from core.active_turns import assert_project_write_allowed
 from core.config import DATA_DIR, PROJECTS_DIR
 from core.library_lock import library_lock
 from core.path_policy import (
@@ -32,6 +33,17 @@ from core.path_policy import (
     validate_file_id,
 )
 from core.recovery_store import DataCorruptionError
+from core.worldbook_policy import (
+    ACTIVATIONS,
+    MAX_WORLDBOOK_CONTENT_LENGTH,
+    MAX_WORLDBOOK_KEYWORD_LENGTH,
+    MAX_WORLDBOOK_KEYWORDS,
+    MAX_WORLDBOOK_PRIORITY,
+    MAX_WORLDBOOK_TITLE_LENGTH,
+    MIN_WORLDBOOK_PRIORITY,
+    WorldbookValidationError,
+    normalize_worldbook_entry,
+)
 
 ROOT_DIR = PROJECTS_DIR
 OLD_DATA_DIR = DATA_DIR  # 只读兼容别名；迁移必须通过 LegacyMigrationService 显式执行。
@@ -50,6 +62,7 @@ CHARACTER_SCHEMA = {
             "fields": [
                 {"key": "id", "label": "唯一 ID（文件名）", "type": "text", "required": True, "placeholder": "用英文/数字，如 elara", "fixed": True},
                 {"key": "name", "label": "角色名", "type": "text"},
+                {"key": "aliases", "label": "角色别名（每行一个）", "type": "textarea", "rows": 3, "array": True},
                 {"key": "tagline", "label": "一句话定位", "type": "text"},
                 {"key": "persona", "label": "详细人设", "type": "textarea", "rows": 6, "placeholder": "性格、背景、动机、说话方式..."},
             ],
@@ -89,6 +102,78 @@ CHARACTER_SCHEMA = {
         },
     ],
     "customGroup": {"key": "_custom", "label": "自定义字段"},
+}
+
+# 世界书编辑器 schema：与服务端 normalize_worldbook_entry 共用同一组字段语义。
+WORLD_BOOK_SCHEMA = {
+    "id": "worldbook",
+    "label": "世界书",
+    "groups": [
+        {
+            "key": "_basic",
+            "label": "基本信息",
+            "builtin": True,
+            "fields": [
+                {
+                    "key": "id",
+                    "label": "稳定 ID（文件名）",
+                    "type": "text",
+                    "required": True,
+                    "fixed": True,
+                    "placeholder": "例如 qinglong_shanghui",
+                },
+                {
+                    "key": "title",
+                    "label": "标题",
+                    "type": "text",
+                    "maxLength": MAX_WORLDBOOK_TITLE_LENGTH,
+                },
+                {
+                    "key": "enabled",
+                    "label": "启用此条目",
+                    "type": "checkbox",
+                    "checkboxLabel": "允许此条目参与触发",
+                },
+                {
+                    "key": "activation",
+                    "label": "触发方式",
+                    "type": "select",
+                    "required": True,
+                    "options": [
+                        {"value": "always", "label": "常驻（always）"},
+                        {"value": "keywords", "label": "关键词（keywords）"},
+                        {"value": "manual", "label": "手动（manual）"},
+                    ],
+                },
+                {
+                    "key": "keywords",
+                    "label": "触发关键词（每行一个）",
+                    "type": "textarea",
+                    "rows": 4,
+                    "array": True,
+                    "maxItems": MAX_WORLDBOOK_KEYWORDS,
+                    "itemMaxLength": MAX_WORLDBOOK_KEYWORD_LENGTH,
+                    "hint": "仅 activation=keywords 时参与匹配",
+                },
+                {
+                    "key": "priority",
+                    "label": "优先级",
+                    "type": "number",
+                    "min": MIN_WORLDBOOK_PRIORITY,
+                    "max": MAX_WORLDBOOK_PRIORITY,
+                },
+                {
+                    "key": "content",
+                    "label": "设定内容",
+                    "type": "textarea",
+                    "rows": 8,
+                    "maxLength": MAX_WORLDBOOK_CONTENT_LENGTH,
+                },
+            ],
+        },
+    ],
+    "customGroup": {"key": "_custom", "label": "自定义事实字段"},
+    "activationValues": sorted(ACTIVATIONS),
 }
 
 
@@ -138,7 +223,13 @@ def get_character_path(project: str, char_id: str) -> Path:
 
 def get_worldbook_path(project: str, entry_id: str) -> Path:
     entry_id = _safe_id(entry_id)
-    return resolve_under(get_project_dir(project), "worldbook", f"{entry_id}.yaml")
+    directory = resolve_under(get_project_dir(project), "worldbook")
+    yaml_path = resolve_under(directory, f"{entry_id}.yaml")
+    yml_path = resolve_under(directory, f"{entry_id}.yml")
+    existing = [path for path in (yaml_path, yml_path) if path.is_file()]
+    if len(existing) > 1:
+        raise ValueError(f"世界书条目 {entry_id} 同时存在 .yaml 与 .yml")
+    return existing[0] if existing else yaml_path
 
 
 def get_user_profile_path(project: str) -> Path:
@@ -332,36 +423,68 @@ def delete_character(project: str, char_id: str, session: dict = None) -> bool:
 # ========== 世界书 ==========
 
 def load_worldbook(project: str) -> list[dict]:
-    d = resolve_under(get_project_dir(project), "worldbook")
+    project_dir = get_project_dir(project)
+    if not project_dir.is_dir():
+        raise FileNotFoundError(f"项目 {project} 不存在")
+    d = resolve_under(project_dir, "worldbook")
     if not d.exists():
         return []
     entries = []
-    for p in sorted(d.glob("*.yaml")):
+    paths = sorted(
+        (*d.glob("*.yaml"), *d.glob("*.yml")),
+        key=lambda path: (path.stem.casefold(), path.stem, path.suffix),
+    )
+    seen_stems: set[str] = set()
+    for p in paths:
         if p.stem.startswith("_") or p.stem.startswith("."):
             continue
+        if p.stem in seen_stems:
+            payload = p.read_bytes()
+            raise DataCorruptionError.from_bytes(
+                p,
+                payload,
+                entity_type="worldbook",
+                project=project,
+                entity_id=p.stem,
+                reason="worldbook_extension_collision",
+                quarantine_available=False,
+            )
+        seen_stems.add(p.stem)
         data = load_yaml(
             p,
             entity_type="worldbook",
             project=project,
             entity_id=p.stem,
         )
-        if data:
-            entries.append(data)
+        try:
+            entries.append(normalize_worldbook_entry(data, p.stem))
+        except WorldbookValidationError as exc:
+            raise DataCorruptionError.from_bytes(
+                p,
+                p.read_bytes(),
+                entity_type="worldbook",
+                project=project,
+                entity_id=p.stem,
+                reason="worldbook_schema_invalid:" + ",".join(exc.violations),
+            ) from exc
     return entries
 
 
 def save_worldbook(project: str, entry_id: str, data: dict) -> Path:
     entry_id = _safe_id(entry_id)
-    if not isinstance(data, dict):
-        raise ValueError("世界书数据顶层必须是对象")
-    data = dict(data)
-    if data.get("id") and data["id"] != entry_id:
-        raise ValueError(f"文件 id({entry_id}) 与内容 id({data['id']}) 不一致")
-    data["id"] = entry_id
+    project_dir = get_project_dir(project)
+    if not project_dir.is_dir():
+        raise FileNotFoundError(f"项目 {project} 不存在")
+    normalized = normalize_worldbook_entry(data, entry_id, strict=True)
+    _validate_yaml_tree(normalized)
+    serialized = yaml.safe_dump(normalized, allow_unicode=True, sort_keys=False)
+    if len(serialized.encode("utf-8")) > _MAX_YAML_BYTES:
+        raise WorldbookValidationError(["entry:serialized_too_large"])
+    assert_project_write_allowed(project)
     with yaml_write_transaction():
-        d = resolve_under(ensure_project(project), "worldbook")
-        path = resolve_under(d, f"{entry_id}.yaml")
-        _atomic_dump(path, data)
+        assert_project_write_allowed(project)
+        path = get_worldbook_path(project, entry_id)
+        _atomic_dump(path, normalized)
     return path
 
 

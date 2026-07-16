@@ -19,6 +19,7 @@ def build_messages(
     worldbook_entries: list[dict],
     history: list[dict],
     summaries: Optional[list] = None,
+    manual_worldbook_ids: Optional[list[str]] = None,
 ) -> list[dict]:
     """保留原公开函数，按数量窗口组装但不施加运行时模型预算。
 
@@ -38,6 +39,7 @@ def build_messages(
         context_limit=2_147_483_647,
         context_limit_source="compat_unbounded",
         num_predict=0,
+        manual_worldbook_ids=manual_worldbook_ids,
         safety_margin=0,
     ).messages
 

@@ -117,11 +117,13 @@ class DestructiveService:
         return resolve_under(self._project_dir(project), "user.yaml")
 
     def _worldbook_path(self, project: str, entry_id: str) -> Path:
-        return resolve_under(
-            self._project_dir(project),
-            "worldbook",
-            f"{entry_id}.yaml",
-        )
+        directory = resolve_under(self._project_dir(project), "worldbook")
+        yaml_path = resolve_under(directory, f"{entry_id}.yaml")
+        yml_path = resolve_under(directory, f"{entry_id}.yml")
+        existing = [path for path in (yaml_path, yml_path) if path.is_file()]
+        if len(existing) > 1:
+            raise ValueError(f"世界书条目 {entry_id} 同时存在 .yaml 与 .yml")
+        return existing[0] if existing else yaml_path
 
     def _tombstone_metadata(self, source: Path, *, kind: str) -> dict:
         source_relpath = self._source_relpath(source)
@@ -809,6 +811,10 @@ class DestructiveService:
         tombstone = self.recovery_store.tombstone_path(verified)
         if target.exists():
             raise RecoveryConflict("恢复目标已存在", code="target_changed")
+        if entity_type == "worldbook":
+            sibling_suffix = ".yml" if target.suffix.casefold() == ".yaml" else ".yaml"
+            if target.with_suffix(sibling_suffix).exists():
+                raise RecoveryConflict("世界书另一扩展目标已存在", code="target_changed")
         if not target.parent.is_dir():
             raise RecoveryConflict("恢复目标父目录不存在", code="target_changed")
         if metadata["tombstone_kind"] == "directory":

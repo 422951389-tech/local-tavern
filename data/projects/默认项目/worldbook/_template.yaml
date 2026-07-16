@@ -1,23 +1,26 @@
 # 世界书条目模板 — 复制改名后填内容
-# 世界书 = 关键词触发的背景设定库
-# AI 输出时，prompt 中会自动注入匹配的条目
+# 旧条目缺少 activation 时按 always 读取；只有显式保存才写入新字段。
 
-# 唯一标识
+# 唯一标识（必须与文件名一致）
 id: world_entry_id
 
-# 触发关键词（逗号分隔，任一匹配即触发）
-keys:
-  - 关键词1
-  - 关键词2
+# 总开关；false 会覆盖任何触发方式
+enabled: true
 
-# 是否每次必注入（true = 无视关键词，永远在 prompt 里）
-constant: false
+# 触发方式：always（常驻）/ keywords（关键词）/ manual（当前存档手动选择）
+activation: always
 
-# 插入位置（before / after = 插在角色卡前/后）
-position: after
+# activation 为 keywords 时，每行一个字面关键词，至少填写一个
+keywords: []
 
-# 条目内容（实际注入到 prompt 的文本）
+# 候选优先级；数值越大越先争取 Prompt 预算
+priority: 0
+
+# 实际注入到 Prompt 的设定正文
 content: |
   这里写世界的背景设定。
   例如地点、势力、规则、历史、术语解释等。
   越具体，AI 越不会乱编。
+
+# 可选扩展事实；控制字段请使用上方固定字段
+custom: {}

@@ -28,6 +28,7 @@ from core.summary_lifecycle import (
     schedule_summary_generation,
     shutdown_summary_tasks,
 )
+from core.worldbook_policy import WorldbookValidationError
 from core.session_manager import (
     RevisionConflict,
     aload_session,
@@ -172,8 +173,7 @@ async def _prepare_turn(
             char_name_to_cid[name] = cid
 
     user_profile = load_user_profile(project)
-    all_entries = load_worldbook(project)
-    wb_entries = [e for e in all_entries if e.get("enabled", True)]
+    wb_entries = load_worldbook(project)
     history = (
         deepcopy(history_override)
         if history_override is not None
@@ -194,8 +194,13 @@ async def _prepare_turn(
             context_limit=context_info["context_limit"],
             context_limit_source=context_info["source"],
             num_predict=params["num_predict"],
+            manual_worldbook_ids=session.get("manual_worldbook_ids", []),
         )
-    except (PromptBudgetExceeded, PromptTemplateInvalid) as exc:
+    except (
+        PromptBudgetExceeded,
+        PromptTemplateInvalid,
+        WorldbookValidationError,
+    ) as exc:
         raise HTTPException(422, detail=exc.as_detail()) from exc
     # 与预算计算共用同一有效窗口，禁止 Ollama 按更小默认 num_ctx 静默截断。
     params["num_ctx"] = assembly.diagnostics["context_limit"]

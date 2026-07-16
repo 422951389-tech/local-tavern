@@ -23,6 +23,7 @@ from core.path_policy import (
     validate_file_id,
     validate_snapshot_filename,
 )
+from core.worldbook_policy import MAX_MANUAL_WORLDBOOK_IDS
 
 
 MAX_IMPORT_BYTES = 8 * 1024 * 1024
@@ -129,6 +130,10 @@ class ImportedSession(ImportModel):
         default_factory=dict,
         max_length=MAX_CHARACTERS,
     )
+    manual_worldbook_ids: list[StrictStr] = Field(
+        default_factory=list,
+        max_length=MAX_MANUAL_WORLDBOOK_IDS,
+    )
     message_history: list[ImportedMessage] = Field(
         default_factory=list,
         max_length=MAX_MESSAGES,
@@ -159,6 +164,22 @@ class ImportedSession(ImportModel):
             except PathPolicyError as exc:
                 raise ValueError(str(exc)) from exc
         return value
+
+    @field_validator("manual_worldbook_ids")
+    @classmethod
+    def validate_manual_worldbook_ids(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for entry_id in value:
+            try:
+                validated = validate_file_id(entry_id, label="手动世界书条目 ID")
+            except PathPolicyError as exc:
+                raise ValueError(str(exc)) from exc
+            if validated in seen:
+                raise ValueError("手动世界书条目 ID 不能重复")
+            seen.add(validated)
+            normalized.append(validated)
+        return sorted(normalized)
 
     @model_validator(mode="after")
     def validate_summary_identity(self) -> "ImportedSession":

@@ -10,6 +10,11 @@ from typing import Callable
 
 from core.config import MAX_TURNS_IN_PROMPT, PROMPTS_DIR, PROMPT_SAFETY_MARGIN
 from core.token_estimator import DEFAULT_TOKEN_ESTIMATOR, TokenEstimator
+from core.worldbook_policy import (
+    WorldbookCandidate,
+    activate_worldbook_entries,
+    worldbook_prompt_payload,
+)
 
 
 _TEMPLATE_TOKEN = re.compile(r"\{\{([a-z_][a-z0-9_]*)\}\}")
@@ -24,6 +29,7 @@ _RUNTIME_TEMPLATE_TOKENS = {
 _CHARACTER_PROFILE_FIELDS = (
     "id",
     "name",
+    "aliases",
     "tagline",
     "persona",
     "appearance",
@@ -189,21 +195,19 @@ class PromptAssembler:
         return result
 
     @staticmethod
-    def _worldbook_sources(entries: list[dict]) -> list[tuple[str, str]]:
+    def _worldbook_sources(
+        candidates: list[WorldbookCandidate],
+    ) -> list[tuple[str, str]]:
         result: list[tuple[str, str]] = []
         seen: set[str] = set()
-        for index, entry in enumerate(entries):
-            if not isinstance(entry, dict):
+        for candidate in candidates:
+            if not candidate.activated:
                 continue
-            entry_id = _source_id(entry.get("id"), f"worldbook-{index + 1}")
+            entry_id = candidate.entry_id
             if entry_id in seen:
                 continue
             seen.add(entry_id)
-            payload = {
-                key: deepcopy(value)
-                for key, value in entry.items()
-                if key != "enabled" and value not in (None, "", [], {})
-            }
+            payload = worldbook_prompt_payload(candidate.entry)
             result.append((entry_id, _compact_json(payload)))
         return result
 
@@ -242,6 +246,7 @@ class PromptAssembler:
         context_limit: int,
         context_limit_source: str,
         num_predict: int,
+        manual_worldbook_ids: list[str] | None = None,
         safety_margin: int = PROMPT_SAFETY_MARGIN,
     ) -> PromptAssembly:
         context_limit = int(context_limit)
@@ -301,7 +306,22 @@ class PromptAssembler:
         selected_pinned: set[int] = set()
         selected_worldbook: set[int] = set()
         selected_summaries: set[int] = set()
-        worldbook_sources = self._worldbook_sources(worldbook_entries)
+        worldbook_candidates = activate_worldbook_entries(
+            worldbook_entries,
+            user_input=str(user_input),
+            history=history,
+            scene_meta=scene_meta,
+            characters=characters,
+            characters_state=characters_state,
+            manual_worldbook_ids=manual_worldbook_ids,
+            max_turns=MAX_TURNS_IN_PROMPT,
+        )
+        worldbook_sources = self._worldbook_sources(worldbook_candidates)
+        worldbook_matches = [candidate.diagnostic() for candidate in worldbook_candidates]
+        worldbook_match_by_id = {
+            item["id"]: item
+            for item in worldbook_matches
+        }
         summary_sources = self._summary_sources(summaries)
 
         def history_block() -> str:
@@ -412,7 +432,7 @@ class PromptAssembler:
 
         def diagnostics() -> dict:
             return {
-                "schema_version": 1,
+                "schema_version": 2,
                 "estimator": self.estimator.estimator_id,
                 "context_limit": context_limit,
                 "context_limit_source": str(context_limit_source),
@@ -422,6 +442,7 @@ class PromptAssembler:
                 "estimated_prompt_tokens": estimated_prompt,
                 "remaining_input_tokens": max(0, input_budget - estimated_prompt),
                 "sources": deepcopy(sources),
+                "worldbook_matches": deepcopy(worldbook_matches),
             }
 
         if input_budget <= 0 or estimated_prompt > input_budget:
@@ -430,6 +451,9 @@ class PromptAssembler:
                 if source["reason"] == "required":
                     source["kept"] = False
                     source["reason"] = "required_exceeds_budget"
+            for item in failed_diagnostics["worldbook_matches"]:
+                if item["activated"]:
+                    item["reason"] = "required_exceeds_budget_before_optional"
             raise PromptBudgetExceeded(failed_diagnostics)
 
         def try_source(
@@ -512,9 +536,9 @@ class PromptAssembler:
                 kept_reason="pinned_history",
             )
 
-        # 3. 当前版本的 enabled 世界书条目；WORLD-1 会在进入本组装器前完成触发排序。
+        # 3. 已按 activation、priority、命中数、最近性和稳定 ID 排序的世界书。
         for index, (entry_id, text) in enumerate(worldbook_sources):
-            try_source(
+            kept = try_source(
                 source="worldbook",
                 source_id=entry_id,
                 text=text,
@@ -522,6 +546,9 @@ class PromptAssembler:
                 unselect=lambda index=index: selected_worldbook.discard(index),
                 kept_reason="within_budget",
             )
+            match = worldbook_match_by_id[entry_id]
+            match["kept"] = kept
+            match["reason"] = "within_budget" if kept else "budget_exceeded"
 
         # 4. 摘要按新到旧争取预算，最终仍按时间正序呈现。
         for index, summary_id, text in reversed(summary_sources):
