@@ -50,18 +50,6 @@
             <button id="prompts-btn" class="icon-btn" title="编辑提示词">📝</button>
         </div>
 
-        <!-- 隐藏的旧节点（保留供回滚 / 内部使用） -->
-        <div class="legacy-hide" aria-hidden="true">
-            <select id="project-select"></select>
-            <button id="project-new"></button>
-            <select id="save-select"></select>
-            <button id="save-new"></button>
-            <button id="save-rename"></button>
-            <button id="save-delete"></button>
-            <button id="save-export"></button>
-            <button id="save-import"></button>
-            <button id="cards-btn"></button>
-        </div>
     </header>
 
     <!-- 项目下拉面板（点击 📁 弹出） -->
@@ -145,19 +133,20 @@
     <script src="/static/api-client.js?v=fe1-20260715"></script>
     <script src="/static/session-ref.js?v=fe1-20260715"></script>
     <script src="/static/turn-client.js?v=fe1-20260715"></script>
-    <script src="/static/app.js?v=fe1-20260715"></script>
+    <script type="module" src="/static/app.mjs?v=fe2-20260716"></script>
 
     <!-- 通用 Modal 容器 -->
-    <div id="modal-backdrop" class="modal-backdrop hidden">
-        <div id="modal" class="modal">
+    <div id="modal-backdrop" class="modal-backdrop hidden" aria-hidden="true">
+        <div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-error">
             <div class="modal-header">
                 <h2 id="modal-title"></h2>
-                <button id="modal-close" class="modal-close">×</button>
+                <button id="modal-close" class="modal-close" type="button" aria-label="关闭对话框">×</button>
             </div>
             <div id="modal-body" class="modal-body"></div>
+            <div id="modal-error" class="modal-error hidden" role="alert" aria-live="assertive"></div>
             <div id="modal-footer" class="modal-footer hidden">
-                <button id="modal-cancel" class="modal-btn">取消</button>
-                <button id="modal-confirm" class="modal-btn primary">确定</button>
+                <button id="modal-cancel" class="modal-btn" type="button">取消</button>
+                <button id="modal-confirm" class="modal-btn primary" type="button">确定</button>
             </div>
         </div>
     </div>

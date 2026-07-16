@@ -325,11 +325,6 @@ body {
     opacity: 1;
 }
 
-/* ===== Legacy 隐藏（保留旧节点供回滚） ===== */
-.legacy-hide {
-    display: none !important;
-}
-
 /* ===== Modal ===== */
 .modal-backdrop {
     position: fixed;
@@ -405,6 +400,16 @@ body {
     display: none;
 }
 
+.modal-error {
+    margin: 0 16px 12px;
+    padding: 8px 10px;
+    border: 1px solid #a64b4b;
+    border-radius: 4px;
+    background: rgba(166, 75, 75, 0.14);
+    color: #ffb4b4;
+    font-size: 12px;
+}
+
 .modal-btn {
     background: var(--bg-input);
     color: var(--text);
@@ -417,6 +422,12 @@ body {
 
 .modal-btn:hover {
     background: var(--border);
+}
+
+.modal-btn:disabled,
+.modal-close:disabled {
+    cursor: wait;
+    opacity: 0.55;
 }
 
 .modal-btn.primary {
@@ -652,6 +663,43 @@ body {
     font-size: 14px;
     resize: vertical;
     min-height: 40px;
+}
+
+.message-edit-error {
+    margin-top: 6px;
+    color: #ff9e9e;
+    font-size: 12px;
+}
+
+.msg[aria-busy="true"] .message-edit-input {
+    cursor: wait;
+    opacity: 0.72;
+}
+
+.message-draft-recovery {
+    display: grid;
+    gap: 8px;
+    margin: 10px;
+    padding: 12px;
+    border: 1px solid #a64b4b;
+    border-radius: 6px;
+    background: rgba(166, 75, 75, 0.14);
+    color: #ffb4b4;
+}
+
+.message-draft-recovery textarea {
+    width: 100%;
+    min-height: 80px;
+    resize: vertical;
+    background: var(--bg-input);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px;
+}
+
+.message-draft-recovery button {
+    justify-self: end;
 }
 
 /* ===== 场景元数据条 ===== */

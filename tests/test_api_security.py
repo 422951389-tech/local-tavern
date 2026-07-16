@@ -50,6 +50,29 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(list(Path(self.tempdir.name).rglob("*")), [])
 
+    async def test_frontend_es_modules_are_served_as_javascript(self):
+        index = await self.client.get("/")
+        self.assertEqual(index.status_code, 200, index.text)
+        self.assertIn('type="module" src="/static/app.mjs', index.text)
+        self.assertNotIn("legacy-hide", index.text)
+
+        module_names = (
+            "app", "modal", "message-editor", "card-editor", "projects",
+            "saves", "chat", "summaries", "prompt-editor", "render",
+        )
+        for name in module_names:
+            with self.subTest(module=name):
+                response = await self.client.get(f"/static/{name}.mjs")
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertTrue(
+                    response.headers.get("content-type", "").startswith("text/javascript"),
+                    response.headers,
+                )
+                self.assertEqual(
+                    response.headers.get("cache-control"),
+                    "no-cache, no-store, must-revalidate",
+                )
+
     async def test_invalid_import_returns_400_and_writes_nothing(self):
         fixture = {
             "session_id": "恶意导入",

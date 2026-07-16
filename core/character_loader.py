@@ -150,7 +150,7 @@ def ensure_project(name: str) -> Path:
 
     默认存档用于：
     - list_sessions / delete_session 的"至少保留 1 个存档"逻辑能正确生效
-    - 切项目后 loadOrCreateCurrentSave 不再因空目录创建幽灵存档
+    - 切项目后 loadProjectContext 不再因空目录创建幽灵存档
     """
     from core.session_manager import _empty_session, atomic_write, DEFAULT_SAVE
     d = get_project_dir(name)

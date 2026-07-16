@@ -1,3 +1,18 @@
+import { createModalController, modalElementsFromDocument } from './modal.mjs';
+import { enterMessageEditor } from './message-editor.mjs';
+import {
+    clearDragState,
+    collectCardEditorData,
+    getPathValue,
+    groupsWithCustomFields,
+} from './card-editor.mjs';
+import { createProjectService } from './projects.mjs';
+import { createSaveService } from './saves.mjs';
+import { createTurnPayload, createTurnPersistence } from './chat.mjs';
+import { createSummaryService, summaryPatchFromForm } from './summaries.mjs';
+import { createPromptService } from './prompt-editor.mjs';
+import { affinityBar, createMessageElement } from './render.mjs';
+
 // 本地酒馆 — 前端逻辑 v2（项目+存档双层架构）
 // 流式对话、角色卡渲染、行动建议、会话管理、提示词编辑
 
@@ -5,6 +20,8 @@ if (!globalThis.TavernSecurity) throw new Error('安全渲染模块未加载');
 if (!globalThis.TavernApi) throw new Error('ApiClient 模块未加载');
 if (!globalThis.TavernSessionRef) throw new Error('SessionRef 模块未加载');
 if (!globalThis.TavernTurn) throw new Error('TurnClient 模块未加载');
+
+const TavernSecurity = globalThis.TavernSecurity;
 
 const { ApiClient, ApiError, payloadMessage } = globalThis.TavernApi;
 const {
@@ -44,6 +61,7 @@ const API = {
     sessionHistory: '/api/session/history',
     sessionRestore: '/api/session/restore',
     sessionSnapshot: (filename) => `/api/session/snapshot?filename=${encodeURIComponent(filename)}`,
+    summary: '/api/session/summary',
     summaryRegen: '/api/session/summary/regenerate',
     // 角色/世界书/用户
     characterSchema: '/api/schema/character',
@@ -78,6 +96,19 @@ const state = {
         think: true,
     },
 };
+
+const projectService = createProjectService(apiClient, API);
+const saveService = createSaveService(apiClient, API);
+const promptService = createPromptService(apiClient, API);
+const summaryService = createSummaryService(sessionWrite, API);
+const turnPersistence = createTurnPersistence(sessionStorage);
+const modalController = createModalController(
+    modalElementsFromDocument(document),
+    { documentRef: document },
+);
+modalController.bind();
+const showModal = config => modalController.show(config);
+const hideModal = options => modalController.hide(options);
 
 const sessionRefs = new SessionRefTracker(state.currentProject, state.currentSave);
 let committedSessionRef = sessionRefs.capture();
@@ -229,26 +260,12 @@ async function sessionWrite(url, method, payload, label = '保存', options = {}
 async function loadProjects() {
     const requestRef = captureSessionRef();
     const requestId = ++latestRequest.projects;
-    const data = await apiClient.get(API.projects, {
-        schema: body => Array.isArray(body && body.projects) || '项目列表响应无效',
-    });
+    const projects = await projectService.list();
     if (!isCurrentSessionRef(requestRef) || requestId !== latestRequest.projects) return null;
-    if (data.projects.length === 0) {
+    if (projects.length === 0) {
         throw new ApiError('服务端没有可用项目', { code: 'empty_project_list' });
     }
-    state.projectList = [...data.projects];
-
-    const oldSelect = document.getElementById('project-select');
-    if (oldSelect) {
-        oldSelect.innerHTML = '';
-        state.projectList.forEach(p => {
-            const opt = document.createElement('option');
-            opt.value = p;
-            opt.textContent = p;
-            oldSelect.appendChild(opt);
-        });
-        oldSelect.value = state.currentProject;
-    }
+    state.projectList = projects;
     await renderProjectDropdown(requestRef);
     return state.projectList;
 }
@@ -259,32 +276,11 @@ async function renderProjectDropdown(requestRef = captureSessionRef()) {
     if (!listEl) return;
     const requestId = ++latestRequest.projectStats;
 
-    // 并发拉每个项目的 stats（角色/世界书/存档数）
-    const stats = {};
     const projectList = [...state.projectList];
-    await Promise.all(projectList.map(async (p) => {
-        try {
-            const [c, w, s] = await Promise.all([
-                apiClient.get(`${API.characters}?project=${encodeURIComponent(p)}`, {
-                    schema: body => Array.isArray(body && body.characters) || '角色列表响应无效',
-                }),
-                apiClient.get(`${API.worldbook}?project=${encodeURIComponent(p)}`, {
-                    schema: body => Array.isArray(body && body.entries) || '世界书列表响应无效',
-                }),
-                apiClient.get(`${API.sessions}?project=${encodeURIComponent(p)}`, {
-                    schema: body => Array.isArray(body && body.sessions) || '存档列表响应无效',
-                }),
-            ]);
-            stats[p] = {
-                chars: (c.characters || []).length,
-                world: (w.entries || []).length,
-                saves: (s.sessions || []).length,
-            };
-        } catch (error) {
-            console.warn(`加载项目 ${p} 元信息失败`, error);
-            stats[p] = { chars: '—', world: '—', saves: '—' };
-        }
-    }));
+    const stats = await projectService.loadStats(projectList);
+    for (const [project, value] of Object.entries(stats)) {
+        if (value.error) console.warn(`加载项目 ${project} 元信息失败`, value.error);
+    }
 
     if (!isCurrentSessionRef(requestRef) || requestId !== latestRequest.projectStats) return;
 
@@ -385,10 +381,9 @@ async function loadSettings() {
     } catch (e) { console.warn('读取设置失败', e); }
 }
 
-async function saveSettings() {
-    try {
-        await apiClient.put(API.settings, { data: state.modelParams });
-    } catch (e) { console.warn('保存设置失败', e); }
+async function saveSettings(params = state.modelParams) {
+    await apiClient.put(API.settings, { data: params });
+    return params;
 }
 
 async function loadModels() {
@@ -419,18 +414,12 @@ async function loadCharacters(project = state.currentProject) {
 }
 
 async function fetchSaveList(project) {
-    const data = await apiClient.get(`${API.sessions}?project=${encodeURIComponent(project)}`, {
-        schema: body => Array.isArray(body && body.sessions) || '存档列表响应无效',
-    });
-    return data.sessions;
+    return saveService.list(project);
 }
 
 async function fetchSession(ref) {
     if (!ref || !ref.save) throw new ApiError('缺少存档引用', { code: 'invalid_session_ref' });
-    const url = `${API.session}?project=${encodeURIComponent(ref.project)}&save=${encodeURIComponent(ref.save)}`;
-    const session = await apiClient.get(url, {
-        schema: body => Boolean(sessionFromResult(body)) || '存档响应无效',
-    });
+    const session = await saveService.get(ref.project, ref.save);
     if (!sessionBelongsToRef(session, ref)) {
         throw new ApiError('服务端返回了其他存档', { code: 'session_ref_mismatch', payload: session });
     }
@@ -459,9 +448,7 @@ async function loadProjectContext(project, preferredSave = null) {
             ? preferredSave
             : (saves[0] && saves[0].session_id);
         if (!saveId && shouldCreateDefaultSave(saves, candidateRef, captureSessionRef())) {
-            session = await apiClient.post(API.sessionCreate, { project, name: '默认存档' }, {
-                schema: body => Boolean(sessionFromResult(body)) || '创建存档响应无效',
-            });
+            session = await saveService.create(project, '默认存档');
             if (!isCurrentSessionRef(candidateRef)) return false;
             saveId = session.session_id;
             nextSaves = [{
@@ -483,8 +470,6 @@ async function loadProjectContext(project, preferredSave = null) {
         window.location.hash = `#${project}`;
         const projectName = document.getElementById('project-name');
         if (projectName) projectName.textContent = project;
-        const oldProjectSelect = document.getElementById('project-select');
-        if (oldProjectSelect) oldProjectSelect.value = project;
         renderSaveListControls();
         return true;
     } catch (error) {
@@ -509,26 +494,6 @@ async function loadSaveList(requestRef = captureSessionRef()) {
 }
 
 function renderSaveListControls() {
-    // 兼容旧 select
-    const oldSelect = document.getElementById('save-select');
-    if (oldSelect) {
-        oldSelect.innerHTML = '';
-        if (state.saveList.length === 0) {
-            const opt = document.createElement('option');
-            opt.value = ''; opt.textContent = '— 无存档 —';
-            oldSelect.appendChild(opt);
-        } else {
-            state.saveList.forEach(s => {
-                const opt = document.createElement('option');
-                opt.value = s.session_id;
-                opt.textContent = s.name + (s.message_count > 0 ? ` (${s.message_count})` : '');
-                oldSelect.appendChild(opt);
-            });
-            if (state.currentSave) oldSelect.value = state.currentSave;
-        }
-    }
-
-    // 渲染新下拉面板 + 更新 badge
     renderSaveDropdown();
     const badge = document.getElementById('save-count');
     if (badge) badge.textContent = state.saveList.length;
@@ -555,10 +520,6 @@ function renderSaveDropdown() {
             switchSave(sid);
         });
     });
-}
-
-async function loadOrCreateCurrentSave() {
-    return loadProjectContext(state.currentProject);
 }
 
 async function loadCurrentSession(requestRef = captureSessionRef()) {
@@ -597,12 +558,7 @@ async function createNewSave(name) {
     }
     let candidateRef = beginSessionTransition(state.currentProject, null);
     try {
-        const session = await apiClient.post(API.sessionCreate, {
-            project: state.currentProject,
-            name,
-        }, {
-            schema: body => Boolean(sessionFromResult(body)) || '创建存档响应无效',
-        });
+        const session = await saveService.create(state.currentProject, name);
         if (!isCurrentSessionRef(candidateRef)) return null;
         candidateRef = sessionRefs.advance(state.currentProject, session.session_id);
         const saves = await fetchSaveList(candidateRef.project);
@@ -614,12 +570,12 @@ async function createNewSave(name) {
     } catch (error) {
         rollbackSessionTransition(candidateRef);
         showToast(`创建失败：${errorDetail(error)}`, 3000);
-        return null;
+        throw error;
     }
 }
 
 async function renameCurrentSave(newName) {
-    if (!state.currentSave) return;
+    if (!state.currentSave) return false;
     const requestRef = captureSessionRef();
     let body;
     try {
@@ -629,24 +585,25 @@ async function renameCurrentSave(newName) {
             new_name: newName,
         }, '重命名', { applyResult: false });
     } catch (error) {
-        alert('重命名失败：' + error.message);
-        return;
+        throw error;
     }
-    if (!isCurrentSessionRef(requestRef)) return;
+    if (!isCurrentSessionRef(requestRef)) return false;
     const session = sessionFromResult(body);
     if (!session || (session.project && session.project !== requestRef.project)) {
-        alert('重命名失败：响应缺少有效存档');
-        return;
+        throw new ApiError('重命名失败：响应缺少有效存档', { code: 'invalid_response_schema' });
     }
     const candidateRef = beginSessionTransition(requestRef.project, session.session_id);
+    const previousSaveList = state.saveList;
     state.saveList = state.saveList.map(item => item.session_id === requestRef.save
         ? { ...item, session_id: session.session_id, name: session.name || newName }
         : item);
     if (!commitSessionState(session, candidateRef)) {
+        state.saveList = previousSaveList;
         rollbackSessionTransition(candidateRef);
-        return;
+        throw new ApiError('重命名结果已过期，请重新打开存档', { code: 'stale_session_ref' });
     }
     renderSaveListControls();
+    return session;
 }
 
 async function deleteCurrentSave() {
@@ -685,10 +642,7 @@ async function deleteCurrentSave() {
 async function exportCurrentSave() {
     if (!state.currentSave) return;
     const requestRef = captureSessionRef();
-    const url = `${API.sessionExport}?project=${encodeURIComponent(requestRef.project)}&save=${encodeURIComponent(requestRef.save)}`;
-    const data = await apiClient.get(url, {
-        schema: body => Boolean(body && typeof body.json_str === 'string') || '导出响应无效',
-    });
+    const data = await saveService.exportJson(requestRef.project, requestRef.save);
     if (!isCurrentSessionRef(requestRef)) return;
     const blob = new Blob([data.json_str], { type: 'application/json' });
     const a = document.createElement('a');
@@ -703,13 +657,7 @@ async function importSave(file) {
     if (validationError) throw new Error(validationError);
     const text = await file.text();
     const requestRef = captureSessionRef();
-    await apiClient.post(API.sessionImport, {
-        project: requestRef.project,
-        json_str: text,
-        name: file.name.replace(/\.json$/i, ''),
-    }, {
-        schema: body => Boolean(sessionFromResult(body)) || '导入响应无效',
-    });
+    await saveService.importJson(requestRef.project, text, file.name.replace(/\.json$/i, ''));
     if (!isCurrentSessionRef(requestRef)) return false;
     await loadSaveList(requestRef);
     return true;
@@ -745,9 +693,7 @@ async function createNewProject(name) {
         throw new ApiError('当前正在切换或生成，请稍候', { code: 'ui_busy' });
     }
     const requestRef = captureSessionRef();
-    const created = await apiClient.post(API.projects, { name }, {
-        schema: body => Boolean(body && typeof body.name === 'string') || '创建项目响应无效',
-    });
+    const created = await projectService.create(name);
     if (!isCurrentSessionRef(requestRef)) return null;
     await loadProjects();
     await switchProject(created.name);
@@ -786,8 +732,7 @@ function renderCharacterPanel(charactersState) {
 }
 
 function renderAffinityBar(percent) {
-    const filled = Math.round(TavernSecurity.normalizeAffinity(percent) / 10);
-    return '█'.repeat(filled) + '░'.repeat(10 - filled);
+    return affinityBar(percent, TavernSecurity.normalizeAffinity);
 }
 
 function renderHistory(history) {
@@ -807,19 +752,11 @@ function renderHistory(history) {
 
 function appendUserMessage(text, msgData = null) {
     const stream = document.getElementById('chat-stream');
-    const div = document.createElement('div');
-    div.className = 'msg user';
-    div.dataset.messageId = msgData && msgData.id ? msgData.id : '';
-    div.innerHTML = `
-        <input type="checkbox" class="msg-checkbox" ${msgData && msgData.in_prompt === false ? '' : 'checked'} title="勾选 = 进 prompt">
-        <div class="msg-actions">
-            <button class="msg-action-btn edit" title="编辑">✎</button>
-            <button class="msg-action-btn regenerate" title="重新生成（从此条之后）">🔄</button>
-            <button class="msg-action-btn pin ${msgData && msgData.pinned ? 'active' : ''}" title="📌 钉选 = 永久常驻 AI 记忆（截断不删）">📌</button>
-            <button class="msg-action-btn delete" title="删除">🗑</button>
-        </div>
-        <div class="msg-role">你</div>
-        <div class="content">${escapeHtml(text)}</div>`;
+    const { container: div } = createMessageElement(document, {
+        role: 'user',
+        content: text,
+        message: msgData || {},
+    });
     stream.appendChild(div);
     bindMessageActions(div);
     scrollToBottom();
@@ -827,37 +764,20 @@ function appendUserMessage(text, msgData = null) {
 
 function appendAssistantMessage(content, thinking = '', msgData = null) {
     const stream = document.getElementById('chat-stream');
-    const div = document.createElement('div');
-    div.className = 'msg assistant';
-    div.dataset.messageId = msgData && msgData.id ? msgData.id : '';
+    const rendered = createMessageElement(document, {
+        role: 'assistant',
+        content,
+        message: msgData || {},
+        timeText: new Date().toLocaleTimeString(),
+    });
+    const div = rendered.container;
     // 给 assistant 节点分配唯一 id，便于 SSE/regenerate 精确锁定目标（兜底 :last-child 选择器）
     div.id = div.id || `msg-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    div.innerHTML = `
-        <input type="checkbox" class="msg-checkbox" ${msgData && msgData.in_prompt === false ? '' : 'checked'} title="勾选 = 进 prompt">
-        <div class="msg-actions">
-            <button class="msg-action-btn edit" title="编辑">✎</button>
-            <button class="msg-action-btn regenerate" title="重新生成">🔄</button>
-            <button class="msg-action-btn pin ${msgData && msgData.pinned ? 'active' : ''}" title="📌 钉选 = 永久常驻 AI 记忆（截断不删）">📌</button>
-            <button class="msg-action-btn delete" title="删除">🗑</button>
-        </div>
-        <div class="msg-role">AI · ${new Date().toLocaleTimeString()}</div>
-        <div class="content"></div>`;
     stream.appendChild(div);
-    const contentEl = div.querySelector('.content');
-    contentEl.textContent = content;
+    const contentEl = rendered.contentElement;
     bindMessageActions(div);
     scrollToBottom();
     return contentEl;
-}
-
-function appendStreamChunk(targetEl, chunk) {
-    if (targetEl) { targetEl.textContent += chunk; scrollToBottom(); }
-}
-
-function appendStreamThinking(chunk) {
-    const tp = document.getElementById('thinking-panel');
-    tp.classList.remove('hidden');
-    document.getElementById('thinking-content').textContent += chunk;
 }
 
 // ===== 消息操作 =====
@@ -931,33 +851,46 @@ async function togglePin(messageRef) {
     } catch (e) { console.error('toggle_pin 失败', e); return { error: String(e) }; }
 }
 
-function enterMessageEditMode(msgEl, messageRef) {
-    const contentEl = msgEl.querySelector('.content');
-    const original = contentEl.textContent;
-    msgEl.classList.add('editing');
-    const textarea = document.createElement('textarea');
-    textarea.value = original;
-    contentEl.replaceWith(textarea);
-    textarea.focus();
+function recoverDetachedMessageDraft({ messageRef, draft, error }) {
+    const replacement = [...document.querySelectorAll('#chat-stream .msg')].find(
+        element => element.dataset.messageId === messageRef.message_id,
+    );
+    const failure = `保存失败：${errorDetail(error)}`;
+    if (replacement) {
+        enterMessageEditMode(replacement, messageRef, { draft, error: failure });
+        return true;
+    }
 
-    let finished = false;   // 防重入：Ctrl+Enter 后 blur 不再触发第二次保存
-    const finish = async (save) => {
-        if (finished) return;
-        finished = true;
-        msgEl.classList.remove('editing');
-        const newContent = textarea.value;
-        textarea.replaceWith(contentEl);
-        if (save && newContent !== original) {
-            await editMessage(messageRef, newContent);
-            contentEl.textContent = newContent;
-            await reloadCurrentSession();
-        } else { contentEl.textContent = original; }
-    };
-    textarea.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); finish(true); }
-        else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    const stream = document.getElementById('chat-stream');
+    const recovery = document.createElement('section');
+    recovery.className = 'message-draft-recovery';
+    recovery.setAttribute('role', 'alert');
+    const label = document.createElement('strong');
+    label.textContent = `${failure}；原消息已不在当前历史中，草稿保留如下：`;
+    const textarea = document.createElement('textarea');
+    textarea.value = draft;
+    textarea.setAttribute('aria-label', '未保存的消息草稿');
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.textContent = '我已复制，关闭';
+    dismiss.addEventListener('click', () => recovery.remove());
+    recovery.append(label, textarea, dismiss);
+    stream.appendChild(recovery);
+    textarea.focus();
+    scrollToBottom();
+    return true;
+}
+
+function enterMessageEditMode(msgEl, messageRef, initial = {}) {
+    return enterMessageEditor({
+        documentRef: document,
+        messageElement: msgEl,
+        messageRef,
+        save: editMessage,
+        initialValue: initial.draft,
+        initialError: initial.error,
+        recover: recoverDetachedMessageDraft,
     });
-    textarea.addEventListener('blur', () => finish(true));
 }
 
 async function toggleMessageInPrompt(messageRef, inPrompt) {
@@ -1236,24 +1169,8 @@ function enterSummaryEditMode(panel, summary, index) {
 }
 
 async function saveEdit(panel, index, body) {
-    const inputs = Array.from(body.querySelectorAll('.summary-edit-input'));
-    const text = inputs.find(el => el.dataset.field === 'text')?.value || '';
-    const time = inputs.find(el => el.dataset.field === 'time')?.value || '';
-    const factsStr = inputs.find(el => el.dataset.field === 'facts')?.value || '';
-    const relsStr = inputs.find(el => el.dataset.field === 'relations')?.value || '';
-    const facts = factsStr.split('\n').map(s => s.trim()).filter(Boolean);
-    const relations = relsStr.split('\n').map(s => s.trim()).filter(Boolean);
-
     try {
-        await sessionWrite('/api/session/summary', 'PATCH', {
-            project: state.currentProject,
-            save: state.currentSave,
-            index: index,
-            text: text || '',
-            time: time || '',
-            facts: facts || [],
-            relations: relations || [],
-        }, '保存总结');
+        await summaryService.update(captureSessionRef(), index, summaryPatchFromForm(body));
         await reloadCurrentSession();
         const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
         if (lastAI) renderSummaryPanel(lastAI, state.session);
@@ -1267,10 +1184,7 @@ async function regenerateLastSummary(panel, sess) {
     const btn = panel.querySelector('.summary-regen-btn');
     if (btn) btn.disabled = true;
     try {
-        const res = await sessionWrite(API.summaryRegen, 'POST', {
-            project: state.currentProject,
-            save: state.currentSave,
-        }, '重生成总结');
+        const res = await summaryService.regenerate(captureSessionRef());
         if (res.error) { alert('重新生成失败: ' + res.error); if (btn) btn.disabled = false; return; }
         // sessionWrite 已原子提交并重绘完整 Session。
         const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
@@ -1297,40 +1211,18 @@ function renderSuggestions(suggestions) {
 
 // ===== 发送消息 =====
 
-const ACTIVE_TURN_STORAGE_KEY = 'local-tavern.active-turn.v1';
-
 function readPersistedTurnPointer() {
-    try {
-        const value = JSON.parse(sessionStorage.getItem(ACTIVE_TURN_STORAGE_KEY) || 'null');
-        if (!value || typeof value.turnId !== 'string') return null;
-        if (typeof value.project !== 'string' || typeof value.save !== 'string') return null;
-        return {
-            turnId: value.turnId,
-            project: value.project,
-            save: value.save,
-            lastEventId: Number.isSafeInteger(value.lastEventId) && value.lastEventId >= 0
-                ? value.lastEventId
-                : 0,
-        };
-    } catch (_error) {
-        return null;
-    }
+    try { return turnPersistence.read(); }
+    catch (_error) { return null; }
 }
 
 function persistActiveTurn(turn = state.activeTurn) {
     if (!turn || !turn.turnId || !turn.ref) return;
-    try {
-        sessionStorage.setItem(ACTIVE_TURN_STORAGE_KEY, JSON.stringify({
-            turnId: turn.turnId,
-            project: turn.ref.project,
-            save: turn.ref.save,
-            lastEventId: turn.lastEventId || 0,
-        }));
-    } catch (_error) {}
+    try { turnPersistence.write(turn); } catch (_error) {}
 }
 
 function clearPersistedTurn() {
-    try { sessionStorage.removeItem(ACTIVE_TURN_STORAGE_KEY); } catch (_error) {}
+    try { turnPersistence.clear(); } catch (_error) {}
 }
 
 function setTurnUiState(active, cancelling = false) {
@@ -1576,19 +1468,13 @@ async function cancelActiveTurn() {
 }
 
 function buildTurnPayload(requestRef, userInput = undefined) {
-    const payload = {
-        project: requestRef.project,
-        save: requestRef.save,
+    return createTurnPayload({
+        ref: requestRef,
+        revision: currentRevision(requestRef),
         model: state.session.current_model || document.getElementById('model-select').value || null,
-        expected_revision: currentRevision(requestRef),
-        temperature: state.modelParams.temperature,
-        top_p: state.modelParams.top_p,
-        top_k: state.modelParams.top_k,
-        num_predict: state.modelParams.num_predict,
-        think: state.modelParams.think,
-    };
-    if (userInput !== undefined) payload.user_input = userInput;
-    return payload;
+        params: state.modelParams,
+        userInput,
+    });
 }
 
 function prepareProvisionalTurn(requestRef) {
@@ -1665,59 +1551,7 @@ async function sendMessage(text = null) {
     );
 }
 
-// ===== Modal 框架 =====
-
-function showModal({ title, body, footer = null }) {
-    document.getElementById('modal-title').textContent = title;
-    document.getElementById('modal-body').innerHTML = '';
-    if (typeof body === 'string') document.getElementById('modal-body').innerHTML = body;
-    else if (body instanceof Node) document.getElementById('modal-body').appendChild(body);
-    const footerEl = document.getElementById('modal-footer');
-    const confirmBtn = document.getElementById('modal-confirm');
-    confirmBtn.onclick = null;
-    if (footer) {
-        footerEl.classList.remove('hidden');
-        document.getElementById('modal-cancel').textContent = footer.cancelText || '取消';
-        confirmBtn.textContent = footer.confirmText || '确定';
-        footerEl.dataset.handler = '1';
-        if (footer.onConfirm) confirmBtn.onclick = () => { footer.onConfirm(); hideModal(); };
-    } else {
-        footerEl.classList.add('hidden');
-        footerEl.dataset.handler = '';
-    }
-    document.getElementById('modal-backdrop').classList.remove('hidden');
-}
-
-function hideModal() {
-    document.getElementById('modal-backdrop').classList.add('hidden');
-    document.getElementById('modal-body').innerHTML = '';   // 断开所有子节点引用，防闭包泄漏
-    document.getElementById('modal-title').textContent = '';
-    const confirmBtn = document.getElementById('modal-confirm');
-    if (confirmBtn) confirmBtn.onclick = null;
-}
-
 // ===== 角色 / 世界书 / 用户档案 编辑器 =====
-
-function cardInput(label, id, value = '', type = 'text', opts = {}) {
-    const ph = opts.placeholder || '';
-    const rows = opts.rows || 3;
-    if (type === 'textarea') {
-        return `<div class="card-field"><label>${label}</label><textarea id="${id}" rows="${rows}" placeholder="${ph}">${escapeHtml(value)}</textarea></div>`;
-    }
-    if (type === 'checkbox') {
-        return `<div class="card-field inline"><label><input type="checkbox" id="${id}" ${value ? 'checked' : ''}> ${label}</label></div>`;
-    }
-    if (type === 'number') {
-        return `<div class="card-field"><label>${label}</label><input type="number" id="${id}" value="${escapeHtml(value)}" min="${opts.min||0}" max="${opts.max||100}"></div>`;
-    }
-    return `<div class="card-field"><label>${label}</label><input type="text" id="${id}" value="${escapeHtml(value)}" placeholder="${ph}"></div>`;
-}
-
-function collectTextareaLines(id) {
-    const el = document.getElementById(id);
-    if (!el) return [];
-    return el.value.split('\n').map(s => s.trim()).filter(Boolean);
-}
 
 // ============================================================
 // 通用卡片编辑器引擎 (v3) — 由 openCharactersEditor/openWorldbookEditor/openUserEditor 调用
@@ -1799,25 +1633,6 @@ async function createCardEditor(config) {
         });
     }
 
-    // ===== 字段工具 =====
-    function getVal(obj, path, fieldDef) {
-        if (fieldDef.type === 'custom') return fieldDef.value || '';
-        if (fieldDef.array) return (path.split('.').reduce((o,k) => (o||{})[k], obj) || []).join('\n');
-        if (fieldDef.type === 'checkbox') return path.split('.').reduce((o,k) => (o||{})[k], obj) !== false;
-        return path.split('.').reduce((o,k) => (o!=null?o[k]:''), obj) ?? '';
-    }
-
-    function setVal(obj, path, val, fieldDef) {
-        if (fieldDef.array) val = val.split('\n').map(s => s.trim()).filter(Boolean);
-        if (fieldDef.type === 'number') val = Number(val) || 0;
-        if (fieldDef.type === 'checkbox') val = Boolean(val);
-        const keys = path.split('.');
-        const last = keys.pop();
-        let cur = obj;
-        for (const k of keys) { if (!cur[k] || typeof cur[k] !== 'object') cur[k] = {}; cur = cur[k]; }
-        cur[last] = val;
-    }
-
     // ===== 字段行 =====
     function makeFieldRow(fd) {
         const row = document.createElement('div');
@@ -1849,24 +1664,24 @@ async function createCardEditor(config) {
             const lbl = document.createElement('label');
             lbl.style.cssText = 'font-size:12px;color:var(--text);cursor:pointer;display:flex;align-items:center;gap:6px';
             const cb = document.createElement('input'); cb.type = 'checkbox'; cb.className = 'ce-field-val';
-            cb.checked = getVal(currentItem || {}, fd.key, fd);
+            cb.checked = getPathValue(currentItem || {}, fd.key, fd);
             lbl.appendChild(cb); lbl.appendChild(document.createTextNode(fd.checkboxLabel || fd.label));
             body.appendChild(lbl);
         } else if (fd.type === 'textarea') {
             const lbl = document.createElement('label'); lbl.textContent = fd.label; lbl.className = 'fld-label'; body.appendChild(lbl);
             const ta = document.createElement('textarea'); ta.className = 'ce-field-val'; ta.rows = fd.rows || 4;
             if (fd.placeholder) ta.placeholder = fd.placeholder;
-            ta.value = getVal(currentItem || {}, fd.key, fd); body.appendChild(ta);
+            ta.value = getPathValue(currentItem || {}, fd.key, fd); body.appendChild(ta);
         } else if (fd.type === 'number') {
             const lbl = document.createElement('label'); lbl.textContent = fd.label; lbl.className = 'fld-label'; body.appendChild(lbl);
             const inp = document.createElement('input'); inp.type = 'number'; inp.className = 'ce-field-val';
             if (fd.min !== undefined) inp.min = fd.min; if (fd.max !== undefined) inp.max = fd.max;
-            inp.value = getVal(currentItem || {}, fd.key, fd); body.appendChild(inp);
+            inp.value = getPathValue(currentItem || {}, fd.key, fd); body.appendChild(inp);
         } else {
             const lbl = document.createElement('label'); lbl.textContent = fd.label; lbl.className = 'fld-label'; body.appendChild(lbl);
             const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'ce-field-val';
             if (fd.placeholder) inp.placeholder = fd.placeholder;
-            inp.value = getVal(currentItem || {}, fd.key, fd); body.appendChild(inp);
+            inp.value = getPathValue(currentItem || {}, fd.key, fd); body.appendChild(inp);
         }
         row.appendChild(body);
         if (!fd.builtin) {
@@ -1982,9 +1797,7 @@ async function createCardEditor(config) {
         groups.forEach((g, i) => groupsEl.appendChild(makeGroup(g, i)));
 
         groupsEl.addEventListener('dragend', () => {
-            fieldList.querySelectorAll('.dragging,.fld-dragging,.drag-over,.fld-drag-over').forEach(el => {
-                el.classList.remove('dragging','fld-dragging','drag-over','fld-drag-over');
-            });
+            clearDragState(groupsEl);
         });
 
         formEl.querySelector('.ce-group-add').addEventListener('click', () => {
@@ -2004,32 +1817,12 @@ async function createCardEditor(config) {
                 return;
             }
             saveButton.disabled = true;
-            const data = { custom: {} };
-            let idVal = '';
-            groupsEl.querySelectorAll('.grp-container').forEach(grp => {
-                grp.querySelectorAll('.fld-row').forEach(row => {
-                    const key = row.dataset.key; const type = row.dataset.type;
-                    if (!key) return;
-                    const keyInp = row.querySelector('.ce-field-key');
-                    const valInp = row.querySelector('.ce-field-val');
-                    if (keyInp && valInp) { const k = keyInp.value.trim(); const v = valInp.value.trim(); if (k) data.custom[k] = v; }
-                    else if (valInp) {
-                        const raw = valInp.type === 'checkbox' ? valInp.checked : valInp.value;
-                        const isArray = row.dataset.array === '1';
-                        setVal(data, key, raw, { array: isArray, type: type, number: type==='number', checkbox: type==='checkbox' });
-                        if (key === config.idField) idVal = raw;
-                    }
-                });
-            });
+            const { data, idValue: idVal } = collectCardEditorData(groupsEl, { idField: config.idField });
             if (config.idField && !idVal) {
                 saveButton.disabled = false;
                 alert(`请填 ${config.idLabel || 'ID'}`);
                 return;
             }
-            if (!data.custom || Object.keys(data.custom).length === 0) delete data.custom;
-            // 单条模式（用户档案）固定 id='user'
-            if (!config.idField) data.id = 'user';
-
             const saveUrl = config.saveApi ? config.saveApi(idVal || 'user') : null;
             if (!saveUrl) {
                 saveButton.disabled = false;
@@ -2202,17 +1995,7 @@ async function openCharactersEditor() {
         buildGroups: (c) => {
             c = c || {};
             const groups = schema.groups.map(g => ({ ...g, fields: g.fields.map(f => ({ ...f, builtin: true })) }));
-            const custom = (c.custom && typeof c.custom === 'object') ? c.custom : {};
-            const customEntries = Object.entries(custom);
-            if (customEntries.length > 0) {
-                groups.push({
-                    key: schema.customGroup.key,
-                    label: schema.customGroup.label,
-                    builtin: false,
-                    fields: customEntries.map(([k, v]) => ({ key: k, label: k, value: v, type: 'custom', builtin: false })),
-                });
-            }
-            return groups;
+            return groupsWithCustomFields(groups, c, schema.customGroup);
         },
         postSave: async () => { showToast('角色已保存，点「重置」让新角色进场景'); },
     });
@@ -2234,13 +2017,14 @@ async function openWorldbookEditor() {
         prefix: 'world',
         buildGroups: (w) => {
             w = w || {};
-            return [
+            const groups = [
                 { key: '_basic', label: '基本信息', builtin: true, fields: [
                     { key: 'id', label: '条目名（英文）', type: 'text', builtin: true, required: true, placeholder: '比如：qinglong_shanghui' },
                     { key: 'enabled', label: '启用此设定', type: 'checkbox', builtin: true, checkboxLabel: '勾选后 AI 就会加载这条设定' },
                     { key: 'content', label: '设定内容', type: 'textarea', builtin: true, rows: 6, placeholder: 'AI 开局就会知道的设定...' },
                 ]},
             ];
+            return groupsWithCustomFields(groups, w, { key: '_custom', label: '自定义字段' });
         },
     });
 }
@@ -2261,7 +2045,7 @@ async function openUserEditor() {
         extraApi: `${API.user}?project=${encodeURIComponent(editorRef.project)}`,
         buildGroups: (ud) => {
             ud = ud || {};
-            return [
+            const groups = [
                 { key: '_identity', label: '身份', builtin: true, fields: [
                     { key: 'name', label: '用户名', type: 'text', builtin: true },
                     { key: 'identity', label: '身份设定', type: 'textarea', builtin: true, rows: 5 },
@@ -2278,6 +2062,7 @@ async function openUserEditor() {
                     { key: 'scene_meta.next_goal', label: '下一步目标', type: 'textarea', builtin: true, rows: 2 },
                 ]},
             ];
+            return groupsWithCustomFields(groups, ud, { key: '_custom', label: '自定义字段' });
         },
         postSave: async () => { showToast('用户档案已保存，点「重置」生效'); },
     });
@@ -2310,12 +2095,16 @@ function showModelParamsEditor() {
         </div>`;
 
     const saveParams = async () => {
-        state.modelParams.temperature = Number(body.querySelector('#p-temp').value);
-        state.modelParams.top_p = Number(body.querySelector('#p-topp').value);
-        state.modelParams.top_k = Number(body.querySelector('#p-topk').value);
-        state.modelParams.num_predict = Number(body.querySelector('#p-nump').value);
-        state.modelParams.think = body.querySelector('#p-think').checked;
-        await saveSettings();
+        const next = {
+            temperature: Number(body.querySelector('#p-temp').value),
+            top_p: Number(body.querySelector('#p-topp').value),
+            top_k: Number(body.querySelector('#p-topk').value),
+            num_predict: Number(body.querySelector('#p-nump').value),
+            think: body.querySelector('#p-think').checked,
+        };
+        await saveSettings(next);
+        state.modelParams = next;
+        return true;
     };
 
     // 只调用一次，footer 一次性到位
@@ -2445,9 +2234,7 @@ async function showSnapshotPreview(filename, snapshotRef = captureSessionRef()) 
 
 async function showPromptsEditor() {
     try {
-        const data = await apiClient.get(API.prompts, {
-            schema: body => Boolean(body && typeof body.system === 'string' && typeof body.group_chat === 'string') || '提示词响应无效',
-        });
+        const data = await promptService.load();
         const body = document.createElement('div');
         body.innerHTML = `
             <div class="modal-tabs">
@@ -2479,7 +2266,7 @@ async function showPromptsEditor() {
             const statusEl = body.querySelector('#prompt-status');
             statusEl.textContent = '保存中…';
             try {
-                await apiClient.put(API.promptSave(currentTab), { content: textarea.value });
+                await promptService.save(currentTab, textarea.value);
                 statusEl.textContent = '✓ 已保存，下次对话生效';
                 setTimeout(() => { statusEl.textContent = ''; }, 3000);
             } catch (error) {
@@ -2490,10 +2277,7 @@ async function showPromptsEditor() {
         body.querySelector('#prompt-reset').addEventListener('click', async () => {
             if (!confirm('恢复为默认提示词？当前编辑内容会丢失。')) return;
             try {
-                await apiClient.post(API.promptReset(currentTab));
-                const fresh = await apiClient.get(API.prompts, {
-                    schema: body => Boolean(body && typeof body.system === 'string' && typeof body.group_chat === 'string') || '提示词响应无效',
-                });
+                const fresh = await promptService.reset(currentTab);
                 data[currentTab] = fresh[currentTab]; textarea.value = fresh[currentTab] || '';
                 const statusEl = body.querySelector('#prompt-status');
                 statusEl.textContent = '✓ 已恢复默认'; setTimeout(() => { statusEl.textContent = ''; }, 3000);
@@ -2577,12 +2361,6 @@ function bindUI() {
         }
     });
 
-    // ===== 旧绑定（保留兜底，节点已被 legacy-hide） =====
-    const oldProjSel = document.getElementById('project-select');
-    if (oldProjSel) oldProjSel.addEventListener('change', (e) => switchProject(e.target.value));
-    const oldSaveSel = document.getElementById('save-select');
-    if (oldSaveSel) oldSaveSel.addEventListener('change', (e) => switchSave(e.target.value));
-
     // 模型切换
     document.getElementById('model-select').addEventListener('change', async (e) => {
         const model = e.target.value;
@@ -2642,12 +2420,6 @@ function bindUI() {
         document.getElementById('thinking-panel').classList.add('hidden');
     });
 
-    // Modal 关闭
-    document.getElementById('modal-close').addEventListener('click', hideModal);
-    document.getElementById('modal-cancel').addEventListener('click', hideModal);
-    document.getElementById('modal-backdrop').addEventListener('click', (e) => {
-        if (e.target === e.currentTarget) hideModal();
-    });
 }
 
 // ===== 新顶栏所需的弹窗辅助函数 =====
@@ -2658,7 +2430,8 @@ function promptForNewProject() {
     input.style.cssText = 'width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text)';
     showModal({ title: '新建项目（世界观）', body: input, footer: { confirmText: '创建', onConfirm: async () => {
         const name = input.value.trim();
-        if (name) await createNewProject(name);
+        if (!name) return false;
+        return Boolean(await createNewProject(name));
     }}});
     setTimeout(() => input.focus(), 100);
 }
@@ -2669,7 +2442,7 @@ function promptForNewSave() {
     input.style.cssText = 'width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text)';
     showModal({ title: '新建存档', body: input, footer: { confirmText: '创建', onConfirm: async () => {
         const name = input.value.trim() || '新存档';
-        await createNewSave(name);
+        return Boolean(await createNewSave(name));
     }}});
     setTimeout(() => input.focus(), 100);
 }
@@ -2681,7 +2454,8 @@ function promptForRenameSave() {
     input.style.cssText = 'width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text)';
     showModal({ title: '重命名存档', body: input, footer: { confirmText: '保存', onConfirm: async () => {
         const name = input.value.trim();
-        if (name) await renameCurrentSave(name);
+        if (!name) return false;
+        return Boolean(await renameCurrentSave(name));
     }}});
 }
 

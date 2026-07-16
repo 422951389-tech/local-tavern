@@ -38,21 +38,22 @@ test('client import preflight enforces extension and 8 MiB limit', () => {
     assert.match(security.validateImportFile({ name: 'save.json', size: 9 * 1024 * 1024 }), /8 MiB/);
 });
 
-test('security module loads before app and app has one escaping entry point', () => {
+test('security module loads before the ES module app and app has one escaping entry point', () => {
     const root = path.resolve(__dirname, '..');
     const html = fs.readFileSync(path.join(root, 'web', 'index.html'), 'utf8');
-    const app = fs.readFileSync(path.join(root, 'web', 'app.js'), 'utf8');
-    assert.ok(html.indexOf('security.js') < html.indexOf('app.js'));
-    assert.ok(html.indexOf('api-client.js') < html.indexOf('app.js'));
-    assert.ok(html.indexOf('session-ref.js') < html.indexOf('app.js'));
-    assert.ok(html.indexOf('turn-client.js') < html.indexOf('app.js'));
+    const app = fs.readFileSync(path.join(root, 'web', 'app.mjs'), 'utf8');
+    assert.ok(html.indexOf('security.js') < html.indexOf('app.mjs'));
+    assert.ok(html.indexOf('api-client.js') < html.indexOf('app.mjs'));
+    assert.ok(html.indexOf('session-ref.js') < html.indexOf('app.mjs'));
+    assert.ok(html.indexOf('turn-client.js') < html.indexOf('app.mjs'));
+    assert.match(html, /<script\s+type="module"\s+src="\/static\/app\.mjs/);
     assert.equal((app.match(/function escapeHtml\s*\(/g) || []).length, 1);
     assert.match(app, /aria-live/);
     assert.doesNotMatch(app, /\$\{c\.affinity\}/);
 });
 
 test('session writes use ApiClient, immutable refs and persistent turn APIs', () => {
-    const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.js'), 'utf8');
+    const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.mjs'), 'utf8');
     assert.match(app, /const expectedRevision = currentRevision\(requestRef\)/);
     assert.match(app, /expected_revision:\s*expectedRevision/);
     assert.match(app, /dataset\.messageId/);
@@ -69,7 +70,7 @@ test('session writes use ApiClient, immutable refs and persistent turn APIs', ()
 });
 
 test('regenerate is one atomic turn command with no client-side history surgery', () => {
-    const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.js'), 'utf8');
+    const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.mjs'), 'utf8');
     const regenerate = sourceBetween(
         app,
         'async function regenerateFrom(messageRef)',
@@ -84,7 +85,7 @@ test('regenerate is one atomic turn command with no client-side history surgery'
 });
 
 test('message actions build stable references from message_id only', () => {
-    const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.js'), 'utf8');
+    const app = fs.readFileSync(path.resolve(__dirname, '..', 'web', 'app.mjs'), 'utf8');
     const bindings = sourceBetween(
         app,
         'function bindMessageActions(msgEl)',
@@ -95,4 +96,25 @@ test('message actions build stable references from message_id only', () => {
     assert.match(bindings, /const messageRef\s*=\s*\{\s*message_id:\s*messageId\s*\}\s*;/);
     assert.doesNotMatch(bindings, /dataset\.index|\bidxRaw\b|\bindex\s*:/);
     assert.doesNotMatch(bindings, /message_id:\s*messageId\s*\|\|/);
+});
+
+test('frontend modules have no duplicate named function declarations', () => {
+    const webRoot = path.resolve(__dirname, '..', 'web');
+    const files = fs.readdirSync(webRoot).filter(name => /\.(?:js|mjs)$/.test(name));
+    for (const name of files) {
+        const source = fs.readFileSync(path.join(webRoot, name), 'utf8');
+        const declarations = [...source.matchAll(/\bfunction\s+([A-Za-z_$][\w$]*)\s*\(/g)].map(match => match[1]);
+        const duplicates = declarations.filter((value, index) => declarations.indexOf(value) !== index);
+        assert.deepEqual([...new Set(duplicates)], [], name);
+    }
+});
+
+test('legacy hidden controls and their bindings are removed', () => {
+    const root = path.resolve(__dirname, '..');
+    const html = fs.readFileSync(path.join(root, 'web', 'index.html'), 'utf8');
+    const app = fs.readFileSync(path.join(root, 'web', 'app.mjs'), 'utf8');
+    const css = fs.readFileSync(path.join(root, 'web', 'style.css'), 'utf8');
+    assert.doesNotMatch(html, /legacy-hide|id="(?:project-select|save-select|project-new|save-new|save-rename|save-delete|save-export|save-import|cards-btn)"/);
+    assert.doesNotMatch(app, /oldProjSel|oldSaveSel|oldProjectSelect|oldSelect/);
+    assert.doesNotMatch(css, /\.legacy-hide/);
 });

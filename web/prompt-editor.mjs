@@ -1,0 +1,26 @@
+export function createPromptService(client, endpoints) {
+    if (!client || typeof client.get !== 'function' || typeof client.put !== 'function') {
+        throw new TypeError('Prompt 服务需要 ApiClient');
+    }
+    if (!endpoints || !endpoints.prompts) throw new TypeError('Prompt 服务缺少 endpoints');
+
+    function validate(body) {
+        return Boolean(body && typeof body.system === 'string' && typeof body.group_chat === 'string')
+            || '提示词响应无效';
+    }
+
+    function load() {
+        return client.get(endpoints.prompts, { schema: validate });
+    }
+
+    function save(name, content) {
+        return client.put(endpoints.promptSave(name), { content });
+    }
+
+    async function reset(name) {
+        await client.post(endpoints.promptReset(name));
+        return load();
+    }
+
+    return Object.freeze({ load, save, reset });
+}

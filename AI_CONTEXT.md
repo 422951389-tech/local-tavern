@@ -104,7 +104,8 @@ C:\local-tavern\
 └── web/                       # 前端
     ├── index.html             # 主页面 + Modal 容器
     ├── style.css              # 样式（深色 + 古风暖金强调色）
-    └── app.js                 # 前端逻辑（700+ 行）
+    ├── app.mjs                # 前端组合入口（原生 ES module）
+    └── *.mjs                  # 项目/存档/聊天/摘要/卡片/Prompt/渲染等职责模块
 ```
 
 ---
@@ -116,9 +117,9 @@ C:\local-tavern\
 ```
 [用户打字]
    ↓
-[web/app.js fetch /api/chat]
+[web/app.mjs + chat.mjs POST /api/chat/turns]
    ↓
-[server.py: api_chat]
+[routes/chat.py: 持久化 turn API]
    ├─ load_session(session_id)
    ├─ load_worldbook() + match_worldbook(user_input)  # 关键词触发
    ├─ build_messages()  # 拼装 system + history + user_input
@@ -201,8 +202,8 @@ C:\local-tavern\
 1. **`prompts/system.md`** —— AI 行为铁律，改格式/规则改这里
 2. **`core/prompt_builder.py`** —— prompt 怎么拼装，变量替换逻辑
 3. **`core/response_parser.py`** —— 解析 AI 输出的正则，加字段改这里
-4. **`server.py: api_chat`** —— 主聊天流程的核心
-5. **`web/app.js`** —— 前端怎么渲染角色卡/处理 SSE 流
+4. **`routes/chat.py` 与 `core/chat_turns.py`** —— 持久回合 API 与后台生成状态机
+5. **`web/app.mjs` 与 `web/*.mjs`** —— 前端组合、领域服务与持久 SSE 回合处理
 6. **`data/characters/_template.yaml`** —— 角色卡字段定义
 
 ---
@@ -357,7 +358,7 @@ active: true              # 是否默认出场
 | `data/user/_template.yaml` | 26 |
 | `web/index.html` | ~110 |
 | `web/style.css` | ~580 |
-| `web/app.js` | ~700 |
+| `web/app.mjs` + `web/*.mjs` | ~3200 |
 | `start.bat` | 46 |
 | `requirements.txt` | 5 |
 | `README.md` | 65 |
@@ -376,6 +377,6 @@ active: true              # 是否默认出场
 
 ---
 
-**最后更新**：2026-06-27  v1 + 增强完成
+**最后更新**：2026-07-16  FE-2 原生 ES modules
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目
