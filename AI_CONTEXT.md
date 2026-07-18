@@ -3,7 +3,7 @@
 > **目的**：让下一个 AI 协作者在不询问用户的情况下，能完整理解这个项目并继续工作。
 > **创建日期**：2026-06-27
 > **最后更新**：2026-07-18
-> **当前状态**：阶段 A、B、C completed；阶段 D 的 PROMPT-1、MEMORY-1、WORLD-1 completed，当前进入 ROLE-1
+> **当前状态**：阶段 A、B、C、D completed；PROMPT-1、MEMORY-1、WORLD-1、ROLE-1 已验收，当前进入 OPS-1 / OPS-2
 > **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
 
 ---
@@ -76,6 +76,7 @@ C:\local-tavern\
 │   ├── session_manager.py     # 存档管理 + 多时间线（260+ 行）
 │   ├── prompt_assembler.py    # ★ PROMPT-1：来源单次注入、总预算、裁剪诊断
 │   ├── worldbook_policy.py    # ★ WORLD-1：三态触发、稳定排序与脱敏诊断
+│   ├── roleplay_policy.py     # ★ ROLE-1：发言上下文、身份解析、禁言倒计时
 │   ├── token_estimator.py     # ★ PROMPT-1：可替换的保守 token 估算协议
 │   ├── summary_lifecycle.py   # ★ MEMORY-1：稳定 ID、严格校验、异步生成与代际收口
 │   ├── session_store.py       # revision/CAS、旧摘要稳定迁移、来源状态派生
@@ -108,7 +109,7 @@ C:\local-tavern\
     ├── index.html             # 主页面 + Modal 容器
     ├── style.css              # 样式（深色 + 古风暖金强调色）
     ├── app.mjs                # 前端组合入口（原生 ES module）
-    └── *.mjs                  # 项目/存档/聊天/摘要/世界书/卡片/Prompt/渲染等职责模块
+    └── *.mjs                  # 项目/存档/聊天/摘要/世界书/角色节奏/卡片/Prompt/渲染等职责模块
 ```
 
 ---
@@ -158,6 +159,8 @@ C:\local-tavern\
 | **摘要稳定 UUID + trim 双向绑定** | 编辑和重生成按 `summary_id` 精确定位；每段只读取自己的 `source_snapshot_id`，不回退最新快照 |
 | **摘要状态与内容有效性分离** | `pending/completed/failed` 描述生成任务，`content_status` 决定正文能否进入 Prompt；失败重试不丢旧有效正文 |
 | **生成代际令牌** | 后台结果只写回相同 `generation_id` 的 pending 段，人工编辑、新重试和乱序任务不会被旧结果覆盖 |
+| **角色发言快照** | turn 接受时冻结 `may_speak/chattiness/remaining_silent_turns`；Prompt 与解析写回使用同一份上下文 |
+| **完成回合计数** | 仅 completed 普通 chat 在唯一 Session 提交内扣减禁言；重生成、取消、失败和中断恢复均不扣减 |
 
 ---
 
@@ -197,6 +200,8 @@ C:\local-tavern\
 | POST | `/api/session/restore` | 从普通/reset 快照恢复（trim 仅供摘要原文查看） |
 | PATCH | `/api/session/summary` | 按稳定 `summary_id` 严格编辑任意摘要段 |
 | POST | `/api/session/summary/regenerate` | 按绑定 trim 快照异步重生成，返回 202 |
+| PATCH | `/api/session/characters/{character_id}/silence` | 按 revision CAS 保存角色剩余禁言成功轮次（0–999） |
+| PATCH | `/api/session/roleplay-policy` | 按 revision CAS 保存禁言角色严格写回开关 |
 
 ### 模型切换与聊天
 | 方法 | 路径 | 说明 |
@@ -216,9 +221,9 @@ C:\local-tavern\
 1. **`prompts/system.md`** —— AI 行为铁律，改格式/规则改这里
 2. **`core/prompt_assembler.py` + `core/token_estimator.py`** —— Prompt 总预算、裁剪顺序、诊断与估算规则
 3. **`core/response_parser.py`** —— 解析 AI 输出的正则，加字段改这里
-4. **`routes/chat.py` 与 `core/chat_turns.py`** —— 持久回合 API 与后台生成状态机
+4. **`routes/chat.py`、`core/chat_turns.py` 与 `core/roleplay_policy.py`** —— 持久回合、角色发言快照、解析写回与终态计数
 5. **`core/summary_lifecycle.py` 与 `routes/messages.py`** —— 摘要严格校验、来源绑定、失败重试与并发收口
-6. **`web/app.mjs`、`web/summary-panel.mjs` 与 `web/*.mjs`** —— 前端组合、任意摘要段操作与持久 SSE 回合处理
+6. **`web/app.mjs`、`web/summary-panel.mjs`、`web/roleplay.mjs` 与 `web/*.mjs`** —— 前端组合、摘要、角色节奏与持久 SSE 回合处理
 7. **`data/characters/_template.yaml`** —— 角色卡字段定义
 
 ---
@@ -228,6 +233,8 @@ C:\local-tavern\
 ```yaml
 id: char_id              # 唯一标识（文件名用这个）
 name: 角色名              # 显示名
+aliases: []               # 身份解析别名；仅唯一命中才允许写回
+chattiness: 50            # 0–100 提示权重，不是发言人数配额
 tagline: 核心特征         # 30 字内
 persona: |               # 详细人设（300-1000 字）
   ...
@@ -312,7 +319,7 @@ active: true              # 是否默认出场
 
 ## 10. 待办 / 未实现
 
-完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。当前依赖顺序为 `ROLE-1 → 阶段 E`。
+完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。当前依赖顺序为 `OPS-1 → OPS-2 → UX-1 → SEARCH-1 → REL-1`。
 
 ---
 
@@ -332,6 +339,7 @@ active: true              # 是否默认出场
    - 消息 hover 可删/编辑/重生成
    - 顶部 ⚙ 提示词可编辑 system/group_chat/summary；摘要面板可按段查看原文、编辑、重生成或重试
    - 世界书页可编辑项目共享条目，并为当前存档单独选择 manual 条目；命中诊断不显示正文
+   - 右侧「角色状态与禁言」可保存当前存档的禁言倒计时和严格写回策略；角色卡编辑器保存项目共享 chattiness
    - 关闭浏览器再开会话仍在（自动保存）
 
 ---
@@ -389,6 +397,6 @@ active: true              # 是否默认出场
 
 ---
 
-**最后更新**：2026-07-18  WORLD-1 三态触发、存档级手动选择与可解释诊断
+**最后更新**：2026-07-18  ROLE-1 确定性发言控制、禁言成功轮次与脱敏写回警告
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目
