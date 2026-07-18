@@ -2,8 +2,8 @@
 
 > **目的**：让下一个 AI 协作者在不询问用户的情况下，能完整理解这个项目并继续工作。
 > **创建日期**：2026-06-27
-> **最后更新**：2026-07-18
-> **当前状态**：阶段 A、B、C、D completed；OPS-1 completed，OPS-2 运行基线已落地但开发锁验收仍 in_progress；当前实施 UX-1
+> **最后更新**：2026-07-18（UX-1）
+> **当前状态**：阶段 A、B、C、D completed；OPS-1、UX-1 completed，OPS-2 运行基线已落地但开发锁验收仍 in_progress；当前实施 SEARCH-1
 > **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
 
 ---
@@ -106,7 +106,7 @@ C:\local-tavern\
     ├── index.html             # 主页面 + Modal 容器
     ├── style.css              # 样式（深色 + 古风暖金强调色）
     ├── app.mjs                # 前端组合入口（原生 ES module）
-    └── *.mjs                  # 项目/存档/聊天/摘要/世界书/角色节奏/卡片/Prompt/渲染等职责模块
+    └── *.mjs                  # 项目/存档/聊天/摘要/世界书/角色节奏/卡片/Prompt/渲染/listbox/帧合并等职责模块
 ```
 
 ---
@@ -135,7 +135,7 @@ C:\local-tavern\
         ├─ response_parser.parse_response()  # 拆出角色卡/建议
         ├─ 更新 session（scene_meta + characters_state）
         ├─ save_session()  # 原子写
-        └─ SSE 推送 {type:"parsed", parsed, session} 给前端
+        └─ SSE 推送 {type:"parsed", parsed, revision, session_delta} 给前端
 ```
 
 ### 4.2 关键设计决策
@@ -163,6 +163,8 @@ C:\local-tavern\
 
 **OPS-1/OPS-2 运行边界（提交 `c16ddb4`）**：官方入口只调用项目 Python 3.12 `.venv` 和 `core.launcher serve --workers 1`；启动前逐包比对 22 包 runtime lock，路径/host/port/PID/log/Ollama 配置来自 `core.config`。launcher 预绑定最终 socket，foreign listener 不打开浏览器；hidden 使用轮转日志。lifespan 启动失败与外部取消仍完整清理 PID/任务/client。pytest 476/476、Node 60/60、17 个模块语法、隔离真实子进程 smoke 与独立 P0/P1 终审通过；真实 data 31 文件 / `F20D671B…A68EDF`、backups 97 文件 / `81F28F77…D2C888`、logs 0 文件 / `E3B0C442…B855` 均未变化，95 个历史 ZIP 未删除。coverage/Ruff/Playwright、hash lock 与全新环境安装验收尚未完成。
 
+**UX-1 边界（提交 `f0dcd87`）**：项目统计使用一次聚合 API；现代 parsed 事件只携带 revision 与场景/角色/策略/模型四字段 delta，旧日志缺 warnings 时仍可重放。旧 Session 的 scene_meta 缺失/null/字符串只在内存补六字段。流式文本按动画帧合并，历史消息单 Fragment 挂载；终态权威 reload 前保持写锁。Modal、listbox、角色卡和消息操作具备键盘、焦点恢复与 44px 触控路径。375/600/768px Edge 隔离验收无横向滚动，下拉保留 16px 边界；pytest 487/487、Node 72/72、19 个模块语法和独立 P0/P1 终审通过。axe/Playwright 未运行，仍属于 OPS-2 外部开发依赖门。
+
 ---
 
 ## 5. API 完整列表
@@ -173,6 +175,7 @@ C:\local-tavern\
 | GET | `/health/live` | 固定存活标记；200、no-store，不探测磁盘/Ollama |
 | GET | `/health/ready` | data/runtime/Ollama/maintenance；全部通过 200，否则 503 |
 | GET | `/api/models` | 列出 Ollama 可用模型 |
+| GET | `/api/projects/stats` | 一次返回各项目角色、世界书与权威存档数量；单项目错误固定降级 |
 | GET | `/api/characters` | 列出所有角色卡 |
 | GET | `/api/user` | 获取用户档案 |
 
@@ -323,7 +326,7 @@ active: true              # 是否默认出场
 
 ## 10. 待办 / 未实现
 
-完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。OPS-1 已完成；当前顺序为 `UX-1 → SEARCH-1 → REL-1`。OPS-2 的 coverage/Ruff/Playwright、hash lock 与全新环境安装在取得外部下载确认后收口。
+完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。OPS-1、UX-1 已完成；当前顺序为 `SEARCH-1 → REL-1`。OPS-2 的 coverage/Ruff/Playwright、hash lock 与全新环境安装在取得外部下载确认后收口。
 
 ---
 
@@ -385,6 +388,6 @@ active: true              # 是否默认出场
 
 ---
 
-**最后更新**：2026-07-18  OPS-1 安全启动、health、轮转日志与 OPS-2 运行锁/配置基线
+**最后更新**：2026-07-18  UX-1 响应式、可访问性、前端性能与轻量 parsed 事件
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目
