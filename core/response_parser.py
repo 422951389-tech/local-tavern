@@ -23,6 +23,7 @@ def parse_response(raw: str) -> dict:
         ],
         "narration": "场景旁白文本" | "",
         "suggestions": ["建议1", "建议2", "建议3"],
+        "roleplay_warnings": [],
         "raw": 原始文本
     }
     """
@@ -31,6 +32,7 @@ def parse_response(raw: str) -> dict:
         "characters": [],
         "narration": "",
         "suggestions": [],
+        "roleplay_warnings": [],
         "raw": raw,
     }
 

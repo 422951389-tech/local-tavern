@@ -109,3 +109,34 @@ def test_compat_builder_uses_keyword_and_manual_activation_without_control_field
     assert _occurrences(messages, '"activation"') == 0
     assert _occurrences(messages, '"keywords"') == 0
     assert _occurrences(messages, '"priority"') == 0
+
+
+def test_compat_builder_keeps_roleplay_controls_in_character_slot_once():
+    messages = prompt_builder.build_messages(
+        user_input="继续",
+        characters=[{"id": "solo", "name": "独角", "chattiness": 90}],
+        characters_state={"solo": {"remaining_silent_turns": 1}},
+        scene_meta={},
+        user_profile={},
+        worldbook_entries=[],
+        history=[],
+        summaries=[],
+        roleplay_context={
+            "strict_muted_writeback": False,
+            "characters": [{
+                "id": "solo",
+                "name": "独角",
+                "aliases": [],
+                "chattiness": 90,
+                "remaining_silent_turns": 1,
+                "may_speak": False,
+            }],
+            "speakable_ids": [],
+            "muted_ids": ["solo"],
+        },
+    )
+
+    assert _occurrences(messages, '"id":"solo"') == 1
+    assert _occurrences(messages, '"may_speak":false') == 1
+    assert _occurrences(messages, '"remaining_silent_turns":1') == 1
+    assert _occurrences(messages, '"chattiness":90') == 1

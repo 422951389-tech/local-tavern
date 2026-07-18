@@ -24,6 +24,17 @@ from core.prompt_assembler import (
     PromptTemplateInvalid,
 )
 from core.response_parser import parse_response, check_voice_confusion
+from core.roleplay_policy import (
+    ACTION_UNRESOLVED_SKIPPED,
+    ACTION_WRITEBACK_APPLIED,
+    ACTION_WRITEBACK_SKIPPED,
+    WARNING_AMBIGUOUS_CHARACTER_IDENTITY,
+    WARNING_MUTED_CHARACTER_OUTPUT,
+    WARNING_UNKNOWN_CHARACTER_IDENTITY,
+    build_roleplay_context,
+    decrement_silence_counters,
+    resolve_character_id,
+)
 from core.summary_lifecycle import (
     schedule_summary_generation,
     shutdown_summary_tasks,
@@ -122,6 +133,7 @@ def _validated_parameters(req: ChatRequest | RegenerateRequest) -> dict:
 async def _prepare_turn(
     req: ChatRequest | RegenerateRequest,
     *,
+    turn_kind: str = "chat",
     user_text_override: str | None = None,
     session_override: dict | None = None,
     history_override: list[dict] | None = None,
@@ -164,13 +176,11 @@ async def _prepare_turn(
     characters = [load_character(project, cid) for cid in session.get("characters_state", {}).keys()]
     characters = [c for c in characters if c]
 
-    # B2：建立角色卡 name -> cid 反向映射
-    char_name_to_cid = {}
-    for c in characters:
-        cid = c.get("id")
-        name = c.get("name", "")
-        if cid and name:
-            char_name_to_cid[name] = cid
+    roleplay_context = build_roleplay_context(
+        characters,
+        session.get("characters_state", {}),
+        session.get("roleplay_policy"),
+    )
 
     user_profile = load_user_profile(project)
     wb_entries = load_worldbook(project)
@@ -195,6 +205,7 @@ async def _prepare_turn(
             context_limit_source=context_info["source"],
             num_predict=params["num_predict"],
             manual_worldbook_ids=session.get("manual_worldbook_ids", []),
+            roleplay_context=roleplay_context,
         )
     except (
         PromptBudgetExceeded,
@@ -214,7 +225,8 @@ async def _prepare_turn(
         "params": params,
         "session": deepcopy(session),
         "characters": characters,
-        "char_name_to_cid": char_name_to_cid,
+        "roleplay_context": deepcopy(roleplay_context),
+        "turn_kind": turn_kind,
         "messages": assembly.messages,
         "prompt_diagnostics": assembly.diagnostics,
     }
@@ -227,9 +239,12 @@ def _message_metadata(
     *,
     in_prompt: bool,
     created_at: str,
+    turn_kind: str,
+    roleplay_warnings: list[dict] | None = None,
 ) -> dict:
-    return {
+    metadata = {
         "turn_id": turn_id,
+        "turn_kind": turn_kind,
         "status": status,
         "error": deepcopy(error),
         "timestamps": {
@@ -238,6 +253,9 @@ def _message_metadata(
         },
         "in_prompt": in_prompt,
     }
+    if roleplay_warnings is not None:
+        metadata["roleplay_warnings"] = deepcopy(roleplay_warnings)
+    return metadata
 
 
 def _finalize_turn_messages(
@@ -250,6 +268,7 @@ def _finalize_turn_messages(
     error: dict | None,
     *,
     trim: bool = True,
+    roleplay_warnings: list[dict] | None = None,
 ) -> tuple[dict, dict | None, list[dict]]:
     user_message = next(
         (
@@ -271,6 +290,7 @@ def _finalize_turn_messages(
         error,
         in_prompt=True,
         created_at=created_at,
+        turn_kind=prepared.get("turn_kind", "chat"),
     ))
     assistant_message = None
     if status == "completed" or content or thinking:
@@ -285,6 +305,8 @@ def _finalize_turn_messages(
                 error,
                 in_prompt=status == "completed",
                 created_at=created_at,
+                turn_kind=prepared.get("turn_kind", "chat"),
+                roleplay_warnings=roleplay_warnings,
             ),
         )
     dropped = (
@@ -298,9 +320,14 @@ def _finalize_turn_messages(
 def _apply_parsed_state(
     session: dict,
     parsed: dict,
-    characters: list[dict],
-    char_name_to_cid: dict[str, str],
-) -> None:
+    roleplay_context: dict,
+) -> list[dict]:
+    roleplay_warnings: list[dict] = []
+    muted_ids = {
+        character_id
+        for character_id in roleplay_context.get("muted_ids", [])
+        if isinstance(character_id, str)
+    }
     if parsed.get("scene_meta"):
         for key, value in parsed["scene_meta"].items():
             if not value or key == "user_line":
@@ -314,21 +341,51 @@ def _apply_parsed_state(
                 session["scene_meta"][key] = value
 
     for character in parsed.get("characters", []):
-        name = character.get("name", "")
-        matched = False
-        for state in session.get("characters_state", {}).values():
-            if state.get("name") == name:
-                apply_character_state(state, character)
-                matched = True
-                break
-        if not matched:
-            cid = char_name_to_cid.get(name)
-            if cid and cid in session.get("characters_state", {}):
-                apply_character_state(session["characters_state"][cid], character)
-                matched = True
-                logger.info("角色「%s」通过 name→cid(%s) 映射写回状态", name, cid)
-        if not matched and name:
-            logger.info("解析到角色「%s」但 characters_state 无匹配，已跳过", name)
+        if not isinstance(character, dict):
+            continue
+        resolved = resolve_character_id(character.get("name"), roleplay_context)
+        status = resolved.get("status")
+        if status == "ambiguous":
+            roleplay_warnings.append({
+                "code": WARNING_AMBIGUOUS_CHARACTER_IDENTITY,
+                "action": ACTION_UNRESOLVED_SKIPPED,
+                "candidate_ids": sorted({
+                    candidate
+                    for candidate in resolved.get("candidate_ids", [])
+                    if isinstance(candidate, str) and candidate
+                }),
+            })
+            continue
+        if status != "matched":
+            roleplay_warnings.append({
+                "code": WARNING_UNKNOWN_CHARACTER_IDENTITY,
+                "action": ACTION_UNRESOLVED_SKIPPED,
+            })
+            continue
+
+        character_id = resolved.get("character_id")
+        state = session.get("characters_state", {}).get(character_id)
+        if not isinstance(character_id, str) or not isinstance(state, dict):
+            roleplay_warnings.append({
+                "code": WARNING_UNKNOWN_CHARACTER_IDENTITY,
+                "action": ACTION_UNRESOLVED_SKIPPED,
+            })
+            continue
+        if character_id in muted_ids:
+            strict = roleplay_context.get("strict_muted_writeback") is True
+            roleplay_warnings.append({
+                "code": WARNING_MUTED_CHARACTER_OUTPUT,
+                "action": (
+                    ACTION_WRITEBACK_SKIPPED if strict else ACTION_WRITEBACK_APPLIED
+                ),
+                "character_id": character_id,
+            })
+            if strict:
+                continue
+        apply_character_state(state, character)
+
+    parsed["roleplay_warnings"] = deepcopy(roleplay_warnings)
+    return roleplay_warnings
 
 
 async def _commit_partial(
@@ -405,6 +462,7 @@ async def _reconcile_failed_turn_on_current(
                 error,
                 in_prompt=True,
                 created_at=created_at,
+                turn_kind=prepared.get("turn_kind", "chat"),
             ))
             assistant = next(
                 (
@@ -422,6 +480,7 @@ async def _reconcile_failed_turn_on_current(
                     error,
                     in_prompt=False,
                     created_at=created_at,
+                    turn_kind=prepared.get("turn_kind", "chat"),
                 )
                 if assistant is None:
                     append_history(
@@ -462,11 +521,10 @@ async def _commit_completed(
     except Exception:
         logger.exception("角色声线校验失败，不阻断 turn 提交")
 
-    _apply_parsed_state(
+    roleplay_warnings = _apply_parsed_state(
         session,
         parsed,
-        prepared["characters"],
-        prepared["char_name_to_cid"],
+        prepared["roleplay_context"],
     )
     _user, _assistant, dropped = _finalize_turn_messages(
         session,
@@ -476,6 +534,7 @@ async def _commit_completed(
         thinking,
         "completed",
         None,
+        roleplay_warnings=roleplay_warnings,
     )
 
     session["current_model"] = prepared["model"]
@@ -485,6 +544,10 @@ async def _commit_completed(
     def commit_chat(current: dict, context) -> str | None:
         current.clear()
         current.update(deepcopy(session))
+        # 起始为 1 的角色已在冻结 Prompt 上下文中保持 muted；只有普通
+        # completed chat 在这次唯一 Session commit 内把它递减为 0。
+        if prepared.get("turn_kind", "chat") == "chat":
+            decrement_silence_counters(current)
         if dropped:
             snapshot_path = context.snapshot(
                 "trim",
@@ -515,9 +578,11 @@ async def _commit_completed(
         prepared["expected_revision"],
         commit_chat,
     )
+    await runtime.mark_session_committed(mutation.session["revision"])
     parsed_event = {
         "type": "parsed",
         "parsed": parsed,
+        "roleplay_warnings": deepcopy(roleplay_warnings),
         "session": mutation.session,
     }
     await runtime.emit(parsed_event, session_revision=mutation.session["revision"])
@@ -712,6 +777,10 @@ def _turn_worker(prepared: dict):
         except RevisionConflict as conflict:
             await runtime.terminal("failed", error=_revision_error(conflict))
         except Exception as exc:
+            # Session completed commit 是权威终态；完成后的 parsed/terminal
+            # 日志故障交由 coordinator 以 completed 收口，禁止走失败写回。
+            if runtime.session_committed_revision is not None:
+                raise
             logger.exception("turn 生成异常")
             await _fail_turn(
                 runtime,
@@ -726,7 +795,7 @@ def _turn_worker(prepared: dict):
 
 
 async def _start_turn(req: ChatRequest) -> dict:
-    prepared = await _prepare_turn(req)
+    prepared = await _prepare_turn(req, turn_kind="chat")
     coordinator = get_turn_coordinator()
 
     def accepted(session: dict) -> None:
@@ -745,6 +814,7 @@ async def _start_turn(req: ChatRequest) -> dict:
             accepted_callback=accepted,
             worker=_turn_worker(prepared),
             prompt_diagnostics=prepared["prompt_diagnostics"],
+            turn_kind="chat",
         )
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
@@ -774,6 +844,7 @@ async def _start_regenerated_turn(req: RegenerateRequest) -> dict:
 
     prepared = await _prepare_turn(
         req,
+        turn_kind="regenerate",
         user_text_override=plan.user_input,
         session_override=session,
         history_override=plan.prompt_history,
@@ -809,6 +880,7 @@ async def _start_regenerated_turn(req: RegenerateRequest) -> dict:
             worker=_turn_worker(prepared),
             accept_command=accept_command,
             prompt_diagnostics=prepared["prompt_diagnostics"],
+            turn_kind="regenerate",
         )
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)

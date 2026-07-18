@@ -16,6 +16,7 @@
         'send', 'model', 'reset', 'rename', 'delete', 'restore',
         'message_edit', 'message_delete', 'pin', 'include', 'regenerate',
         'summary', 'project_switch', 'save_switch', 'card_write',
+        'roleplay',
     ]);
 
     function isObject(value) {

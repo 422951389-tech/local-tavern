@@ -32,6 +32,7 @@ from core.recovery_store import (
     RecoveryStore,
     sha256_file,
 )
+from core.roleplay_policy import normalize_silent_turns
 from core.worldbook_policy import MAX_MANUAL_WORLDBOOK_IDS
 
 
@@ -172,6 +173,23 @@ def normalize_session(session: dict, project: str, save_id: str) -> dict:
     session["manual_worldbook_ids"] = sorted(normalized_manual_ids)[
         :MAX_MANUAL_WORLDBOOK_IDS
     ]
+    raw_policy = session.get("roleplay_policy")
+    roleplay_policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
+    roleplay_policy["strict_muted_writeback"] = (
+        roleplay_policy.get("strict_muted_writeback") is True
+    )
+    session["roleplay_policy"] = roleplay_policy
+    raw_character_states = session.get("characters_state")
+    if not isinstance(raw_character_states, dict):
+        raw_character_states = {}
+        session["characters_state"] = raw_character_states
+    for character_id, raw_state in tuple(raw_character_states.items()):
+        if not isinstance(raw_state, dict):
+            raw_state = {}
+            raw_character_states[character_id] = raw_state
+        raw_state["remaining_silent_turns"] = normalize_silent_turns(
+            raw_state.get("remaining_silent_turns", 0)
+        )
     summaries = session.setdefault("summaries", [])
     if not isinstance(summaries, list):
         summaries = []

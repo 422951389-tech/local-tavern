@@ -37,6 +37,7 @@ from routes import (
     characters,
     user,
     worldbook,
+    roleplay,
     settings,
     sessions,
     chat,
@@ -222,6 +223,7 @@ app.include_router(projects.router)
 app.include_router(characters.router)
 app.include_router(user.router)
 app.include_router(worldbook.router)
+app.include_router(roleplay.router)
 app.include_router(settings.router)
 app.include_router(sessions.router)
 app.include_router(chat.router)

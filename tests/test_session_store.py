@@ -56,6 +56,41 @@ async def test_legacy_read_adds_stable_ids_only_in_memory(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_roleplay_defaults_are_added_only_in_memory_for_legacy_session(tmp_path):
+    store = SessionStore(tmp_path / "projects")
+    path = store.session_path("roleplay_legacy", "legacy_save")
+    legacy = _session("roleplay_legacy", "legacy_save")
+    legacy["characters_state"] = {
+        "alpha": {"name": "阿尔法"},
+        "invalid": {"remaining_silent_turns": "3"},
+    }
+    atomic_write(path, json.dumps(legacy, ensure_ascii=False))
+    before = path.read_bytes()
+
+    loaded = await store.read("roleplay_legacy", "legacy_save")
+    assert loaded["roleplay_policy"] == {"strict_muted_writeback": False}
+    assert loaded["characters_state"]["alpha"]["remaining_silent_turns"] == 0
+    assert loaded["characters_state"]["invalid"]["remaining_silent_turns"] == 0
+    assert path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_new_session_persists_explicit_roleplay_defaults(tmp_path):
+    store = SessionStore(tmp_path / "projects")
+    session = _session("roleplay_new", "new_save")
+    session["characters_state"] = {"alpha": {"name": "阿尔法"}}
+    created = await store.create("roleplay_new", "new_save", session)
+
+    assert created["roleplay_policy"] == {"strict_muted_writeback": False}
+    assert created["characters_state"]["alpha"]["remaining_silent_turns"] == 0
+    on_disk = json.loads(
+        store.session_path("roleplay_new", "new_save").read_text(encoding="utf-8")
+    )
+    assert on_disk["roleplay_policy"] == {"strict_muted_writeback": False}
+    assert on_disk["characters_state"]["alpha"]["remaining_silent_turns"] == 0
+
+
+@pytest.mark.asyncio
 async def test_revision_is_monotonic_and_stale_write_is_rejected(tmp_path):
     store = SessionStore(tmp_path / "projects")
     created = await store.create("revision_project", "revision_save", _session("revision_project", "revision_save"))

@@ -33,6 +33,13 @@ from core.path_policy import (
     validate_file_id,
 )
 from core.recovery_store import DataCorruptionError
+from core.roleplay_policy import (
+    DEFAULT_CHATTINESS,
+    MAX_CHATTINESS,
+    MIN_CHATTINESS,
+    normalize_chattiness,
+    validate_chattiness,
+)
 from core.worldbook_policy import (
     ACTIVATIONS,
     MAX_WORLDBOOK_CONTENT_LENGTH,
@@ -85,6 +92,15 @@ CHARACTER_SCHEMA = {
             "fields": [
                 {"key": "voice_tone", "label": "整体语调", "type": "text", "placeholder": "轻声细语 / 大大咧咧"},
                 {"key": "speaking_style", "label": "说话方式", "type": "textarea", "rows": 4, "placeholder": '句末带"呢"，爱用省略号...'},
+                {
+                    "key": "chattiness",
+                    "label": "发言倾向 (0-100)",
+                    "type": "number",
+                    "min": MIN_CHATTINESS,
+                    "max": MAX_CHATTINESS,
+                    "default": DEFAULT_CHATTINESS,
+                    "hint": "仅作为群聊提示权重，不强制角色每轮发言",
+                },
                 {"key": "catchphrases", "label": "示范台词（每行一句）", "type": "textarea", "rows": 3, "array": True},
                 {"key": "abilities", "label": "能力（每行一个）", "type": "textarea", "rows": 2, "array": True},
             ],
@@ -370,14 +386,22 @@ def _safe_id(char_id: str) -> str:
 
 # ========== 角色卡 ==========
 
+def _normalize_character_card(data: dict) -> dict:
+    normalized = dict(data)
+    normalized["chattiness"] = normalize_chattiness(
+        normalized.get("chattiness", DEFAULT_CHATTINESS)
+    )
+    return normalized
+
 def load_character(project: str, char_id: str) -> dict:
     char_id = _safe_id(char_id)
-    return load_yaml(
+    data = load_yaml(
         get_character_path(project, char_id),
         entity_type="character",
         project=project,
         entity_id=char_id,
     )
+    return _normalize_character_card(data) if data else {}
 
 
 def list_characters(project: str) -> list[dict]:
@@ -395,7 +419,7 @@ def list_characters(project: str) -> list[dict]:
             entity_id=p.stem,
         )
         if data:
-            chars.append(data)
+            chars.append(_normalize_character_card(data))
     return chars
 
 
@@ -407,6 +431,9 @@ def save_character(project: str, char_id: str, data: dict) -> Path:
     if data.get("id") and data["id"] != char_id:
         raise ValueError(f"文件 id({char_id}) 与内容 id({data['id']}) 不一致")
     data["id"] = char_id
+    data["chattiness"] = validate_chattiness(
+        data.get("chattiness", DEFAULT_CHATTINESS)
+    )
     with yaml_write_transaction():
         d = resolve_under(ensure_project(project), "characters")
         path = resolve_under(d, f"{char_id}.yaml")

@@ -53,6 +53,7 @@ def _assemble(
     characters_state: dict | None = None,
     worldbook_entries: list[dict] | None = None,
     manual_worldbook_ids: list[str] | None = None,
+    roleplay_context: dict | None = None,
     history: list[dict] | None = None,
     summaries: list[dict] | None = None,
     user_input: str = "INPUT",
@@ -73,6 +74,7 @@ def _assemble(
         context_limit_source="test_context_limit",
         num_predict=num_predict,
         manual_worldbook_ids=manual_worldbook_ids,
+        roleplay_context=roleplay_context,
         safety_margin=safety_margin,
     )
 
@@ -219,6 +221,55 @@ def test_each_runtime_source_is_injected_once_without_cascading_template_values(
         "input_budget_tokens"
     ]
     assert all(set(source) == SOURCE_KEYS for source in assembly.diagnostics["sources"])
+
+
+def test_character_context_embeds_frozen_roleplay_controls_in_existing_slot(tmp_path):
+    assembler = _test_assembler(tmp_path)
+    context = {
+        "strict_muted_writeback": False,
+        "characters": [
+            {
+                "id": "quiet",
+                "name": "安静角色",
+                "aliases": ["小静"],
+                "chattiness": 12,
+                "remaining_silent_turns": 1,
+                "may_speak": False,
+            },
+            {
+                "id": "talkative",
+                "name": "活跃角色",
+                "aliases": [],
+                "chattiness": 88,
+                "remaining_silent_turns": 0,
+                "may_speak": True,
+            },
+        ],
+        "speakable_ids": ["talkative"],
+        "muted_ids": ["quiet"],
+    }
+    assembly = _assemble(
+        assembler,
+        characters=[
+            {"id": "quiet", "name": "安静角色"},
+            {"id": "talkative", "name": "活跃角色"},
+        ],
+        characters_state={
+            "quiet": {"remaining_silent_turns": 99},
+            "talkative": {"remaining_silent_turns": 99},
+        },
+        roleplay_context=context,
+    )
+
+    content = _all_content(assembly)
+    assert content.count('"id":"quiet"') == 1
+    assert content.count('"may_speak":false') == 1
+    assert content.count('"chattiness":12') == 1
+    assert content.count('"remaining_silent_turns":1') == 1
+    assert content.count('"id":"talkative"') == 1
+    assert content.count('"may_speak":true') == 1
+    assert content.count('"chattiness":88') == 1
+    assert content.count('"remaining_silent_turns":0') == 1
 
 
 def test_optional_growth_is_trimmed_with_body_free_diagnostics(tmp_path):
@@ -454,6 +505,10 @@ def test_current_and_latest_default_production_templates_have_no_named_ghosts():
         assert backups, f"{name} 缺少版本化默认模板"
         paths.append(backups[-1])
         assert (prompt_dir / f"{name}.md").read_bytes() == backups[-1].read_bytes()
+
+    group_plain_default = prompt_dir / ".default" / "group_chat.md"
+    assert (prompt_dir / "group_chat.md").read_bytes() == group_plain_default.read_bytes()
+    paths.append(group_plain_default)
 
     for path in paths:
         content = path.read_text(encoding="utf-8")

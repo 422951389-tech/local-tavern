@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from core.config import MAX_TURNS_IN_PROMPT, PROMPTS_DIR, PROMPT_SAFETY_MARGIN
+from core.roleplay_policy import build_roleplay_context
 from core.token_estimator import DEFAULT_TOKEN_ESTIMATOR, TokenEstimator
 from core.worldbook_policy import (
     WorldbookCandidate,
@@ -159,9 +160,15 @@ class PromptAssembler:
     def _character_sources(
         characters: list[dict],
         characters_state: dict,
+        roleplay_context: dict,
     ) -> list[tuple[str, str]]:
         result: list[tuple[str, str]] = []
         seen: set[str] = set()
+        roleplay_by_id = {
+            item.get("id"): item
+            for item in roleplay_context.get("characters", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
         for index, character in enumerate(characters):
             if not isinstance(character, dict):
                 continue
@@ -174,6 +181,17 @@ class PromptAssembler:
                 for key in _CHARACTER_PROFILE_FIELDS
                 if key in character and character[key] not in (None, "", [], {})
             }
+            roleplay = roleplay_by_id.get(cid, {})
+            # 这些控制字段与角色资料共用 character_context 单一槽位，避免
+            # 新增动态来源或重复注入。稳定 ID 即使卡片缺字段也必须显式给出。
+            payload["id"] = cid
+            payload["name"] = str(roleplay.get("name") or payload.get("name") or cid)
+            payload["aliases"] = deepcopy(roleplay.get("aliases", payload.get("aliases", [])))
+            payload["chattiness"] = int(roleplay.get("chattiness", 50))
+            payload["remaining_silent_turns"] = int(
+                roleplay.get("remaining_silent_turns", 0)
+            )
+            payload["may_speak"] = bool(roleplay.get("may_speak", True))
             state = characters_state.get(cid, {}) if isinstance(characters_state, dict) else {}
             if isinstance(state, dict):
                 compact_state = {
@@ -247,6 +265,7 @@ class PromptAssembler:
         context_limit_source: str,
         num_predict: int,
         manual_worldbook_ids: list[str] | None = None,
+        roleplay_context: dict | None = None,
         safety_margin: int = PROMPT_SAFETY_MARGIN,
     ) -> PromptAssembly:
         context_limit = int(context_limit)
@@ -257,7 +276,16 @@ class PromptAssembler:
         system_content = self._template("system.md")
         group_template = self._template("group_chat.md")
         self._validate_templates(system_content, group_template)
-        character_sources = self._character_sources(characters, characters_state)
+        effective_roleplay_context = (
+            deepcopy(roleplay_context)
+            if isinstance(roleplay_context, dict)
+            else build_roleplay_context(characters, characters_state)
+        )
+        character_sources = self._character_sources(
+            characters,
+            characters_state,
+            effective_roleplay_context,
+        )
         character_text = "\n---\n".join(text for _cid, text in character_sources)
         if not character_text:
             character_text = "（无活跃角色；本轮严禁创建角色或角色状态卡）"

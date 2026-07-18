@@ -5,6 +5,7 @@ import {
     collectCardEditorData,
     getPathValue,
     groupsWithCustomFields,
+    mergeCardEditorData,
 } from './card-editor.mjs';
 import { createProjectService } from './projects.mjs';
 import { createSaveService } from './saves.mjs';
@@ -18,6 +19,11 @@ import {
     createWorldbookService,
     sanitizeWorldbookDiagnostics,
 } from './worldbook.mjs';
+import {
+    createRoleplayPanel,
+    createRoleplayService,
+    renderRoleplayWarnings,
+} from './roleplay.mjs';
 
 // 本地酒馆 — 前端逻辑 v2（项目+存档双层架构）
 // 流式对话、角色卡渲染、行动建议、会话管理、提示词编辑
@@ -77,6 +83,8 @@ const API = {
     worldbookSave: (id) => `/api/worldbook/${encodeURIComponent(id)}`,
     worldbookDelete: (id) => `/api/worldbook/${encodeURIComponent(id)}`,
     worldbookManual: '/api/session/worldbook/manual',
+    roleplaySilence: (id) => `/api/session/characters/${encodeURIComponent(id)}/silence`,
+    roleplayPolicy: '/api/session/roleplay-policy',
     userSave: '/api/user',
     userDelete: '/api/user',
     settings: '/api/settings',
@@ -99,6 +107,7 @@ const state = {
     selectedSummaryId: null,
     summaryPanelExpanded: false,
     lastWorldbookDiagnostics: null,
+    roleplayPanel: null,
     modelParams: {
         temperature: 0.8,
         top_p: 0.9,
@@ -113,6 +122,7 @@ const saveService = createSaveService(apiClient, API);
 const promptService = createPromptService(apiClient, API);
 const summaryService = createSummaryService(sessionWrite, API);
 const worldbookService = createWorldbookService(apiClient, sessionWrite, API);
+const roleplayService = createRoleplayService(sessionWrite, API);
 const turnPersistence = createTurnPersistence(sessionStorage);
 const modalController = createModalController(
     modalElementsFromDocument(document),
@@ -201,6 +211,7 @@ function setNavigationUiState(active) {
         element.setAttribute('aria-disabled', String(blocked));
         element.setAttribute('aria-busy', String(active));
     }
+    if (state.roleplayPanel) state.roleplayPanel.setDisabled(blocked);
 }
 
 function beginSessionTransition(project, save = null) {
@@ -804,23 +815,37 @@ function renderSession(session) {
     document.getElementById('meta-goal').textContent = `➡️ ${meta.next_goal || ''}`;
     document.getElementById('meta-user').textContent =
         `👤 ${user.name || ''} | 🆔 ${user.identity || ''} | 💪 ${user.condition || ''} | ✨ ${(user.abilities || []).join(', ')}`;
-    renderCharacterPanel(session.characters_state || {});
+    renderCharacterPanel(session);
 }
 
-function renderCharacterPanel(charactersState) {
+function renderCharacterPanel(session) {
     const list = document.getElementById('character-list');
-    const ids = Object.keys(charactersState);
-    if (ids.length === 0) { list.innerHTML = '<p class="empty">无角色数据</p>'; return; }
-    list.innerHTML = ids.map(cid => {
-        const c = charactersState[cid];
-        const affinity = TavernSecurity.normalizeAffinity(c.affinity);
-        const bar = renderAffinityBar(affinity);
-        return `<div class="panel-char">
-            <div class="name">${escapeHtml(c.name || cid)}</div>
-            <div class="affinity-bar">${bar} ${affinity}%</div>
-            ${c.mood ? `<div style="color:var(--text-dim);font-size:11px">心情: ${escapeHtml(c.mood)}</div>` : ''}
-        </div>`;
-    }).join('');
+    if (!list) return;
+    const panelRef = captureSessionRef();
+    state.roleplayPanel = createRoleplayPanel({
+        documentRef: document,
+        container: list,
+        session,
+        sessionRef: panelRef,
+        service: roleplayService,
+        disabled: state.navigationBusy || isTurnActiveForRef(panelRef),
+        isCurrent: () => isCurrentSessionRef(panelRef) && sessionBelongsToRef(state.session, panelRef),
+        isTurnActive: () => isTurnActiveForRef(panelRef),
+        recoverDraft: draft => {
+            if (!isCurrentSessionRef(panelRef) || !state.roleplayPanel) return;
+            const controls = draft.kind === 'policy'
+                ? state.roleplayPanel.elements.policy
+                : state.roleplayPanel.elements.characters.get(draft.characterId);
+            if (!controls) return;
+            const input = draft.kind === 'policy' ? controls.checkbox : controls.input;
+            if (draft.kind === 'policy') input.checked = draft.value === true;
+            else input.value = String(draft.value);
+            controls.status.textContent = draft.message;
+            input.focus();
+        },
+    });
+    // 面板构造期间 turn 可以开始；新控件进入 DOM 后再检查一次。
+    state.roleplayPanel.setDisabled(state.navigationBusy || isTurnActiveForRef(panelRef));
 }
 
 function renderAffinityBar(percent) {
@@ -867,6 +892,7 @@ function appendAssistantMessage(content, thinking = '', msgData = null) {
     div.id = div.id || `msg-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     stream.appendChild(div);
     const contentEl = rendered.contentElement;
+    renderRoleplayWarnings(document, div, msgData);
     bindMessageActions(div);
     scrollToBottom();
     return contentEl;
@@ -1034,12 +1060,15 @@ async function reloadCurrentSession(requestRef = captureSessionRef()) {
 
 // ===== 角色卡渲染 =====
 
-function renderParsedResponse(parsed) {
+function renderParsedResponse(parsed, warningSource = parsed) {
     const stream = document.getElementById('chat-stream');
     const msgs = stream.querySelectorAll('.msg.assistant');
     const lastAssistant = msgs[msgs.length - 1];
     if (!lastAssistant) return;
     const contentEl = lastAssistant.querySelector('.content');
+    const previousRoleplayWarnings = lastAssistant.querySelector('.roleplay-warning-panel');
+    if (previousRoleplayWarnings) previousRoleplayWarnings.remove();
+    renderRoleplayWarnings(document, lastAssistant, warningSource);
     // C4：解析失败兜底 — 若 parsed 既无 characters 也无 scene_meta，保留流式累积的原文
     const isParsedEmpty = (!parsed.characters || parsed.characters.length === 0)
                        && (!parsed.scene_meta || !parsed.scene_meta.location)
@@ -1329,11 +1358,13 @@ function setTurnUiState(active, cancelling = false) {
         '.msg-action-btn', '.msg-checkbox',
         '.history-restore', '.ce-save', '.ce-delete',
         '.worldbook-write-control',
+        '.roleplay-write-control',
     ];
     document.querySelectorAll(selectors.join(',')).forEach(element => {
         if ('disabled' in element) element.disabled = active;
         element.setAttribute('aria-disabled', String(active));
     });
+    if (state.roleplayPanel) state.roleplayPanel.setDisabled(active || state.navigationBusy);
     const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
     if (lastAI && state.session) renderSummaryPanel(lastAI, state.session);
 }
@@ -1400,7 +1431,7 @@ function applyTurnEvent(event) {
         renderActiveTurnBuffer();
     } else if (event.type === 'parsed') {
         const applied = applySessionResult(event.session, active.ref);
-        if (applied && isCurrentSessionRef(active.ref)) renderParsedResponse(event.parsed || {});
+        if (applied && isCurrentSessionRef(active.ref)) renderParsedResponse(event.parsed || {}, event);
         setTurnUiState(true, state.activeTurn.cancelling);
     }
     return true;
@@ -1491,7 +1522,7 @@ async function finalizeActiveTurn(turnId) {
     try {
         await reloadCurrentSession(active.ref);
         if (active.parsed && isCurrentSessionRef(active.ref)) {
-            renderParsedResponse(active.parsed.parsed || {});
+            renderParsedResponse(active.parsed.parsed || {}, active.parsed);
         }
     } catch (error) {
         showToast(`turn 已终止，但刷新存档失败：${errorDetail(error)}`, 4000);
@@ -1670,6 +1701,10 @@ async function createCardEditor(config) {
     const editorRef = config.sessionRef || captureSessionRef();
     config.sessionRef = editorRef;
     if (!isCurrentSessionRef(editorRef)) return;
+    if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+        showToast('当前存档正在生成，请先取消或等待完成');
+        return;
+    }
     // 1. 加载数据
     let items = [];
     let extraData = null;
@@ -1690,6 +1725,10 @@ async function createCardEditor(config) {
         return;
     }
     if (!isCurrentSessionRef(editorRef)) return;
+    if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+        showToast('加载角色卡期间已开始生成，请等待完成后重试');
+        return;
+    }
 
     // 2. 构造 modal HTML
     const body = document.createElement('div');
@@ -1704,6 +1743,7 @@ async function createCardEditor(config) {
     const listEl = body.querySelector('#ce-list');
     const formEl = body.querySelector('#ce-form');
     let currentItem = null;
+    let fieldIdCounter = 0;
 
     // ===== 列表渲染（仅 allowNew）=====
     function renderList() {
@@ -1731,8 +1771,14 @@ async function createCardEditor(config) {
         row.className = 'fld-row';
         row.dataset.key = fd.key;
         row.dataset.type = fd.type;
+        row.dataset.label = fd.label || fd.key || '字段';
         if (fd.array) row.dataset.array = '1';
         if (fd.required) row.dataset.required = '1';
+        const integerField = fd.type === 'integer' || fd.integer === true || fd.key === 'chattiness';
+        if (integerField) row.dataset.integer = '1';
+        if (fd.min !== undefined) row.dataset.min = String(fd.min);
+        if (fd.max !== undefined) row.dataset.max = String(fd.max);
+        const fieldId = `ce-field-${++fieldIdCounter}`;
 
         const handle = document.createElement('span');
         handle.className = 'fld-handle';
@@ -1743,35 +1789,43 @@ async function createCardEditor(config) {
 
         if (fd.type === 'custom') {
             const keyWrap = document.createElement('div'); keyWrap.className = 'fld-cell grow';
-            const keyLbl = document.createElement('label'); keyLbl.textContent = '字段名';
+            const keyLbl = document.createElement('label'); keyLbl.textContent = '字段名'; keyLbl.htmlFor = `${fieldId}-key`;
             const keyInp = document.createElement('input'); keyInp.type = 'text'; keyInp.className = 'ce-field-key';
+            keyInp.id = `${fieldId}-key`;
             keyInp.placeholder = '例：所属势力'; keyInp.value = fd.key || '';
             keyWrap.appendChild(keyLbl); keyWrap.appendChild(keyInp); body.appendChild(keyWrap);
             const valWrap = document.createElement('div'); valWrap.className = 'fld-cell grow';
-            const valLbl = document.createElement('label'); valLbl.textContent = '值';
+            const valLbl = document.createElement('label'); valLbl.textContent = '值'; valLbl.htmlFor = `${fieldId}-value`;
             const valInp = document.createElement('input'); valInp.type = 'text'; valInp.className = 'ce-field-val';
+            valInp.id = `${fieldId}-value`;
             valInp.placeholder = '例：青龙商会'; valInp.value = fd.value || '';
             valWrap.appendChild(valLbl); valWrap.appendChild(valInp); body.appendChild(valWrap);
         } else if (fd.type === 'checkbox') {
             const lbl = document.createElement('label');
+            lbl.htmlFor = fieldId;
             lbl.style.cssText = 'font-size:12px;color:var(--text);cursor:pointer;display:flex;align-items:center;gap:6px';
             const cb = document.createElement('input'); cb.type = 'checkbox'; cb.className = 'ce-field-val';
+            cb.id = fieldId;
             cb.checked = getPathValue(currentItem || {}, fd.key, fd);
             lbl.appendChild(cb); lbl.appendChild(document.createTextNode(fd.checkboxLabel || fd.label));
             body.appendChild(lbl);
         } else if (fd.type === 'textarea') {
-            const lbl = document.createElement('label'); lbl.textContent = fd.label; lbl.className = 'fld-label'; body.appendChild(lbl);
+            const lbl = document.createElement('label'); lbl.textContent = fd.label; lbl.className = 'fld-label'; lbl.htmlFor = fieldId; body.appendChild(lbl);
             const ta = document.createElement('textarea'); ta.className = 'ce-field-val'; ta.rows = fd.rows || 4;
+            ta.id = fieldId;
             if (fd.placeholder) ta.placeholder = fd.placeholder;
             ta.value = getPathValue(currentItem || {}, fd.key, fd); body.appendChild(ta);
-        } else if (fd.type === 'number') {
-            const lbl = document.createElement('label'); lbl.textContent = fd.label; lbl.className = 'fld-label'; body.appendChild(lbl);
+        } else if (fd.type === 'number' || fd.type === 'integer') {
+            const lbl = document.createElement('label'); lbl.textContent = fd.label; lbl.className = 'fld-label'; lbl.htmlFor = fieldId; body.appendChild(lbl);
             const inp = document.createElement('input'); inp.type = 'number'; inp.className = 'ce-field-val';
+            inp.id = fieldId;
             if (fd.min !== undefined) inp.min = fd.min; if (fd.max !== undefined) inp.max = fd.max;
+            if (integerField) inp.step = '1';
             inp.value = getPathValue(currentItem || {}, fd.key, fd); body.appendChild(inp);
         } else {
-            const lbl = document.createElement('label'); lbl.textContent = fd.label; lbl.className = 'fld-label'; body.appendChild(lbl);
+            const lbl = document.createElement('label'); lbl.textContent = fd.label; lbl.className = 'fld-label'; lbl.htmlFor = fieldId; body.appendChild(lbl);
             const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'ce-field-val';
+            inp.id = fieldId;
             if (fd.placeholder) inp.placeholder = fd.placeholder;
             inp.value = getPathValue(currentItem || {}, fd.key, fd); body.appendChild(inp);
         }
@@ -1909,21 +1963,14 @@ async function createCardEditor(config) {
                 return;
             }
             saveButton.disabled = true;
-            const { data, idValue: idVal } = collectCardEditorData(groupsEl, { idField: config.idField });
-            if (config.idField && !idVal) {
-                saveButton.disabled = false;
-                alert(`请填 ${config.idLabel || 'ID'}`);
-                return;
-            }
-            const saveUrl = config.saveApi ? config.saveApi(idVal || 'user') : null;
-            if (!saveUrl) {
-                saveButton.disabled = false;
-                statusEl.textContent = '✗ 缺少保存 API';
-                return;
-            }
-
             statusEl.textContent = '保存中…';
             try {
+                const collected = collectCardEditorData(groupsEl, { idField: config.idField });
+                const data = mergeCardEditorData(currentItem || extraData || {}, collected.data);
+                const idVal = collected.idValue;
+                if (config.idField && !idVal) throw new Error(`请填 ${config.idLabel || 'ID'}`);
+                const saveUrl = config.saveApi ? config.saveApi(idVal || 'user') : null;
+                if (!saveUrl) throw new Error('缺少保存 API');
                 await apiClient.put(saveUrl, { data });
                 if (!isCurrentSessionRef(editorRef)) return;
                 statusEl.textContent = '✓ 已保存';
@@ -1940,6 +1987,15 @@ async function createCardEditor(config) {
                 if (config.postSave) await config.postSave(data);
             } catch (e) {
                 statusEl.textContent = '✗ ' + e.message;
+                const invalidField = e && e.field
+                    ? groupsEl.querySelector(`.fld-row[data-key="${CSS.escape(e.field)}"] .ce-field-val`)
+                    : null;
+                if (invalidField) {
+                    invalidField.setAttribute('aria-invalid', 'true');
+                    invalidField.focus();
+                } else if (saveButton.isConnected) {
+                    saveButton.focus();
+                }
             } finally {
                 if (saveButton.isConnected) saveButton.disabled = isTurnActiveForRef(editorRef);
             }
@@ -2086,7 +2142,19 @@ async function openCharactersEditor() {
         prefix: 'char',
         buildGroups: (c) => {
             c = c || {};
-            const groups = schema.groups.map(g => ({ ...g, fields: g.fields.map(f => ({ ...f, builtin: true })) }));
+            const groups = schema.groups.map(g => ({
+                ...g,
+                fields: g.fields.map(f => ({
+                    ...f,
+                    ...(f.key === 'chattiness' ? {
+                        default: f.default === undefined ? 50 : f.default,
+                        min: f.min === undefined ? 0 : f.min,
+                        max: f.max === undefined ? 100 : f.max,
+                        integer: true,
+                    } : {}),
+                    builtin: true,
+                })),
+            }));
             return groupsWithCustomFields(groups, c, schema.customGroup);
         },
         postSave: async () => { showToast('角色已保存，点「重置」让新角色进场景'); },

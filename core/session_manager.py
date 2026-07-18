@@ -110,6 +110,7 @@ def _empty_session(save_id: str = DEFAULT_SAVE, project: str = "默认项目") -
             "name": "", "identity": "", "condition": "", "abilities": [],
         },
         "characters_state": {},
+        "roleplay_policy": {"strict_muted_writeback": False},
         "manual_worldbook_ids": [],
         "message_history": [],
         "summaries": [],

@@ -98,10 +98,14 @@ class TurnStore:
 
     def create(self, payload: dict) -> dict:
         turn_id = _validate_turn_id(payload["turn_id"])
+        turn_kind = payload.get("turn_kind", "chat")
+        if turn_kind not in {"chat", "regenerate"}:
+            raise ValueError("无效 turn_kind")
         turn_dir = self._turn_dir(turn_id)
         with library_lock.shared():
             turn_dir.mkdir(parents=True, exist_ok=False)
             meta = deepcopy(payload)
+            meta["turn_kind"] = turn_kind
             meta["last_event_id"] = 0
             meta["event_count"] = 0
             self._write_json(turn_dir / "meta.json", meta)
@@ -183,6 +187,10 @@ class TurnStore:
             raise ValueError("turn 元数据损坏") from exc
         if not isinstance(meta, dict) or meta.get("turn_id") != turn_id:
             raise ValueError("turn 元数据归属不匹配")
+        # ROLE-1 之前的持久 turn 没有类型字段，按普通聊天兼容。
+        meta.setdefault("turn_kind", "chat")
+        if meta["turn_kind"] not in {"chat", "regenerate"}:
+            raise ValueError("turn 元数据类型无效")
         events = self._read_events(turn_id)
         meta["last_event_id"] = events[-1]["id"] if events else 0
         meta["event_count"] = len(events)
@@ -257,6 +265,7 @@ class TurnRuntime:
     def __init__(self, coordinator: "TurnCoordinator", turn_id: str):
         self.coordinator = coordinator
         self.turn_id = turn_id
+        self.session_committed_revision: int | None = None
 
     async def emit(self, event: dict, **turn_updates) -> dict:
         return await self.coordinator._emit(self.turn_id, event, turn_updates)
@@ -273,6 +282,23 @@ class TurnRuntime:
             status,
             error=error,
             turn_updates=turn_updates,
+        )
+
+    async def mark_session_committed(self, session_revision: int) -> dict:
+        """记录 Session 已完成提交；此后该 turn 的完成态不可降级。"""
+
+        if (
+            isinstance(session_revision, bool)
+            or not isinstance(session_revision, int)
+            or session_revision < 0
+        ):
+            raise ValueError("session_revision 必须是非负整数")
+        # 先写内存标记；即使 turn 元数据磁盘随后失败，coordinator 仍能依据
+        # Session 事实收口为 completed。
+        self.session_committed_revision = session_revision
+        return await self.coordinator._mark_session_committed(
+            self.turn_id,
+            session_revision,
         )
 
 
@@ -302,6 +328,7 @@ class TurnCoordinator:
         completed_at = _now()
         return {
             "turn_id": turn["turn_id"],
+            "turn_kind": turn.get("turn_kind", "chat"),
             "status": "failed",
             "error": deepcopy(error),
             "timestamps": {
@@ -309,6 +336,87 @@ class TurnCoordinator:
                 "completed_at": completed_at,
             },
         }
+
+    @staticmethod
+    async def _completed_session_revision(turn: dict) -> int | None:
+        """从 Session 判断该 turn 是否已经完成提交，不执行任何写入。"""
+
+        from core.session_manager import aload_session
+
+        session = await aload_session(turn["project"], turn["save"])
+        matched = [
+            message
+            for message in session.get("message_history", [])
+            if message.get("turn_id") == turn["turn_id"]
+        ]
+        has_completed_user = any(
+            message.get("role") == "user" and message.get("status") == "completed"
+            for message in matched
+        )
+        has_completed_assistant = any(
+            message.get("role") == "assistant"
+            and message.get("status") == "completed"
+            for message in matched
+        )
+        if not (has_completed_user and has_completed_assistant):
+            return None
+        revision = session.get("revision", 0)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            return None
+        return revision
+
+    async def _complete_authoritative_turn(
+        self,
+        turn_id: str,
+        session_revision: int,
+    ) -> dict:
+        """尽力写 terminal 事件；日志故障时至少持久化 completed 元数据。"""
+
+        # 事件文件可能已经落盘、仅 meta 写回抛错；先从磁盘重建 last_event_id，
+        # 防止用旧内存游标覆盖同序号的 parsed/terminal 事件。
+        async with self._lock:
+            turn = await _run_sync_critical(self.store.load, turn_id)
+            self._records[turn_id] = deepcopy(turn)
+        if turn.get("status") == "completed":
+            active_turns.unregister(turn["project"], turn["save"], turn_id)
+            await self._notify(turn_id)
+            return turn
+
+        try:
+            return await self._terminal(
+                turn_id,
+                "completed",
+                error=None,
+                turn_updates={
+                    "session_revision": session_revision,
+                    "session_committed_revision": session_revision,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "turn %s completed terminal 事件写入失败，按 Session 权威态收口",
+                turn_id,
+            )
+
+        async with self._lock:
+            # 不信任异常前的内存副本；append_event 可能已写成 terminal，只在
+            # meta 更新阶段抛错，load 会从事件日志重建真实终态。
+            turn = await _run_sync_critical(self.store.load, turn_id)
+            if turn.get("status") != "completed":
+                completed_at = _now()
+                turn.update({
+                    "status": "completed",
+                    "error": None,
+                    "completed_at": completed_at,
+                    "updated_at": completed_at,
+                    "session_revision": session_revision,
+                    "session_committed_revision": session_revision,
+                })
+                turn = await _run_sync_critical(self.store.update, turn)
+            self._records[turn_id] = deepcopy(turn)
+        active_turns.unregister(turn["project"], turn["save"], turn_id)
+        await self._notify(turn_id)
+        return turn
 
     async def _recover_session(self, turn: dict, error: dict) -> int | None:
         from core.session_manager import aload_session, append_history, mutate_session
@@ -397,6 +505,14 @@ class TurnCoordinator:
                     turn = await _run_sync_critical(self.store.load, turn_id)
                     if turn.get("status") not in ACTIVE_STATUSES:
                         continue
+                    completed_revision = await self._completed_session_revision(turn)
+                    if completed_revision is not None:
+                        await self._complete_authoritative_turn(
+                            turn_id,
+                            completed_revision,
+                        )
+                        recovered += 1
+                        continue
                     error = {
                         "code": "server_restarted",
                         "message": "服务进程在 turn 完成前重启",
@@ -438,16 +554,20 @@ class TurnCoordinator:
         worker: TurnWorker,
         accept_command: TurnAcceptor | None = None,
         prompt_diagnostics: dict | None = None,
+        turn_kind: str = "chat",
     ) -> dict:
+        if turn_kind not in {"chat", "regenerate"}:
+            raise ValueError("无效 turn_kind")
         turn_id = str(uuid4())
         created_at = _now()
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "turn_id": turn_id,
             "project": project,
             "save": save,
             "expected_revision": expected_revision,
             "user_input": user_input,
+            "turn_kind": turn_kind,
             "model": model,
             "parameters": deepcopy(parameters),
             "status": "pending",
@@ -511,25 +631,53 @@ class TurnCoordinator:
             with active_turns.turn_write_context(turn_id):
                 await worker(runtime)
         except asyncio.CancelledError:
-            await asyncio.shield(runtime.terminal(
-                "cancelled",
-                error={"code": "cancelled", "message": "turn 已取消"},
-            ))
+            committed_revision = runtime.session_committed_revision
+            if committed_revision is None:
+                committed_revision = await self._completed_session_revision(turn)
+            if committed_revision is not None:
+                await asyncio.shield(self._complete_authoritative_turn(
+                    turn_id,
+                    committed_revision,
+                ))
+            else:
+                await asyncio.shield(runtime.terminal(
+                    "cancelled",
+                    error={"code": "cancelled", "message": "turn 已取消"},
+                ))
         except Exception as exc:
-            await runtime.terminal(
-                "failed",
-                error={"code": "internal_error", "message": str(exc)},
-            )
+            committed_revision = runtime.session_committed_revision
+            if committed_revision is None:
+                committed_revision = await self._completed_session_revision(turn)
+            if committed_revision is not None:
+                logger.exception(
+                    "turn %s Session 已完成，忽略完成后事件异常",
+                    turn_id,
+                )
+                await self._complete_authoritative_turn(turn_id, committed_revision)
+            else:
+                await runtime.terminal(
+                    "failed",
+                    error={"code": "internal_error", "message": str(exc)},
+                )
         finally:
             final = await _run_sync_critical(self.store.load, turn_id)
             if final.get("status") in ACTIVE_STATUSES:
-                await runtime.terminal(
-                    "failed",
-                    error={
-                        "code": "missing_terminal_event",
-                        "message": "turn 工作器未写入终态",
-                    },
-                )
+                committed_revision = runtime.session_committed_revision
+                if committed_revision is None:
+                    committed_revision = await self._completed_session_revision(final)
+                if committed_revision is not None:
+                    await self._complete_authoritative_turn(
+                        turn_id,
+                        committed_revision,
+                    )
+                else:
+                    await runtime.terminal(
+                        "failed",
+                        error={
+                            "code": "missing_terminal_event",
+                            "message": "turn 工作器未写入终态",
+                        },
+                    )
                 final = await _run_sync_critical(self.store.load, turn_id)
             active_turns.unregister(final["project"], final["save"], turn_id)
             self._tasks.pop(turn_id, None)
@@ -557,6 +705,23 @@ class TurnCoordinator:
             self._records[turn_id] = deepcopy(turn)
         await self._notify(turn_id)
         return stored
+
+    async def _mark_session_committed(
+        self,
+        turn_id: str,
+        session_revision: int,
+    ) -> dict:
+        async with self._lock:
+            turn = deepcopy(self._records.get(turn_id))
+            if turn is None:
+                turn = await _run_sync_critical(self.store.load, turn_id)
+            if turn.get("status") in {"cancelled", "failed"}:
+                raise RuntimeError("非完成终态 turn 不能登记 Session 完成提交")
+            turn["session_committed_revision"] = session_revision
+            turn["session_revision"] = session_revision
+            turn = await _run_sync_critical(self.store.update, turn)
+            self._records[turn_id] = deepcopy(turn)
+        return turn
 
     async def _terminal(
         self,

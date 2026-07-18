@@ -40,6 +40,7 @@ SummaryTime = Annotated[StrictStr, Field(max_length=300)]
 SummaryItem = Annotated[StrictStr, Field(min_length=1, max_length=200)]
 Affinity = Annotated[StrictInt | StrictFloat, Field(ge=0, le=100)]
 Revision = Annotated[StrictInt, Field(ge=0)]
+SilentTurns = Annotated[StrictInt, Field(ge=0, le=999)]
 
 
 class ImportModel(BaseModel):
@@ -89,6 +90,11 @@ class ImportedCharacterState(ImportModel):
     outfit: MessageText = ""
     posture: MessageText = ""
     dialogue: MessageText = ""
+    remaining_silent_turns: SilentTurns = 0
+
+
+class ImportedRoleplayPolicy(ImportModel):
+    strict_muted_writeback: StrictBool = False
 
 
 class ImportedSummary(ImportModel):
@@ -129,6 +135,9 @@ class ImportedSession(ImportModel):
     characters_state: dict[StrictStr, ImportedCharacterState] = Field(
         default_factory=dict,
         max_length=MAX_CHARACTERS,
+    )
+    roleplay_policy: ImportedRoleplayPolicy = Field(
+        default_factory=ImportedRoleplayPolicy,
     )
     manual_worldbook_ids: list[StrictStr] = Field(
         default_factory=list,
