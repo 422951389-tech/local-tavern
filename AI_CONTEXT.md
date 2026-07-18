@@ -2,8 +2,8 @@
 
 > **目的**：让下一个 AI 协作者在不询问用户的情况下，能完整理解这个项目并继续工作。
 > **创建日期**：2026-06-27
-> **最后更新**：2026-07-16
-> **当前状态**：阶段 A、B、C completed；阶段 D 的 PROMPT-1、MEMORY-1 completed，当前进入 WORLD-1
+> **最后更新**：2026-07-18
+> **当前状态**：阶段 A、B、C completed；阶段 D 的 PROMPT-1、MEMORY-1、WORLD-1 completed，当前进入 ROLE-1
 > **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
 
 ---
@@ -75,6 +75,7 @@ C:\local-tavern\
 │   ├── character_loader.py    # 角色/世界书/用户档案加载（90 行）
 │   ├── session_manager.py     # 存档管理 + 多时间线（260+ 行）
 │   ├── prompt_assembler.py    # ★ PROMPT-1：来源单次注入、总预算、裁剪诊断
+│   ├── worldbook_policy.py    # ★ WORLD-1：三态触发、稳定排序与脱敏诊断
 │   ├── token_estimator.py     # ★ PROMPT-1：可替换的保守 token 估算协议
 │   ├── summary_lifecycle.py   # ★ MEMORY-1：稳定 ID、严格校验、异步生成与代际收口
 │   ├── session_store.py       # revision/CAS、旧摘要稳定迁移、来源状态派生
@@ -107,7 +108,7 @@ C:\local-tavern\
     ├── index.html             # 主页面 + Modal 容器
     ├── style.css              # 样式（深色 + 古风暖金强调色）
     ├── app.mjs                # 前端组合入口（原生 ES module）
-    └── *.mjs                  # 项目/存档/聊天/摘要/卡片/Prompt/渲染等职责模块
+    └── *.mjs                  # 项目/存档/聊天/摘要/世界书/卡片/Prompt/渲染等职责模块
 ```
 
 ---
@@ -311,7 +312,7 @@ active: true              # 是否默认出场
 
 ## 10. 待办 / 未实现
 
-完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。当前依赖顺序为 `WORLD-1 → ROLE-1 → 阶段 E`。
+完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。当前依赖顺序为 `ROLE-1 → 阶段 E`。
 
 ---
 
@@ -330,6 +331,7 @@ active: true              # 是否默认出场
    - 顶部下拉切换会话（多时间线）
    - 消息 hover 可删/编辑/重生成
    - 顶部 ⚙ 提示词可编辑 system/group_chat/summary；摘要面板可按段查看原文、编辑、重生成或重试
+   - 世界书页可编辑项目共享条目，并为当前存档单独选择 manual 条目；命中诊断不显示正文
    - 关闭浏览器再开会话仍在（自动保存）
 
 ---
@@ -387,6 +389,6 @@ active: true              # 是否默认出场
 
 ---
 
-**最后更新**：2026-07-16  MEMORY-1 可追溯摘要、精确重生成与在线模板
+**最后更新**：2026-07-18  WORLD-1 三态触发、存档级手动选择与可解释诊断
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目
