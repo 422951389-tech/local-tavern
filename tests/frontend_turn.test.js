@@ -47,6 +47,7 @@ test('turn reducer de-duplicates replay and records one terminal', () => {
     assert.equal(state.content, '甲乙');
     assert.equal(state.terminal, true);
     assert.equal(state.terminalCount, 1);
+    assert.equal(state.syncPending, true);
 
     const lateTerminal = reduceTurnEvent(state, { id: 5, type: 'terminal', status: 'failed', error: {} });
     assert.equal(lateTerminal.accepted, false);

@@ -10,11 +10,41 @@ function errorMessage(error) {
 }
 
 function focusFirstInput(body, fallback) {
-    const candidate = body.querySelector(
-        'input:not([disabled]), textarea:not([disabled]), select:not([disabled]), button:not([disabled])',
-    );
+    const candidate = focusableElements(body)[0];
     const target = candidate || fallback;
     if (target && typeof target.focus === 'function') target.focus();
+}
+
+const FOCUSABLE_SELECTOR = [
+    'a[href]',
+    'button:not([disabled])',
+    'input:not([disabled])',
+    'textarea:not([disabled])',
+    'select:not([disabled])',
+    '[tabindex]:not([tabindex="-1"])',
+    '[contenteditable="true"]',
+].join(', ');
+
+function isFocusable(element) {
+    if (!element || element.disabled || element.hidden) return false;
+    if (element.type === 'hidden') return false;
+    if (typeof element.matches === 'function' && element.matches(':disabled')) return false;
+    if (typeof element.getAttribute === 'function') {
+        if (element.getAttribute('aria-hidden') === 'true') return false;
+        if (element.getAttribute('tabindex') === '-1') return false;
+    }
+    if (typeof element.closest === 'function' && element.closest('[hidden], .hidden, [inert]')) return false;
+    const view = element.ownerDocument && element.ownerDocument.defaultView;
+    if (view && typeof view.getComputedStyle === 'function') {
+        const style = view.getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+    }
+    return typeof element.focus === 'function';
+}
+
+function focusableElements(dialog) {
+    if (!dialog || typeof dialog.querySelectorAll !== 'function') return [];
+    return Array.from(dialog.querySelectorAll(FOCUSABLE_SELECTOR)).filter(isFocusable);
 }
 
 export function createModalController(elements, options = {}) {
@@ -90,8 +120,12 @@ export function createModalController(elements, options = {}) {
     function show(config) {
         if (!config || typeof config !== 'object') throw new TypeError('Modal 配置必须是对象');
         if (pending) return false;
-        if (!backdrop.classList.contains('hidden')) hide({ force: true, restoreFocus: false });
-        returnFocus = documentRef && documentRef.activeElement ? documentRef.activeElement : null;
+        const replacing = !backdrop.classList.contains('hidden');
+        const replacementReturnFocus = replacing ? returnFocus : null;
+        if (replacing) hide({ force: true, restoreFocus: false });
+        returnFocus = replacing
+            ? replacementReturnFocus
+            : (documentRef && documentRef.activeElement ? documentRef.activeElement : null);
         title.textContent = String(config.title || '');
         body.replaceChildren();
         if (typeof config.body === 'string') body.innerHTML = config.body;
@@ -130,9 +164,34 @@ export function createModalController(elements, options = {}) {
         });
         if (documentRef && typeof documentRef.addEventListener === 'function') {
             documentRef.addEventListener('keydown', event => {
-                if (event.key !== 'Escape' || backdrop.classList.contains('hidden')) return;
-                event.preventDefault();
-                hide();
+                if (backdrop.classList.contains('hidden')) return;
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    hide();
+                    return;
+                }
+                if (event.key !== 'Tab') return;
+
+                const candidates = focusableElements(dialog);
+                if (candidates.length === 0) {
+                    event.preventDefault();
+                    if (typeof dialog.focus === 'function') dialog.focus();
+                    return;
+                }
+
+                const first = candidates[0];
+                const last = candidates[candidates.length - 1];
+                const active = documentRef.activeElement;
+                const activeInside = typeof dialog.contains === 'function'
+                    ? dialog.contains(active)
+                    : candidates.includes(active);
+                if (event.shiftKey && (!activeInside || active === first)) {
+                    event.preventDefault();
+                    last.focus();
+                } else if (!event.shiftKey && (!activeInside || active === last)) {
+                    event.preventDefault();
+                    first.focus();
+                }
             });
         }
     }

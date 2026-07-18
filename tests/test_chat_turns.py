@@ -98,6 +98,23 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
     assert [event["type"] for event in events].count("terminal") == 1
     assert events[-1]["type"] == "terminal"
     assert events[-1]["status"] == "completed"
+    parsed_event = next(event for event in events if event["type"] == "parsed")
+    assert set(parsed_event) == {
+        "id",
+        "created_at",
+        "type",
+        "parsed",
+        "roleplay_warnings",
+        "revision",
+        "session_delta",
+    }
+    assert "session" not in parsed_event
+    assert set(parsed_event["session_delta"]) == {
+        "scene_meta",
+        "characters_state",
+        "roleplay_policy",
+        "current_model",
+    }
 
     replay = await app_client.get(
         f"/api/chat/turns/{turn_id}/events",
@@ -113,6 +130,19 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
         "save": "默认存档",
     })).json()
     assert session["revision"] == 2
+    assert (
+        parsed_event["revision"]
+        == terminal["session_revision"]
+        == session["revision"]
+    )
+    assert parsed_event["session_delta"] == {
+        "scene_meta": session["scene_meta"],
+        "characters_state": session["characters_state"],
+        "roleplay_policy": session["roleplay_policy"],
+        "current_model": session["current_model"],
+    }
+    assert "message_history" not in parsed_event["session_delta"]
+    assert "summaries" not in parsed_event["session_delta"]
     assert [message["role"] for message in session["message_history"]] == [
         "user",
         "assistant",
@@ -124,6 +154,60 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
         assert message["timestamps"]["created_at"]
         assert message["timestamps"]["completed_at"]
         assert message["pinned"] is False
+
+
+@pytest.mark.parametrize("legacy_scene_meta", ["missing", "null", "string"])
+@pytest.mark.asyncio
+async def test_turn_normalizes_legacy_scene_meta_before_parsed_delta(
+    app_client,
+    fake_ollama,
+    seed_project,
+    legacy_scene_meta,
+):
+    project = seed_project(f"turn_legacy_scene_{legacy_scene_meta}")
+    legacy = new_session(project, "默认存档")
+    if legacy_scene_meta == "missing":
+        legacy.pop("scene_meta")
+    elif legacy_scene_meta == "null":
+        legacy["scene_meta"] = None
+    else:
+        legacy["scene_meta"] = "旧版无效场景"
+    path = get_session_store().session_path(project, "默认存档")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    fake_ollama.events = [
+        {"type": "content", "content": "无结构正文"},
+        {"type": "done", "content": ""},
+    ]
+    created = await app_client.post("/api/chat/turns", json={
+        "project": project,
+        "save": "默认存档",
+        "user_input": "验证旧存档场景字段",
+        "model": "fake-model:latest",
+        "expected_revision": 0,
+    })
+    assert created.status_code == 202, created.text
+    terminal = await _wait_terminal(app_client, created.json()["turn_id"])
+    assert terminal["status"] == "completed"
+    assert terminal["session_revision"] == 2
+
+    stream = await app_client.get(
+        f"/api/chat/turns/{created.json()['turn_id']}/events"
+    )
+    events = _sse_json_events(stream.text)
+    parsed_event = next(event for event in events if event["type"] == "parsed")
+    assert parsed_event["revision"] == 2
+    assert parsed_event["session_delta"]["scene_meta"] == {
+        "location": "",
+        "time": "",
+        "weather": "",
+        "main_quest": "",
+        "current_scene": "",
+        "next_goal": "",
+    }
+    assert events[-1]["type"] == "terminal"
+    assert events[-1]["status"] == "completed"
 
 
 @pytest.mark.asyncio

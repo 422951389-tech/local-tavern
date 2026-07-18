@@ -160,6 +160,15 @@ def normalize_session(session: dict, project: str, save_id: str) -> dict:
     session["project"] = project
     session["session_id"] = save_id
     session["revision"] = _coerce_revision(session.get("revision", 0))
+    raw_scene_meta = session.get("scene_meta")
+    scene_meta = dict(raw_scene_meta) if isinstance(raw_scene_meta, dict) else {}
+    for field in (
+        "location", "time", "weather", "main_quest", "current_scene", "next_goal",
+    ):
+        scene_meta.setdefault(field, "")
+    session["scene_meta"] = scene_meta
+    if not isinstance(session.get("current_model"), str):
+        session["current_model"] = ""
     manual_worldbook_ids = session.get("manual_worldbook_ids", [])
     normalized_manual_ids: set[str] = set()
     if isinstance(manual_worldbook_ids, list):

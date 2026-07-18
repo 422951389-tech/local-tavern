@@ -4,6 +4,28 @@ export function affinityBar(value, normalize) {
     return '█'.repeat(filled) + '░'.repeat(10 - filled);
 }
 
+export function mountMessageHistory(documentRef, container, history, renderMessage) {
+    if (!documentRef || typeof documentRef.createDocumentFragment !== 'function') {
+        throw new TypeError('历史渲染缺少 document');
+    }
+    if (!container || typeof container.replaceChildren !== 'function') {
+        throw new TypeError('历史渲染缺少容器');
+    }
+    if (!Array.isArray(history) || typeof renderMessage !== 'function') {
+        throw new TypeError('历史渲染参数无效');
+    }
+    const fragment = documentRef.createDocumentFragment();
+    let mounted = 0;
+    for (const message of history) {
+        const node = renderMessage(message);
+        if (!node) continue;
+        fragment.appendChild(node);
+        mounted += 1;
+    }
+    container.replaceChildren(fragment);
+    return mounted;
+}
+
 function actionButton(documentRef, className, title, text) {
     const button = documentRef.createElement('button');
     button.type = 'button';
@@ -26,7 +48,10 @@ export function createMessageElement(documentRef, { role, content, message = {},
     checkbox.checked = message.in_prompt !== false;
     checkbox.title = '勾选 = 进 prompt';
     checkbox.setAttribute('aria-label', '包含在 Prompt 中');
-    container.appendChild(checkbox);
+    const includeControl = documentRef.createElement('span');
+    includeControl.className = 'msg-include-control';
+    includeControl.appendChild(checkbox);
+    container.appendChild(includeControl);
 
     const actions = documentRef.createElement('div');
     actions.className = 'msg-actions';

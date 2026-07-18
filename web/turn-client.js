@@ -23,6 +23,35 @@
         return Boolean(value && typeof value === 'object' && !Array.isArray(value));
     }
 
+    function sanitizeRoleplayWarnings(value) {
+        if (!Array.isArray(value)) return null;
+        return Object.freeze(value.map(warning => {
+            if (!isObject(warning)) return warning;
+            const clean = {};
+            for (const key of ['code', 'action', 'character_id']) {
+                if (typeof warning[key] === 'string') clean[key] = warning[key];
+            }
+            if (Array.isArray(warning.candidate_ids)) {
+                clean.candidate_ids = Object.freeze(warning.candidate_ids.filter(id => typeof id === 'string'));
+            }
+            return Object.freeze(clean);
+        }));
+    }
+
+    function normalizeParsedEvent(event) {
+        const modern = Object.prototype.hasOwnProperty.call(event, 'revision')
+            || Object.prototype.hasOwnProperty.call(event, 'session_delta');
+        const normalized = {
+            parsed: event.parsed,
+            roleplay_warnings: sanitizeRoleplayWarnings(event.roleplay_warnings) || Object.freeze([]),
+            revision: modern ? event.revision : null,
+            session_delta: modern ? Object.freeze({ ...event.session_delta }) : null,
+            // 仅旧事件日志缺少 delta/revision 时保留完整 Session 供兼容重放。
+            legacySession: !modern && isObject(event.session) ? event.session : null,
+        };
+        return Object.freeze(normalized);
+    }
+
     function validateTurn(turn) {
         if (!isObject(turn)) return 'turn 响应必须是对象';
         if (typeof turn.turn_id !== 'string' || !turn.turn_id) return 'turn_id 缺失';
@@ -36,6 +65,29 @@
         if (!isObject(event)) return 'turn 事件必须是对象';
         if (!Number.isSafeInteger(event.id) || event.id <= 0) return 'turn 事件 ID 无效';
         if (typeof event.type !== 'string' || !event.type) return 'turn 事件类型缺失';
+        if (event.type === 'parsed') {
+            const hasRevision = Object.prototype.hasOwnProperty.call(event, 'revision');
+            const hasDelta = Object.prototype.hasOwnProperty.call(event, 'session_delta');
+            const modern = hasRevision || hasDelta;
+            if (!isObject(event.parsed)
+                || (modern && !Array.isArray(event.roleplay_warnings))) {
+                return 'parsed 事件结构无效';
+            }
+            if (event.roleplay_warnings !== undefined
+                && (!Array.isArray(event.roleplay_warnings)
+                    || event.roleplay_warnings.some(warning => !isObject(warning)))) {
+                return 'parsed 角色警告无效';
+            }
+            if (modern) {
+                if (!hasRevision || !hasDelta
+                    || !Number.isSafeInteger(event.revision) || event.revision < 0
+                    || !isObject(event.session_delta)) {
+                    return 'parsed delta/revision 无效';
+                }
+            } else if (!isObject(event.session)) {
+                return 'parsed 事件缺少 delta 或旧 Session';
+            }
+        }
         return true;
     }
 
@@ -45,6 +97,7 @@
         const lastEventId = Number.isSafeInteger(turn.last_event_id) && turn.last_event_id >= 0
             ? turn.last_event_id
             : 0;
+        const terminal = TERMINAL_STATUSES.includes(turn.status);
         return {
             turnId: turn.turn_id,
             ref,
@@ -56,8 +109,9 @@
             error: turn.error || null,
             // Prompt 诊断不参与持久指针；由具体视图继续做字段白名单脱敏。
             promptDiagnostics: isObject(turn.prompt_diagnostics) ? turn.prompt_diagnostics : null,
-            terminal: TERMINAL_STATUSES.includes(turn.status),
-            terminalCount: TERMINAL_STATUSES.includes(turn.status) ? 1 : 0,
+            terminal,
+            terminalCount: terminal ? 1 : 0,
+            syncPending: terminal,
         };
     }
 
@@ -76,7 +130,7 @@
         if (event.type === 'started') next.status = 'streaming';
         else if (event.type === 'content') next.content += String(event.content || '');
         else if (event.type === 'thinking') next.thinking += String(event.content || '');
-        else if (event.type === 'parsed') next.parsed = event;
+        else if (event.type === 'parsed') next.parsed = normalizeParsedEvent(event);
         else if (event.type === 'terminal') {
             if (!TERMINAL_STATUSES.includes(event.status)) {
                 throw new ApiError('turn terminal 状态无效', {
@@ -87,6 +141,7 @@
             next.error = event.error || null;
             next.terminal = true;
             next.terminalCount = previous.terminalCount + 1;
+            next.syncPending = true;
         }
         return { state: next, accepted: true, duplicate: false, gap };
     }
@@ -95,6 +150,14 @@
         if (!ACTIVE_STATUSES.includes(status)) return true;
         if (action === 'cancel') return true;
         return !BLOCKED_ACTIONS.has(action);
+    }
+
+    function turnLocksSession(turn, ref) {
+        if (!turn || !turn.ref || !ref) return false;
+        const sameRef = turn.ref.project === ref.project
+            && turn.ref.save === ref.save
+            && turn.ref.epoch === ref.epoch;
+        return sameRef && (!turn.terminal || turn.syncPending === true);
     }
 
     class TurnClient {
@@ -176,8 +239,10 @@
         TurnClient,
         validateTurn,
         validateEvent,
+        normalizeParsedEvent,
         createTurnState,
         reduceTurnEvent,
         canPerformAction,
+        turnLocksSession,
     };
 });

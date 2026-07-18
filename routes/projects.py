@@ -1,11 +1,18 @@
 """项目路由。"""
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from core.character_loader import list_projects, ensure_project
+from core.character_loader import (
+    ensure_project,
+    list_characters,
+    list_projects,
+    load_worldbook,
+)
 from core.destructive_service import DestructiveOperationError
 from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
-from core.session_manager import delete_project_data
+from core.session_manager import delete_project_data, list_sessions
 from routes.common import (
     _id_from_display_name,
     _norm_project,
@@ -20,9 +27,52 @@ class ProjectRequest(BaseModel):
     name: str
 
 
+def _load_project_stats(project: str) -> dict:
+    counts = {
+        "characters": 0,
+        "worldbook": 0,
+        "saves": 0,
+    }
+    errors: list[str] = []
+    for category, error_code, loader in (
+        ("characters", "characters_unavailable", list_characters),
+        ("worldbook", "worldbook_unavailable", load_worldbook),
+        ("saves", "sessions_unavailable", list_sessions),
+    ):
+        try:
+            entities = loader(project)
+            counts[category] = len(entities)
+            if category == "saves" and any(
+                not isinstance(entity, dict) or entity.get("status") != "ready"
+                for entity in entities
+            ):
+                counts[category] = 0
+                errors.append(error_code)
+        except Exception:
+            # 聚合接口只公开安全的分类码；实体内容、路径和解析异常均不出域。
+            errors.append(error_code)
+
+    return {
+        "project": project,
+        **counts,
+        "status": "partial" if errors else "ready",
+        "errors": errors,
+    }
+
+
 @router.get("/api/projects")
 async def api_list_projects():
     return {"projects": list_projects()}
+
+
+@router.get("/api/projects/stats")
+async def api_project_stats():
+    projects = list_projects()
+    stats = await asyncio.gather(*(
+        asyncio.to_thread(_load_project_stats, project)
+        for project in projects
+    ))
+    return {"stats": stats}
 
 
 @router.post("/api/projects")

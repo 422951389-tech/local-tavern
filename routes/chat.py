@@ -63,6 +63,12 @@ from routes.common import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 _prompt_assembler = PromptAssembler()
+_PARSED_SESSION_DELTA_FIELDS = (
+    "scene_meta",
+    "characters_state",
+    "roleplay_policy",
+    "current_model",
+)
 
 
 async def shutdown_chat_background_tasks() -> None:
@@ -578,17 +584,22 @@ async def _commit_completed(
         prepared["expected_revision"],
         commit_chat,
     )
-    await runtime.mark_session_committed(mutation.session["revision"])
+    revision = mutation.session["revision"]
+    await runtime.mark_session_committed(revision)
     parsed_event = {
         "type": "parsed",
         "parsed": parsed,
         "roleplay_warnings": deepcopy(roleplay_warnings),
-        "session": mutation.session,
+        "revision": revision,
+        "session_delta": {
+            field: deepcopy(mutation.session[field])
+            for field in _PARSED_SESSION_DELTA_FIELDS
+        },
     }
-    await runtime.emit(parsed_event, session_revision=mutation.session["revision"])
+    await runtime.emit(parsed_event, session_revision=revision)
     await runtime.terminal(
         "completed",
-        session_revision=mutation.session["revision"],
+        session_revision=revision,
     )
     if dropped and summary_id and summary_generation_id:
         schedule_summary_generation(

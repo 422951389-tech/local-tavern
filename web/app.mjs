@@ -13,7 +13,9 @@ import { createTurnPayload, createTurnPersistence } from './chat.mjs';
 import { createSummaryService, summaryPatchFromForm } from './summaries.mjs';
 import { renderSummaryPanelView } from './summary-panel.mjs';
 import { createPromptService, promptTabTargetIndex } from './prompt-editor.mjs';
-import { affinityBar, createMessageElement } from './render.mjs';
+import { clampAnchoredLeft, createListboxController } from './listbox.mjs';
+import { createFrameRenderer } from './frame-renderer.mjs';
+import { affinityBar, createMessageElement, mountMessageHistory } from './render.mjs';
 import {
     createWorldbookEditor,
     createWorldbookService,
@@ -48,6 +50,7 @@ const {
     createTurnState,
     reduceTurnEvent,
     canPerformAction,
+    turnLocksSession,
 } = globalThis.TavernTurn;
 const apiClient = new ApiClient({ timeoutMs: 15000 });
 const turnClient = new TurnClient(apiClient);
@@ -62,6 +65,7 @@ const API = {
     switchModel: '/api/model/switch',
     // 项目
     projects: '/api/projects',
+    projectStats: '/api/projects/stats',
     // 多存档
     sessions: '/api/sessions',
     sessionCreate: '/api/sessions',
@@ -135,6 +139,9 @@ const hideModal = options => modalController.hide(options);
 const sessionRefs = new SessionRefTracker(state.currentProject, state.currentSave);
 let committedSessionRef = sessionRefs.capture();
 let activeController = null;   // 当前 turn SSE 的 AbortController；业务取消必须调用服务端 cancel API
+let activeFrameRenderer = null;
+let projectListboxController = null;
+let saveListboxController = null;
 const latestRequest = { projects: 0, projectStats: 0, saves: 0 };
 const summaryWatchers = new Map();
 
@@ -215,6 +222,7 @@ function setNavigationUiState(active) {
 }
 
 function beginSessionTransition(project, save = null) {
+    cancelActiveTurnFrame({ flush: true });
     cancelSummaryWatchers();
     state.selectedSummaryId = null;
     state.summaryPanelExpanded = false;
@@ -308,14 +316,12 @@ function commitSummaryRefresh(session, ref) {
 }
 
 function isTurnActiveForRef(ref = captureSessionRef()) {
-    return Boolean(
-        state.activeTurn
-        && !state.activeTurn.terminal
-        && state.activeTurn.ref
-        && state.activeTurn.ref.project === ref.project
-        && state.activeTurn.ref.save === ref.save
-        && state.activeTurn.ref.epoch === ref.epoch
-    );
+    return turnLocksSession(state.activeTurn, ref);
+}
+
+function canPerformTurnAction(action, ref = captureSessionRef()) {
+    return !isTurnActiveForRef(ref)
+        && canPerformAction(action, state.activeTurn && state.activeTurn.status);
 }
 
 async function sessionWrite(url, method, payload, label = '保存', options = {}) {
@@ -369,11 +375,14 @@ async function loadProjects() {
         throw new ApiError('服务端没有可用项目', { code: 'empty_project_list' });
     }
     state.projectList = projects;
-    await renderProjectDropdown(requestRef);
     return state.projectList;
 }
 
 // ===== 项目下拉渲染（含元信息） =====
+function projectStatValue(stat, field, errorCode) {
+    return Array.isArray(stat.errors) && stat.errors.includes(errorCode) ? '—' : stat[field];
+}
+
 async function renderProjectDropdown(requestRef = captureSessionRef()) {
     const listEl = document.getElementById('project-list');
     if (!listEl) return;
@@ -382,27 +391,22 @@ async function renderProjectDropdown(requestRef = captureSessionRef()) {
     const projectList = [...state.projectList];
     const stats = await projectService.loadStats(projectList);
     for (const [project, value] of Object.entries(stats)) {
-        if (value.error) console.warn(`加载项目 ${project} 元信息失败`, value.error);
+        if (value.status === 'partial') {
+            console.warn(`项目 ${project} 统计不完整`, value.errors.join(','));
+        }
     }
 
     if (!isCurrentSessionRef(requestRef) || requestId !== latestRequest.projectStats) return;
 
     listEl.innerHTML = projectList.map(p => {
-        const st = stats[p] || { chars:0, world:0, saves:0 };
+        const st = stats[p] || { characters:0, worldbook:0, saves:0 };
         const active = p === state.currentProject ? 'active' : '';
         return `<div class="dropdown-item ${active}" data-project="${escapeHtml(p)}">
             <span class="item-name">📁 ${escapeHtml(p)}</span>
-            <span class="project-item-stats">👥${st.chars} 📖${st.world} 💾${st.saves}</span>
+            <span class="project-item-stats">👥${projectStatValue(st, 'characters', 'characters_unavailable')} 📖${projectStatValue(st, 'worldbook', 'worldbook_unavailable')} 💾${projectStatValue(st, 'saves', 'sessions_unavailable')}</span>
         </div>`;
     }).join('');
-
-    listEl.querySelectorAll('.dropdown-item').forEach(item => {
-        item.addEventListener('click', () => {
-            const p = item.dataset.project;
-            hideAllDropdowns();
-            switchProject(p);
-        });
-    });
+    if (projectListboxController) projectListboxController.refresh();
 
     // 更新顶栏项目名 + 元信息
     updateProjectButton(stats);
@@ -413,8 +417,8 @@ function updateProjectButton(statsMap) {
     const statsEl = document.getElementById('project-stats');
     if (nameEl) nameEl.textContent = state.currentProject;
     if (statsEl && statsMap) {
-        const st = statsMap[state.currentProject] || { chars:0, world:0, saves:0 };
-        statsEl.innerHTML = `<span class="stat">👥${st.chars}</span><span class="stat">📖${st.world}</span><span class="stat">💾${st.saves}</span>`;
+        const st = statsMap[state.currentProject] || { characters:0, worldbook:0, saves:0 };
+        statsEl.innerHTML = `<span class="stat">👥${projectStatValue(st, 'characters', 'characters_unavailable')}</span><span class="stat">📖${projectStatValue(st, 'worldbook', 'worldbook_unavailable')}</span><span class="stat">💾${projectStatValue(st, 'saves', 'sessions_unavailable')}</span>`;
     }
 }
 
@@ -437,13 +441,17 @@ function showToast(msg, duration = 1800) {
 
 // ===== 下拉面板显隐 =====
 function hideAllDropdowns() {
+    if (projectListboxController) projectListboxController.close();
+    if (saveListboxController) saveListboxController.close();
     document.querySelectorAll('.dropdown-panel').forEach(p => p.classList.add('hidden'));
 }
 
 function positionDropdown(panel, anchor) {
     const r = anchor.getBoundingClientRect();
+    const panelWidth = panel.getBoundingClientRect().width;
+    const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
     panel.style.top = (r.bottom + 4) + 'px';
-    panel.style.left = r.left + 'px';
+    panel.style.left = clampAnchoredLeft(r.left, panelWidth, viewportWidth) + 'px';
 }
 
 // ===== 初始化 =====
@@ -607,6 +615,7 @@ function renderSaveDropdown() {
     if (!listEl) return;
     if (state.saveList.length === 0) {
         listEl.innerHTML = '<div class="dropdown-item" style="color:var(--text-dim);cursor:default">— 无存档 —</div>';
+        if (saveListboxController) saveListboxController.refresh();
         return;
     }
     listEl.innerHTML = state.saveList.map(s => {
@@ -616,13 +625,7 @@ function renderSaveDropdown() {
             <span class="item-meta">${s.message_count || 0} 条</span>
         </div>`;
     }).join('');
-    listEl.querySelectorAll('.dropdown-item[data-save]').forEach(item => {
-        item.addEventListener('click', () => {
-            const sid = item.dataset.save;
-            hideAllDropdowns();
-            switchSave(sid);
-        });
-    });
+    if (saveListboxController) saveListboxController.refresh();
 }
 
 async function loadCurrentSession(requestRef = captureSessionRef()) {
@@ -854,10 +857,10 @@ function renderAffinityBar(percent) {
 
 function renderHistory(history) {
     const stream = document.getElementById('chat-stream');
-    stream.innerHTML = '';
-    history.forEach((msg) => {
-        if (msg.role === 'user') appendUserMessage(msg.content, msg);
-        else if (msg.role === 'assistant') appendAssistantMessage(msg.content, msg.thinking || '', msg);
+    mountMessageHistory(document, stream, history, msg => {
+        if (msg.role === 'user') return buildUserMessage(msg.content, msg);
+        if (msg.role === 'assistant') return buildAssistantMessage(msg.content, msg.thinking || '', msg).container;
+        return null;
     });
     // 重渲染历史时，给最新一条 AI 消息补上「📋 剧情记忆」折叠面板（已有 summaries 才显示）
     const lastAI = stream.querySelector('.msg.assistant:last-of-type');
@@ -867,20 +870,24 @@ function renderHistory(history) {
 
 // ===== 消息追加 =====
 
-function appendUserMessage(text, msgData = null) {
-    const stream = document.getElementById('chat-stream');
+function buildUserMessage(text, msgData = null) {
     const { container: div } = createMessageElement(document, {
         role: 'user',
         content: text,
         message: msgData || {},
     });
-    stream.appendChild(div);
     bindMessageActions(div);
+    return div;
+}
+
+function appendUserMessage(text, msgData = null) {
+    const stream = document.getElementById('chat-stream');
+    const div = buildUserMessage(text, msgData);
+    stream.appendChild(div);
     scrollToBottom();
 }
 
-function appendAssistantMessage(content, thinking = '', msgData = null) {
-    const stream = document.getElementById('chat-stream');
+function buildAssistantMessage(content, thinking = '', msgData = null) {
     const rendered = createMessageElement(document, {
         role: 'assistant',
         content,
@@ -890,12 +897,17 @@ function appendAssistantMessage(content, thinking = '', msgData = null) {
     const div = rendered.container;
     // 给 assistant 节点分配唯一 id，便于 SSE/regenerate 精确锁定目标（兜底 :last-child 选择器）
     div.id = div.id || `msg-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    stream.appendChild(div);
-    const contentEl = rendered.contentElement;
     renderRoleplayWarnings(document, div, msgData);
     bindMessageActions(div);
+    return rendered;
+}
+
+function appendAssistantMessage(content, thinking = '', msgData = null) {
+    const stream = document.getElementById('chat-stream');
+    const rendered = buildAssistantMessage(content, thinking, msgData);
+    stream.appendChild(rendered.container);
     scrollToBottom();
-    return contentEl;
+    return rendered.contentElement;
 }
 
 // ===== 消息操作 =====
@@ -1038,8 +1050,8 @@ async function regenerateFrom(messageRef) {
     if (!messageRef || !messageRef.message_id) {
         throw new ApiError('重生成需要稳定 message_id', { code: 'message_id_required' });
     }
-    if (state.navigationBusy || !canPerformAction('regenerate', state.activeTurn && state.activeTurn.status)) return;
     const requestRef = captureSessionRef();
+    if (state.navigationBusy || !canPerformTurnAction('regenerate', requestRef)) return;
     if (!sessionBelongsToRef(state.session, requestRef)) {
         throw new ApiError('当前存档尚未加载完成', { code: 'stale_session_ref' });
     }
@@ -1142,10 +1154,7 @@ function renderSummaryPanel(lastAssistant, sess) {
         session: sess,
         selectedId: state.selectedSummaryId,
         expanded: state.summaryPanelExpanded,
-        disabled: state.navigationBusy || state.isStreaming || !canPerformAction(
-            'summary',
-            state.activeTurn && state.activeTurn.status,
-        ),
+        disabled: state.navigationBusy || state.isStreaming || !canPerformTurnAction('summary'),
         onSelect: summaryId => {
             state.selectedSummaryId = summaryId;
             state.summaryPanelExpanded = true;
@@ -1189,7 +1198,7 @@ function appendSummaryEditorField(form, summaryId, config) {
 
 function showSummaryEditor(summary) {
     if (!summary || !summary.id) return;
-    if (!canPerformAction('summary', state.activeTurn && state.activeTurn.status)) {
+    if (!canPerformTurnAction('summary')) {
         showToast('当前对话正在生成，摘要暂不可编辑');
         return;
     }
@@ -1284,7 +1293,7 @@ function watchPendingSummaries(ref, session) {
 
 async function regenerateSummary(summary) {
     if (!summary || !summary.id) return;
-    if (!canPerformAction('summary', state.activeTurn && state.activeTurn.status)) {
+    if (!canPerformTurnAction('summary')) {
         showToast('当前对话正在生成，摘要暂不可重生成');
         return;
     }
@@ -1335,7 +1344,7 @@ function clearPersistedTurn() {
     try { turnPersistence.clear(); } catch (_error) {}
 }
 
-function setTurnUiState(active, cancelling = false) {
+function setTurnUiState(active, cancelling = false, syncPending = false) {
     state.isStreaming = active;
     const sendBtn = document.getElementById('send-btn');
     const cancelBtn = document.getElementById('send-cancel-btn');
@@ -1345,10 +1354,11 @@ function setTurnUiState(active, cancelling = false) {
         sendBtn.setAttribute('aria-disabled', String(active));
     }
     if (cancelBtn) {
-        cancelBtn.disabled = !active || cancelling;
+        const waitingForSession = syncPending || Boolean(state.activeTurn && state.activeTurn.syncPending);
+        cancelBtn.disabled = !active || cancelling || waitingForSession;
         cancelBtn.classList.toggle('hidden', !active);
-        cancelBtn.setAttribute('aria-busy', String(cancelling));
-        cancelBtn.textContent = cancelling ? '正在取消…' : '⏹ 取消';
+        cancelBtn.setAttribute('aria-busy', String(cancelling || waitingForSession));
+        cancelBtn.textContent = waitingForSession ? '正在同步存档…' : cancelling ? '正在取消…' : '⏹ 取消';
     }
 
     const selectors = [
@@ -1386,18 +1396,78 @@ function makeProvisionalTurn(ref) {
     };
 }
 
-function renderActiveTurnBuffer(turn = state.activeTurn) {
-    if (!turn) return;
-    if (turn.targetEl && turn.targetEl.isConnected) {
-        turn.targetEl.textContent = turn.content || (turn.terminal ? '' : '（生成中…）');
+function sameSessionRef(left, right) {
+    return Boolean(left && right
+        && left.project === right.project
+        && left.save === right.save
+        && left.epoch === right.epoch);
+}
+
+function activeTurnSnapshot(turn = state.activeTurn) {
+    if (!turn) return null;
+    return Object.freeze({
+        turnId: turn.turnId,
+        ref: turn.ref,
+        targetEl: turn.targetEl || null,
+        content: turn.content || '',
+        thinking: turn.thinking || '',
+        terminal: Boolean(turn.terminal),
+    });
+}
+
+function renderTurnSnapshot(snapshot) {
+    if (!snapshot) return;
+    if (snapshot.targetEl && snapshot.targetEl.isConnected) {
+        snapshot.targetEl.textContent = snapshot.content || (snapshot.terminal ? '' : '（生成中…）');
     }
     const thinking = document.getElementById('thinking-content');
     const panel = document.getElementById('thinking-panel');
-    if (thinking) thinking.textContent = turn.thinking || '';
-    if (panel) panel.classList.toggle('hidden', !turn.thinking);
+    if (thinking) thinking.textContent = snapshot.thinking;
+    if (panel) panel.classList.toggle('hidden', !snapshot.thinking);
+    const stream = document.getElementById('chat-stream');
+    if (stream) stream.scrollTop = stream.scrollHeight;
+}
+
+function ensureActiveTurnFrame() {
+    if (activeFrameRenderer) return activeFrameRenderer;
+    activeFrameRenderer = createFrameRenderer({
+        requestFrame: callback => requestAnimationFrame(callback),
+        cancelFrame: frameId => cancelAnimationFrame(frameId),
+        isCurrent: snapshot => {
+            const active = state.activeTurn;
+            return Boolean(active
+                && active.turnId === snapshot.turnId
+                && active.targetEl === snapshot.targetEl
+                && sameSessionRef(active.ref, snapshot.ref)
+                && isCurrentSessionRef(snapshot.ref));
+        },
+        render: renderTurnSnapshot,
+    });
+    return activeFrameRenderer;
+}
+
+function queueActiveTurnFrame(turn = state.activeTurn) {
+    const snapshot = activeTurnSnapshot(turn);
+    if (snapshot) ensureActiveTurnFrame().enqueue(snapshot);
+}
+
+function flushActiveTurnFrame() {
+    return activeFrameRenderer ? activeFrameRenderer.flush() : false;
+}
+
+function cancelActiveTurnFrame(options = {}) {
+    if (!activeFrameRenderer) return false;
+    const committed = activeFrameRenderer.cancel(options);
+    activeFrameRenderer = null;
+    return committed;
+}
+
+function renderActiveTurnBuffer(turn = state.activeTurn) {
+    renderTurnSnapshot(activeTurnSnapshot(turn));
 }
 
 function installActiveTurn(turn, ref, options = {}) {
+    cancelActiveTurnFrame({ flush: true });
     const base = createTurnState(turn, ref);
     activeController = new AbortController();
     state.activeTurn = {
@@ -1410,8 +1480,9 @@ function installActiveTurn(turn, ref, options = {}) {
         cancelling: false,
     };
     if (base.promptDiagnostics) rememberWorldbookDiagnostics(ref, base.promptDiagnostics);
+    ensureActiveTurnFrame();
     persistActiveTurn();
-    setTurnUiState(true, false);
+    setTurnUiState(true, false, base.terminal);
     return state.activeTurn;
 }
 
@@ -1428,11 +1499,17 @@ function applyTurnEvent(event) {
     state.activeTurn = reduced.state;
     persistActiveTurn();
     if (event.type === 'content' || event.type === 'thinking' || event.type === 'started') {
-        renderActiveTurnBuffer();
+        queueActiveTurnFrame();
     } else if (event.type === 'parsed') {
-        const applied = applySessionResult(event.session, active.ref);
-        if (applied && isCurrentSessionRef(active.ref)) renderParsedResponse(event.parsed || {}, event);
+        flushActiveTurnFrame();
+        const parsedEvent = state.activeTurn.parsed;
+        if (parsedEvent.legacySession) applySessionResult(parsedEvent.legacySession, active.ref);
+        if (isCurrentSessionRef(active.ref)) renderParsedResponse(parsedEvent.parsed, parsedEvent);
         setTurnUiState(true, state.activeTurn.cancelling);
+    } else if (event.type === 'terminal') {
+        flushActiveTurnFrame();
+        cancelActiveTurnFrame();
+        setTurnUiState(true, false, true);
     }
     return true;
 }
@@ -1446,6 +1523,7 @@ function updateActiveTurnFromMeta(meta) {
         && !Array.isArray(meta.prompt_diagnostics)
         ? meta.prompt_diagnostics
         : active.promptDiagnostics;
+    if (terminal) flushActiveTurnFrame();
     state.activeTurn = {
         ...active,
         status: meta.status,
@@ -1455,10 +1533,15 @@ function updateActiveTurnFromMeta(meta) {
         promptDiagnostics,
         terminal,
         terminalCount: terminal ? Math.max(1, active.terminalCount) : active.terminalCount,
+        syncPending: terminal ? true : active.syncPending,
     };
     if (promptDiagnostics) rememberWorldbookDiagnostics(active.ref, promptDiagnostics);
     persistActiveTurn();
     renderActiveTurnBuffer();
+    if (terminal) {
+        cancelActiveTurnFrame();
+        setTurnUiState(true, false, true);
+    }
     return true;
 }
 
@@ -1517,15 +1600,34 @@ function terminalMessage(turn) {
 }
 
 async function finalizeActiveTurn(turnId) {
-    const active = state.activeTurn;
+    let active = state.activeTurn;
     if (!active || active.turnId !== turnId || !active.terminal) return false;
+    if (!active.syncPending) {
+        state.activeTurn = { ...active, syncPending: true };
+        active = state.activeTurn;
+    }
+    persistActiveTurn(active);
+    setTurnUiState(true, Boolean(active.cancelling), true);
+    flushActiveTurnFrame();
+    cancelActiveTurnFrame();
     try {
-        await reloadCurrentSession(active.ref);
-        if (active.parsed && isCurrentSessionRef(active.ref)) {
-            renderParsedResponse(active.parsed.parsed || {}, active.parsed);
-        }
+        const reloaded = await reloadCurrentSession(active.ref);
+        if (!reloaded) throw new ApiError('终态存档刷新未提交', { code: 'terminal_reload_stale' });
     } catch (error) {
-        showToast(`turn 已终止，但刷新存档失败：${errorDetail(error)}`, 4000);
+        if (state.activeTurn && state.activeTurn.turnId === turnId) {
+            state.activeTurn = { ...state.activeTurn, syncPending: true };
+            persistActiveTurn();
+            setTurnUiState(true, false, true);
+        }
+        showToast(`turn 已终止，但刷新存档失败：${errorDetail(error)}；刷新页面可重试同步`, 5000);
+        return false;
+    }
+    const current = state.activeTurn;
+    if (!current || current.turnId !== turnId) return false;
+    active = current;
+    if (active.parsed && isCurrentSessionRef(active.ref)) {
+        try { renderParsedResponse(active.parsed.parsed, active.parsed); }
+        catch (error) { console.warn('结构化响应渲染失败，已保留刷新后的存档', error); }
     }
     showToast(terminalMessage(active), active.status === 'completed' ? 1800 : 3500);
     if (active.controller && !active.controller.signal.aborted) active.controller.abort();
@@ -1573,6 +1675,8 @@ async function resumePersistedTurn(pointer = readPersistedTurnPointer()) {
 async function cancelActiveTurn() {
     const active = state.activeTurn;
     if (!active || !active.turnId || active.terminal || active.cancelling) return;
+    flushActiveTurnFrame();
+    cancelActiveTurnFrame();
     state.activeTurn = { ...active, cancelling: true };
     setTurnUiState(true, true);
     try {
@@ -1601,6 +1705,7 @@ function buildTurnPayload(requestRef, userInput = undefined) {
 }
 
 function prepareProvisionalTurn(requestRef) {
+    cancelActiveTurnFrame({ flush: true });
     const thinking = document.getElementById('thinking-content');
     if (thinking) thinking.textContent = '';
     state.activeTurn = makeProvisionalTurn(requestRef);
@@ -1652,6 +1757,7 @@ async function runTurnLifecycle(turnRequest, requestRef, options = {}) {
         }
         state.activeTurn = null;
         activeController = null;
+        cancelActiveTurnFrame();
         setTurnUiState(false, false);
         showToast(`${failureLabel}失败：${errorDetail(error)}`, 4000);
     }
@@ -1660,8 +1766,8 @@ async function runTurnLifecycle(turnRequest, requestRef, options = {}) {
 async function sendMessage(text = null) {
     const input = document.getElementById('user-input');
     const userText = text !== null ? String(text).trim() : input.value.trim();
-    if (!userText || state.navigationBusy || !canPerformAction('send', state.activeTurn && state.activeTurn.status)) return;
     const requestRef = captureSessionRef();
+    if (!userText || state.navigationBusy || !canPerformTurnAction('send', requestRef)) return;
     if (!sessionBelongsToRef(state.session, requestRef)) {
         showToast('当前存档尚未加载完成');
         return;
@@ -1701,7 +1807,7 @@ async function createCardEditor(config) {
     const editorRef = config.sessionRef || captureSessionRef();
     config.sessionRef = editorRef;
     if (!isCurrentSessionRef(editorRef)) return;
-    if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+    if (!canPerformTurnAction('card_write', editorRef)) {
         showToast('当前存档正在生成，请先取消或等待完成');
         return;
     }
@@ -1725,7 +1831,7 @@ async function createCardEditor(config) {
         return;
     }
     if (!isCurrentSessionRef(editorRef)) return;
-    if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+    if (!canPerformTurnAction('card_write', editorRef)) {
         showToast('加载角色卡期间已开始生成，请等待完成后重试');
         return;
     }
@@ -1746,21 +1852,42 @@ async function createCardEditor(config) {
     let fieldIdCounter = 0;
 
     // ===== 列表渲染（仅 allowNew）=====
+    function syncCardListSelection() {
+        if (!listEl) return;
+        const newButton = listEl.querySelector('#ce-new');
+        if (newButton) {
+            const selected = currentItem === null;
+            newButton.classList.toggle('active', selected);
+            newButton.setAttribute('aria-current', selected ? 'true' : 'false');
+        }
+        listEl.querySelectorAll('.card-row').forEach(row => {
+            const selected = Boolean(
+                currentItem && currentItem[config.idField] === row.dataset.id
+            );
+            row.classList.toggle('active', selected);
+            row.setAttribute('aria-current', selected ? 'true' : 'false');
+        });
+    }
+
     function renderList() {
         if (!listEl) return;
         listEl.innerHTML = `
-            <button class="modal-btn new-card-btn" id="ce-new">＋ 新建</button>
+            <button type="button" class="modal-btn new-card-btn" id="ce-new">＋ 新建</button>
             ${items.map(it => `
-                <div class="card-row ${currentItem && currentItem[config.idField] === it[config.idField] ? 'active' : ''}" data-id="${escapeHtml(it[config.idField])}">
+                <button type="button" class="card-row ${currentItem && currentItem[config.idField] === it[config.idField] ? 'active' : ''}" data-id="${escapeHtml(it[config.idField])}" aria-label="编辑卡片 ${escapeHtml(it.name || it[config.idField] || it.id || '')}">
                     <span class="card-row-name">${escapeHtml(it.name || it[config.idField] || it.id || '')}</span>
-                </div>`).join('')}`;
+                </button>`).join('')}`;
+        syncCardListSelection();
         listEl.querySelector('#ce-new').addEventListener('click', () => {
-            currentItem = null; renderList(); renderForm();
+            currentItem = null;
+            syncCardListSelection();
+            renderForm();
         });
         listEl.querySelectorAll('.card-row').forEach(row => {
             row.addEventListener('click', () => {
                 currentItem = items.find(it => it[config.idField] === row.dataset.id) || null;
-                renderList(); renderForm();
+                syncCardListSelection();
+                renderForm();
             });
         });
     }
@@ -1958,7 +2085,7 @@ async function createCardEditor(config) {
                 statusEl.textContent = '✗ 当前项目或存档已切换，请重新打开编辑器';
                 return;
             }
-            if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+            if (!canPerformTurnAction('card_write', editorRef)) {
                 statusEl.textContent = '✗ 当前存档正在生成，请先取消或等待完成';
                 return;
             }
@@ -2016,7 +2143,7 @@ async function createCardEditor(config) {
                     statusEl.textContent = '✗ 当前项目已切换，请重新打开编辑器';
                     return;
                 }
-                if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+                if (!canPerformTurnAction('card_write', editorRef)) {
                     statusEl.textContent = '✗ 当前存档正在生成，请先取消或等待完成';
                     return;
                 }
@@ -2167,7 +2294,7 @@ async function openWorldbookEditor() {
         showToast('当前存档尚未加载完成');
         return;
     }
-    if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+    if (!canPerformTurnAction('card_write', editorRef)) {
         showToast('当前存档正在生成，请先取消或等待完成');
         return;
     }
@@ -2187,7 +2314,7 @@ async function openWorldbookEditor() {
     if (!isCurrentSessionRef(editorRef) || !sessionBelongsToRef(state.session, editorRef)) return;
     // 加载期间 turn 可能已启动；DOM 尚不存在时全局禁用器无法覆盖新控件，
     // 因此在构造编辑器前再次封闭竞态窗口。
-    if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+    if (!canPerformTurnAction('card_write', editorRef)) {
         showToast('加载世界书期间已开始生成，请等待完成后重试');
         return;
     }
@@ -2203,7 +2330,7 @@ async function openWorldbookEditor() {
         confirmDelete: entryId => confirm(`确定删除世界书条目「${entryId}」吗？删除后将移入回收区，可以恢复。`),
         onSaveEntry: async (data, context) => {
             if (!isCurrentSessionRef(editorRef)) throw new Error('当前项目或存档已切换，请重新打开编辑器');
-            if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+            if (!canPerformTurnAction('card_write', editorRef)) {
                 throw new Error('当前存档正在生成，请先取消或等待完成');
             }
             if (!context.isNew && context.originalId !== data.id) {
@@ -2215,7 +2342,7 @@ async function openWorldbookEditor() {
         },
         onDeleteEntry: async entryId => {
             if (!isCurrentSessionRef(editorRef)) throw new Error('当前项目或存档已切换，请重新打开编辑器');
-            if (!canPerformAction('card_write', state.activeTurn && state.activeTurn.status)) {
+            if (!canPerformTurnAction('card_write', editorRef)) {
                 throw new Error('当前存档正在生成，请先取消或等待完成');
             }
             const result = await worldbookService.remove(editorRef.project, entryId);
@@ -2603,22 +2730,23 @@ function bindUI() {
     // 项目按钮 → 弹出项目下拉
     const projectBtn = document.getElementById('project-btn');
     const projectDropdown = document.getElementById('project-dropdown');
-    projectBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (state.navigationBusy || isTurnActiveForRef(committedSessionRef)) {
-            showToast('当前正在切换或生成，请稍候');
-            return;
-        }
-        const wasHidden = projectDropdown.classList.contains('hidden');
-        hideAllDropdowns();
-        if (wasHidden) {
-            positionDropdown(projectDropdown, projectBtn);
-            projectDropdown.classList.remove('hidden');
-        }
+    projectListboxController = createListboxController({
+        documentRef: document,
+        trigger: projectBtn,
+        panel: projectDropdown,
+        listbox: document.getElementById('project-list'),
+        optionSelector: '.dropdown-item[data-project]',
+        isSelected: option => option.dataset.project === state.currentProject,
+        canOpen: () => !state.navigationBusy && !isTurnActiveForRef(committedSessionRef),
+        onBlocked: () => showToast('当前正在切换或生成，请稍候'),
+        beforeOpen: hideAllDropdowns,
+        position: positionDropdown,
+        onSelect: option => { void switchProject(option.dataset.project); },
     });
 
     // 项目下拉：新建项目
     document.getElementById('project-new-inline').addEventListener('click', () => {
+        projectListboxController.close({ restoreFocus: true });
         hideAllDropdowns();
         promptForNewProject();
     });
@@ -2638,26 +2766,31 @@ function bindUI() {
     });
     const saveTab = document.getElementById('tab-saves');
     const saveDropdown = document.getElementById('save-dropdown');
-    saveTab.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (state.navigationBusy || isTurnActiveForRef(committedSessionRef)) {
-            showToast('当前正在切换或生成，请稍候');
-            return;
-        }
-        const wasHidden = saveDropdown.classList.contains('hidden');
-        hideAllDropdowns();
-        if (wasHidden) {
-            positionDropdown(saveDropdown, saveTab);
-            saveDropdown.classList.remove('hidden');
-        }
+    saveListboxController = createListboxController({
+        documentRef: document,
+        trigger: saveTab,
+        panel: saveDropdown,
+        listbox: document.getElementById('save-list'),
+        optionSelector: '.dropdown-item[data-save]',
+        isSelected: option => option.dataset.save === state.currentSave,
+        canOpen: () => !state.navigationBusy && !isTurnActiveForRef(committedSessionRef),
+        onBlocked: () => showToast('当前正在切换或生成，请稍候'),
+        beforeOpen: hideAllDropdowns,
+        position: positionDropdown,
+        onSelect: option => { void switchSave(option.dataset.save); },
     });
 
     // 存档下拉内的 5 个操作按钮
-    document.getElementById('save-new-inline').addEventListener('click', () => { hideAllDropdowns(); promptForNewSave(); });
-    document.getElementById('save-rename-inline').addEventListener('click', () => { hideAllDropdowns(); promptForRenameSave(); });
-    document.getElementById('save-delete-inline').addEventListener('click', () => { hideAllDropdowns(); deleteCurrentSave(); });
-    document.getElementById('save-export-inline').addEventListener('click', () => { hideAllDropdowns(); exportCurrentSave(); });
-    document.getElementById('save-import-inline').addEventListener('click', () => { hideAllDropdowns(); promptForImportSave(); });
+    const runSaveDropdownAction = action => {
+        saveListboxController.close({ restoreFocus: true });
+        hideAllDropdowns();
+        action();
+    };
+    document.getElementById('save-new-inline').addEventListener('click', () => runSaveDropdownAction(promptForNewSave));
+    document.getElementById('save-rename-inline').addEventListener('click', () => runSaveDropdownAction(promptForRenameSave));
+    document.getElementById('save-delete-inline').addEventListener('click', () => runSaveDropdownAction(deleteCurrentSave));
+    document.getElementById('save-export-inline').addEventListener('click', () => runSaveDropdownAction(exportCurrentSave));
+    document.getElementById('save-import-inline').addEventListener('click', () => runSaveDropdownAction(promptForImportSave));
 
     // 点击空白处关闭所有下拉
     document.addEventListener('click', (e) => {
