@@ -1,18 +1,20 @@
 @echo off
+setlocal
 chcp 65001 >nul
-cd /d C:\local-tavern
+cd /d "%~dp0"
+set "PYTHONUTF8=1"
+if not defined TAVERN_BASE_DIR set "TAVERN_BASE_DIR=%~dp0"
 echo ============================================
 echo   Stop Local Tavern
 echo ============================================
 
-where python >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] Python was not found. No process was stopped.
+if not exist "%~dp0.venv\Scripts\python.exe" (
+    echo [ERROR] Project .venv was not found. No process was stopped.
     set "EXIT_CODE=1"
     goto :finish
 )
 
-python -X utf8 -m core.process_guard stop
+"%~dp0.venv\Scripts\python.exe" -X utf8 -m core.process_guard stop
 set "EXIT_CODE=%ERRORLEVEL%"
 
 :finish

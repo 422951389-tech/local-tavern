@@ -20,9 +20,9 @@ async def _collect(client: OllamaClient) -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_bad_ndjson_chunk_is_skipped_without_losing_valid_events():
+async def test_bad_ndjson_chunk_is_skipped_without_losing_valid_events(caplog):
     body = (
-        b"not-json\n"
+        b"not-json-SECRET_CHAT_BODY\n"
         b'{"message":{"thinking":"test-thinking"},"done":false}\n'
         b'{"message":{"content":"test-content"},"done":false}\n'
         b'{"message":{},"done":true}\n'
@@ -41,6 +41,8 @@ async def test_bad_ndjson_chunk_is_skipped_without_losing_valid_events():
         {"type": "done", "content": ""},
     ]
     assert client._warned_json_parse is True
+    assert "SECRET_CHAT_BODY" not in caplog.text
+    assert "invalid_ndjson_chunk length=" in caplog.text
 
 
 @pytest.mark.asyncio

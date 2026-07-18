@@ -17,6 +17,7 @@ import httpx
 
 from core.config import (
     MODEL_CONTEXT_CACHE_SECONDS,
+    OLLAMA_HEALTH_TIMEOUT_MS,
     OLLAMA_HOST,
     PROMPT_CONTEXT_FALLBACK,
 )
@@ -27,9 +28,15 @@ DEFAULT_TIMEOUT = 300.0  # 35B 首字可能慢
 
 
 class OllamaClient:
-    def __init__(self, host: str = OLLAMA_HOST):
+    def __init__(
+        self,
+        host: str = OLLAMA_HOST,
+        *,
+        health_transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self.host = host
         self._client: Optional[httpx.AsyncClient] = None
+        self._health_transport = health_transport
         self._warned_json_parse = False
         self._context_limit_cache: dict[str, tuple[float, dict]] = {}
         self._context_limit_lock = asyncio.Lock()
@@ -45,6 +52,50 @@ class OllamaClient:
     async def close(self):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+
+    async def probe_health(self) -> dict[str, object]:
+        """用独立短超时检查 Ollama；结果不含 URL、版本或模型名。"""
+        timeout_seconds = OLLAMA_HEALTH_TIMEOUT_MS / 1000
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.host,
+                timeout=httpx.Timeout(
+                    timeout_seconds,
+                    connect=min(1.0, timeout_seconds),
+                ),
+                transport=self._health_transport,
+            ) as client:
+                response = await client.get("/api/tags")
+            if response.status_code != 200:
+                return {"ok": False, "code": "bad_status"}
+            try:
+                payload = response.json()
+            except (ValueError, TypeError):
+                return {"ok": False, "code": "invalid_response"}
+            models = payload.get("models") if isinstance(payload, dict) else None
+            if not isinstance(models, list):
+                return {"ok": False, "code": "invalid_response"}
+            if not models:
+                return {"ok": False, "code": "no_models"}
+            return {"ok": True}
+        except httpx.TimeoutException as exc:
+            logger.warning(
+                "ollama_health code=timeout exception=%s",
+                type(exc).__name__,
+            )
+            return {"ok": False, "code": "timeout"}
+        except httpx.RequestError as exc:
+            logger.warning(
+                "ollama_health code=unreachable exception=%s",
+                type(exc).__name__,
+            )
+            return {"ok": False, "code": "unreachable"}
+        except Exception as exc:
+            logger.warning(
+                "ollama_health code=invalid_response exception=%s",
+                type(exc).__name__,
+            )
+            return {"ok": False, "code": "invalid_response"}
 
     async def list_models(self) -> list[str]:
         """列出 Ollama 中所有可用模型"""
@@ -204,7 +255,10 @@ class OllamaClient:
                     except json.JSONDecodeError:
                         # E1：限流日志，防止 LLM 抖动时刷屏
                         if not self._warned_json_parse:
-                            logger.warning("无法解析 chunk（后续同型警告将忽略）: %s", line[:200])
+                            logger.warning(
+                                "invalid_ndjson_chunk length=%s subsequent_warnings=suppressed",
+                                len(line),
+                            )
                             self._warned_json_parse = True
                         continue
 

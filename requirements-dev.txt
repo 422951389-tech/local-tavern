@@ -1,4 +1,9 @@
 -r requirements.txt
 
+# Installed and verified development direct dependencies.
 pytest==8.3.5
 pytest-asyncio==0.25.3
+
+# coverage, ruff and playwright are deliberately not guessed: none is installed
+# or present in the local pip cache. Add exact reviewed versions before claiming
+# a complete development lock.

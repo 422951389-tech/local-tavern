@@ -17,14 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from core.config import BASE_DIR
+from core.config import BASE_DIR, PID_PATH, PORT, STOP_REQUEST_PATH
 
 
 logger = logging.getLogger(__name__)
 
-PORT = 8765
-PID_PATH = BASE_DIR / "tavern.pid"
-STOP_REQUEST_PATH = BASE_DIR / "tavern.stop.pid"
 STOP_TIMEOUT_SECONDS = 8.0
 
 
@@ -125,7 +122,12 @@ def _listening_pids(port: int) -> set[int]:
 
 def _command_matches_tavern(command_line: str) -> bool:
     command = command_line.lower().replace("\\", "/")
-    return ("uvicorn" in command and "server:app" in command) or command.endswith("server.py") or " server.py " in command
+    return (
+        ("uvicorn" in command and "server:app" in command)
+        or ("core.launcher" in command and " serve" in command)
+        or command.endswith("server.py")
+        or " server.py " in command
+    )
 
 
 def metadata_matches_process(
@@ -160,7 +162,12 @@ def claim_pid_file(path: Path = PID_PATH) -> dict:
         existing = _read_json(path)
         existing_pid = existing.get("pid") if existing else None
         if isinstance(existing_pid, int) and _pid_is_running(existing_pid):
-            raise RuntimeError(f"检测到仍在运行的本地酒馆 PID {existing_pid}")
+            if existing_pid == os.getpid() or metadata_matches_process(
+                existing,
+                command_line=_process_command_line(existing_pid),
+                listening_pids=_listening_pids(PORT),
+            ):
+                raise RuntimeError(f"检测到仍在运行的本地酒馆 PID {existing_pid}")
         path.unlink(missing_ok=True)
 
     metadata = {
@@ -200,6 +207,7 @@ def write_stop_request(metadata: dict, path: Path = STOP_REQUEST_PATH) -> None:
         "requested_at": datetime.now(timezone.utc).isoformat(),
     }
     target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

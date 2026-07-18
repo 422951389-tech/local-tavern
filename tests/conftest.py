@@ -22,6 +22,9 @@ TEST_PROMPTS_DIR = TEST_ROOT / "prompts"
 TEST_SETTINGS_PATH = TEST_DATA_DIR / "settings.json"
 TEST_BACKUPS_DIR = TEST_ROOT / "backups"
 TEST_LOG_DIR = TEST_ROOT / "logs"
+TEST_LOG_FILE = TEST_LOG_DIR / "tavern.log"
+TEST_PID_PATH = TEST_ROOT / "tavern.pid"
+TEST_STOP_REQUEST_PATH = TEST_ROOT / "tavern.stop.pid"
 
 # 必须先配置环境，再导入任何 core/routes/server 模块。
 os.environ["TAVERN_DATA_DIR"] = str(TEST_DATA_DIR)
@@ -32,6 +35,15 @@ os.environ["TAVERN_RECOVERY_DIR"] = str(TEST_DATA_DIR / ".recovery")
 os.environ["TAVERN_MIGRATIONS_DIR"] = str(TEST_DATA_DIR / ".migrations")
 os.environ["TAVERN_BACKUP_DIR"] = str(TEST_BACKUPS_DIR)
 os.environ["TAVERN_LOG_DIR"] = str(TEST_LOG_DIR)
+os.environ["TAVERN_LOG_FILE"] = str(TEST_LOG_FILE)
+os.environ["TAVERN_PID_PATH"] = str(TEST_PID_PATH)
+os.environ["TAVERN_STOP_REQUEST_PATH"] = str(TEST_STOP_REQUEST_PATH)
+os.environ["TAVERN_HOST"] = "127.0.0.1"
+os.environ["TAVERN_PORT"] = "8765"
+os.environ["TAVERN_ALLOW_REMOTE"] = "false"
+os.environ["TAVERN_LOG_MAX_BYTES"] = str(5 * 1024 * 1024)
+os.environ["TAVERN_LOG_BACKUP_COUNT"] = "5"
+os.environ["TAVERN_OLLAMA_HEALTH_TIMEOUT_MS"] = "2000"
 os.environ["TAVERN_OLLAMA_HOST"] = "http://127.0.0.1:1"
 
 TEST_PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -81,6 +93,9 @@ def isolated_paths() -> dict[str, Path]:
         "migrations": TEST_DATA_DIR / ".migrations",
         "backups": TEST_BACKUPS_DIR,
         "logs": TEST_LOG_DIR,
+        "log_file": TEST_LOG_FILE,
+        "pid": TEST_PID_PATH,
+        "stop_request": TEST_STOP_REQUEST_PATH,
         "real_data": REAL_DATA_DIR,
         "real_prompts": REAL_PROMPTS_DIR,
         "real_backups": REAL_BACKUPS_DIR,

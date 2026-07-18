@@ -93,6 +93,9 @@ class FakeOllamaClient:
     async def list_models(self) -> list[str]:
         return list(self.models)
 
+    async def probe_health(self) -> dict[str, object]:
+        return {"ok": bool(self.models), **({} if self.models else {"code": "no_models"})}
+
     async def get_context_limit(self, model: str) -> dict:
         self.context_limit_calls.append(model)
         return deepcopy(self.context_limits.get(model, {

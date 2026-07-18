@@ -1,49 +1,23 @@
-' run_hidden.vbs - Local Tavern silent launcher
-' Launches uvicorn in a hidden window, waits for the port, then opens the browser.
-' Stop the server: stop_tavern.bat (only the PID registered by this project).
+' run_hidden.vbs - Local Tavern hidden launcher
 Option Explicit
 
-Dim fso, shell, port, url, appDir
+Dim fso, shell, processEnv, appDir, pythonw, command
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set shell = CreateObject("WScript.Shell")
+Set processEnv = shell.Environment("PROCESS")
 
-appDir = "C:\local-tavern"
-port = "8765"
-url = "http://localhost:" & port
+appDir = fso.GetParentFolderName(WScript.ScriptFullName)
+pythonw = fso.BuildPath(appDir, ".venv\Scripts\pythonw.exe")
+If Len(Trim(processEnv("TAVERN_BASE_DIR"))) = 0 Then
+    processEnv("TAVERN_BASE_DIR") = appDir
+End If
+
+If Not fso.FileExists(pythonw) Then
+    shell.Popup "Project .venv was not found." & vbCrLf & _
+                "Run setup.bat first.", 0, "Local Tavern", 16
+    WScript.Quit 1
+End If
 
 shell.CurrentDirectory = appDir
-
-' Launch uvicorn asynchronously in a hidden window (0=no window, False=async).
-shell.Run "cmd /c python -X utf8 -m uvicorn server:app --host 127.0.0.1 --port " & port, 0, False
-
-' Poll the port until ready (up to ~40s to cover Ollama cold load + uvicorn start).
-Dim ok, waited, http
-ok = False
-waited = 0
-On Error Resume Next
-Do While waited < 40
-    WScript.Sleep 1000
-    waited = waited + 1
-    Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
-    http.SetTimeouts 1500, 1500, 1500, 1500
-    Err.Clear
-    http.Open "GET", url, False
-    http.Send
-    If Err.Number = 0 And http.Status = 200 Then
-        ok = True
-        Exit Do
-    End If
-    Set http = Nothing
-Loop
-On Error GoTo 0
-
-If ok Then
-    shell.Run url
-
-    ' Also open the new-session if there is none yet is not needed; just open root.
-Else
-    ' Service did not come up in 40s: warn the user.
-    shell.Popup "Server not ready within 40 s." & vbCrLf & vbCrLf & _
-                "Possible: Ollama not running, Python deps missing, or port taken." & vbCrLf & _
-                "Run start.bat to see the error log.", 0, "Local Tavern", 48
-End If
+command = """" & pythonw & """ -X utf8 -m core.launcher serve --hidden --open-browser --workers 1"
+shell.Run command, 0, False
