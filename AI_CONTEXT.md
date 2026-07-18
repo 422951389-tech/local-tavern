@@ -3,7 +3,7 @@
 > **目的**：让下一个 AI 协作者在不询问用户的情况下，能完整理解这个项目并继续工作。
 > **创建日期**：2026-06-27
 > **最后更新**：2026-07-18
-> **当前状态**：阶段 A、B、C、D completed；PROMPT-1、MEMORY-1、WORLD-1、ROLE-1 已验收，当前进入 OPS-1 / OPS-2
+> **当前状态**：阶段 A、B、C、D completed；OPS-1 completed，OPS-2 运行基线已落地但开发锁验收仍 in_progress；当前实施 UX-1
 > **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
 
 ---
@@ -43,13 +43,13 @@
 | 维度 | 选型 | 备注 |
 |------|------|------|
 | 后端语言 | **Python 3.12** | 用户机器装的版本 |
-| Web 框架 | **FastAPI 0.138** | uvicorn 0.49 启动 |
-| LLM 通信 | **httpx 0.28** 异步流式 | 直接调 Ollama `/api/chat`，不用 OpenAI SDK |
+| Web 框架 | **FastAPI 0.115.0** | uvicorn 0.32.0，lifespan 启动 |
+| LLM 通信 | **httpx 0.27.0** 异步流式 | 直接调 Ollama `/api/chat`，不用 OpenAI SDK |
 | LLM 后端 | **Ollama 0.30.7** | 监听 11434 |
 | 前端 | **原生 HTML/CSS/JS** | 无构建工具，无 npm，零前端依赖 |
 | 数据存储 | **本地 JSON 文件** | 无数据库 |
-| 角色卡/世界书格式 | **YAML** | pyyaml 6.0.3 |
-| 数据校验 | **Pydantic 2.13** | |
+| 角色卡/世界书格式 | **YAML** | PyYAML 6.0.1 |
+| 数据校验 | **Pydantic 2.9.0** | |
 | 系统 | **Windows 11 + Git Bash** | 注意 GBK 编码问题 |
 
 **重要环境陷阱**：
@@ -64,14 +64,20 @@
 
 ```
 C:\local-tavern\
-├── server.py                  # FastAPI 主程序（500+ 行）
-├── start.bat                  # Windows 一键启动脚本
-├── requirements.txt           # 5 个依赖
+├── server.py                  # FastAPI 主程序：lifespan、路由、安全头
+├── setup.bat                  # Python 3.12 .venv + 精确 runtime lock 安装/校验
+├── start.bat / run_hidden.vbs / stop_tavern.bat  # 统一安全 launcher 与精确停止
+├── requirements.txt / requirements.lock.txt       # 直接 runtime 依赖 / 22 包闭包
+├── requirements-dev.txt / requirements-dev.lock.txt # pytest 工具链；浏览器工具尚未完整锁定
 ├── README.md                  # 用户文档（启动说明）
 ├── AI_CONTEXT.md              # ← 本文档（AI 协作者交接）
 │
 ├── core/                      # Python 核心模块
 │   ├── ollama_client.py       # Ollama 流式客户端 + /api/show 上下文缓存
+│   ├── launcher.py            # ★ OPS-1：版本校验、预绑定端口、live 浏览器门禁
+│   ├── health.py              # ★ OPS-1：data/runtime/Ollama/maintenance 就绪检查
+│   ├── logging_config.py      # ★ OPS-1：前台控制台 / hidden UTF-8 轮转日志
+│   ├── runtime_validation.py  # ★ OPS-2：Python 3.12 与 runtime lock 精确校验
 │   ├── character_loader.py    # 角色/世界书/用户档案加载（90 行）
 │   ├── session_manager.py     # 存档管理 + 多时间线（260+ 行）
 │   ├── prompt_assembler.py    # ★ PROMPT-1：来源单次注入、总预算、裁剪诊断
@@ -90,20 +96,11 @@ C:\local-tavern\
 │   ├── summary.md             # 短期记忆总结模板，可在线编辑
 │   └── .default/              # 默认备份；system/group_chat/summary 均有最新版本
 │
-├── data/
-│   ├── characters/            # 角色卡（YAML，用户填）
-│   │   ├── _template.yaml     # 字段模板（必读）
-│   │   └── *.yaml             # 用户创建的角色
-│   ├── worldbook/             # 世界书条目（YAML，可选）
-│   │   ├── _template.yaml
-│   │   └── *.yaml
-│   ├── user/                  # 用户档案（YAML）
-│   │   ├── _template.yaml
-│   │   └── *.yaml
-│   └── saves/                 # 存档（自动生成）
-│       ├── *.json             # 每个会话一个文件
-│       └── .history/          # 版本快照（重生成前自动）
-│           └── *.timestamp.json
+├── data/projects/<项目稳定ID>/
+│   ├── characters/            # 项目共享角色卡 YAML
+│   ├── worldbook/             # 项目共享世界书 YAML
+│   ├── user.yaml              # 项目共享用户档案
+│   └── saves/                 # 独立 Session JSON + .history/ 快照
 │
 └── web/                       # 前端
     ├── index.html             # 主页面 + Modal 容器
@@ -154,6 +151,8 @@ C:\local-tavern\
 | **运行 num_ctx 与预算上限同源** | `/api/chat.options.num_ctx` 使用本轮诊断中的 context_limit |
 | **thinking 模式默认开启** | 35B MoE 启用 thinking，质量更好 |
 | **前端无构建** | 避免 npm 依赖，用户双击 start.bat 就跑 |
+| **统一 launcher + 单 worker** | 启动前逐包校验 runtime lock、预绑定最终 socket；浏览器只认固定 live 标记，外部占用者不被结束 |
+| **hidden 轮转日志** | UTF-8 5 MiB × 5，关闭 access log，不记录聊天正文；配置导入失败也有两级文件兜底 |
 | **提示词模板 Markdown** | `PromptAssembler` 每轮重读；system 只放静态规则，group 中六类运行时数据槽各恰好一次 |
 | **.default/ 备份目录** | 用户改坏提示词能一键恢复 |
 | **摘要稳定 UUID + trim 双向绑定** | 编辑和重生成按 `summary_id` 精确定位；每段只读取自己的 `source_snapshot_id`，不回退最新快照 |
@@ -162,6 +161,8 @@ C:\local-tavern\
 | **角色发言快照** | turn 接受时冻结 `may_speak/chattiness/remaining_silent_turns`；Prompt 与解析写回使用同一份上下文 |
 | **完成回合计数** | 仅 completed 普通 chat 在唯一 Session 提交内扣减禁言；重生成、取消、失败和中断恢复均不扣减 |
 
+**OPS-1/OPS-2 运行边界（提交 `c16ddb4`）**：官方入口只调用项目 Python 3.12 `.venv` 和 `core.launcher serve --workers 1`；启动前逐包比对 22 包 runtime lock，路径/host/port/PID/log/Ollama 配置来自 `core.config`。launcher 预绑定最终 socket，foreign listener 不打开浏览器；hidden 使用轮转日志。lifespan 启动失败与外部取消仍完整清理 PID/任务/client。pytest 476/476、Node 60/60、17 个模块语法、隔离真实子进程 smoke 与独立 P0/P1 终审通过；真实 data 31 文件 / `F20D671B…A68EDF`、backups 97 文件 / `81F28F77…D2C888`、logs 0 文件 / `E3B0C442…B855` 均未变化，95 个历史 ZIP 未删除。coverage/Ruff/Playwright、hash lock 与全新环境安装验收尚未完成。
+
 ---
 
 ## 5. API 完整列表
@@ -169,6 +170,8 @@ C:\local-tavern\
 ### 模型与基础
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| GET | `/health/live` | 固定存活标记；200、no-store，不探测磁盘/Ollama |
+| GET | `/health/ready` | data/runtime/Ollama/maintenance；全部通过 200，否则 503 |
 | GET | `/api/models` | 列出 Ollama 可用模型 |
 | GET | `/api/characters` | 列出所有角色卡 |
 | GET | `/api/user` | 获取用户档案 |
@@ -224,7 +227,8 @@ C:\local-tavern\
 4. **`routes/chat.py`、`core/chat_turns.py` 与 `core/roleplay_policy.py`** —— 持久回合、角色发言快照、解析写回与终态计数
 5. **`core/summary_lifecycle.py` 与 `routes/messages.py`** —— 摘要严格校验、来源绑定、失败重试与并发收口
 6. **`web/app.mjs`、`web/summary-panel.mjs`、`web/roleplay.mjs` 与 `web/*.mjs`** —— 前端组合、摘要、角色节奏与持久 SSE 回合处理
-7. **`data/characters/_template.yaml`** —— 角色卡字段定义
+7. **`core/launcher.py`、`core/health.py`、`core/runtime_validation.py`** —— 安全启动、health 与精确依赖校验
+8. **`core/character_loader.py` 中的 `CHARACTER_SCHEMA` + 各项目受跟踪 `_template.yaml`** —— 角色卡字段定义
 
 ---
 
@@ -319,7 +323,7 @@ active: true              # 是否默认出场
 
 ## 10. 待办 / 未实现
 
-完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。当前依赖顺序为 `OPS-1 → OPS-2 → UX-1 → SEARCH-1 → REL-1`。
+完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。OPS-1 已完成；当前顺序为 `UX-1 → SEARCH-1 → REL-1`。OPS-2 的 coverage/Ruff/Playwright、hash lock 与全新环境安装在取得外部下载确认后收口。
 
 ---
 
@@ -328,9 +332,9 @@ active: true              # 是否默认出场
 用户的使用流程：
 
 1. **首次使用**：
-   - 在 `data/characters/` 创建角色卡（参考 `_template.yaml`）
-   - 在 `data/user/` 创建用户档案
-   - 双击 `start.bat` → 浏览器开 `http://localhost:8765`
+   - 双击 `setup.bat` 创建并校验 Python 3.12 项目 `.venv`
+   - 启动 Ollama，双击 `start.bat`；浏览器只在 `/health/live` 返回本项目标记后打开
+   - 在界面创建项目、角色、用户档案、世界书与存档
    - 点「重置」初始化场景
    - 在底部输入框打字开玩
 
@@ -357,32 +361,16 @@ active: true              # 是否默认出场
 
 ---
 
-## 13. 完整文件清单 + 行数
+## 13. 关键文件索引
 
-| 文件 | 行数 |
+| 范围 | 文件 |
 |------|------|
-| `server.py` | ~500 |
-| `core/ollama_client.py` | Ollama 流式、上下文发现与缓存 |
-| `core/character_loader.py` | 90 |
-| `core/session_manager.py` | ~260 |
-| `core/prompt_assembler.py` / `core/token_estimator.py` | Prompt 预算与估算 |
-| `core/summary_lifecycle.py` | 摘要验证、后台生成、失败重试与代际 CAS |
-| `core/prompt_builder.py` | 兼容入口 |
-| `core/response_parser.py` | 168 |
-| `core/prompt_editor.py` | 65 |
-| `prompts/system.md` | 69 |
-| `prompts/group_chat.md` | 47 |
-| `prompts/status_update.md` | 43 |
-| `data/characters/_template.yaml` | 52 |
-| `data/worldbook/_template.yaml` | 23 |
-| `data/user/_template.yaml` | 26 |
-| `web/index.html` | ~110 |
-| `web/style.css` | ~580 |
-| `web/app.mjs` + `web/*.mjs` | ~3200 |
-| `start.bat` | 46 |
-| `requirements.txt` | 5 |
-| `README.md` | 65 |
-| **合计** | **~3200 行** |
+| 启动/运行 | `core/launcher.py`、`core/runtime_validation.py`、`core/logging_config.py`、`core/health.py`、`core/process_guard.py` |
+| 数据事务 | `core/session_store.py`、`core/recovery_store.py`、`core/backup_store.py`、`core/library_lock.py` |
+| 聊天/Prompt | `core/chat_turns.py`、`core/prompt_assembler.py`、`core/token_estimator.py`、`core/ollama_client.py` |
+| 记忆/世界/角色 | `core/summary_lifecycle.py`、`core/worldbook_policy.py`、`core/roleplay_policy.py` |
+| 前端 | `web/app.mjs`、`web/api-client.js`、`web/session-ref.js`、`web/turn-client.js`、`web/*.mjs` |
+| 安装锁 | `.python-version`、`requirements.lock.txt`、`requirements-dev.lock.txt`、`setup.bat` |
 
 ---
 
@@ -390,13 +378,13 @@ active: true              # 是否默认出场
 
 1. **读 `prompts/system.md`** — 理解 AI 行为约束
 2. **读 `core/prompt_assembler.py` + `core/response_parser.py`** — 理解预算化 Prompt 与解析数据流
-3. **启动 server**（`cd C:\local-tavern && python -m uvicorn server:app --port 8765`），看 `http://localhost:8765`
+3. **检查启动链**：首次运行 `setup.bat`，随后使用 `start.bat` 或 `run_hidden.vbs`；不要绕过 launcher 直接调用 uvicorn
 4. **确认 Ollama 在跑**（`ollama ps`）
 5. **如果用户说"X 不工作"**，先 curl 测 API → 看 server 日志 → 看前端 console
 6. **如果用户要新功能**，按 CLAUDE.md 工作规则走（复述→方案→确认→执行）
 
 ---
 
-**最后更新**：2026-07-18  ROLE-1 确定性发言控制、禁言成功轮次与脱敏写回警告
+**最后更新**：2026-07-18  OPS-1 安全启动、health、轮转日志与 OPS-2 运行锁/配置基线
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目
