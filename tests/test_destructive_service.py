@@ -22,6 +22,8 @@ from tests.data_guard import file_manifest
 
 
 CHARACTER_ID = "service_character"
+KEEPER_CHARACTER_ID = "service_keeper"
+THIRD_CHARACTER_ID = "service_third"
 WORLD_ID = "service_world"
 SAVE_IDS = ("active", "side_a", "side_b")
 
@@ -70,6 +72,8 @@ async def _seed_service(
     service = DestructiveService(sessions)
     created: dict[str, dict] = {}
     for index, save_id in enumerate(SAVE_IDS):
+        incident_evidence = f"10000000-0000-4000-8000-{index + 1:012d}"
+        retained_evidence = f"20000000-0000-4000-8000-{index + 1:012d}"
         created[save_id] = await sessions.create(
             project,
             save_id,
@@ -77,6 +81,8 @@ async def _seed_service(
                 "name": save_id,
                 "characters_state": {
                     CHARACTER_ID: {"name": "故障注入角色", "affinity": index},
+                    KEEPER_CHARACTER_ID: {"name": "保留角色", "affinity": 50},
+                    THIRD_CHARACTER_ID: {"name": "第三角色", "affinity": 40},
                 },
                 "user_status": {
                     "name": "故障注入用户",
@@ -84,7 +90,40 @@ async def _seed_service(
                     "condition": "正常",
                     "abilities": ["测试"],
                 },
-                "message_history": [],
+                "message_history": [
+                    {
+                        "id": incident_evidence,
+                        "role": "user",
+                        "content": f"关联证据-{index}",
+                        "pinned": False,
+                        "in_prompt": True,
+                    },
+                    {
+                        "id": retained_evidence,
+                        "role": "assistant",
+                        "content": f"保留证据-{index}",
+                        "pinned": False,
+                        "in_prompt": True,
+                    },
+                ],
+                "relationship_edges": [
+                    {
+                        "source_character_id": CHARACTER_ID,
+                        "target_character_id": KEEPER_CHARACTER_ID,
+                        "relation_type": "关联边",
+                        "strength": 70,
+                        "evidence_message_ids": [incident_evidence],
+                        "updated_at": "2026-07-22T12:00:00+08:00",
+                    },
+                    {
+                        "source_character_id": KEEPER_CHARACTER_ID,
+                        "target_character_id": THIRD_CHARACTER_ID,
+                        "relation_type": "非关联边",
+                        "strength": 45,
+                        "evidence_message_ids": [retained_evidence],
+                        "updated_at": "2026-07-22T12:00:00+08:00",
+                    },
+                ],
             },
         )
     return {
@@ -211,7 +250,9 @@ async def test_trash_manifest_is_exact_and_each_entity_restores(
         assert file_manifest(seeded["project_dir"]) == project_before
     elif entity_type == "character":
         for save_id in SAVE_IDS:
-            assert CHARACTER_ID in (await sessions.read(project, save_id))["characters_state"]
+            restored_session = await sessions.read(project, save_id)
+            assert CHARACTER_ID in restored_session["characters_state"]
+            assert restored_session["relationship_edges"] == seeded["created"][save_id]["relationship_edges"]
     elif entity_type == "user":
         for save_id in SAVE_IDS:
             assert (await sessions.read(project, save_id))["user_status"]["name"] == "故障注入用户"
@@ -249,6 +290,9 @@ async def test_nth_session_write_failure_fully_compensates(tmp_path, monkeypatch
     assert raised.value.needs_recovery is False
     assert calls == 2
     assert file_manifest(seeded["project_dir"]) == project_before
+    for save_id in SAVE_IDS:
+        restored_session = await seeded["sessions"].read(seeded["project"], save_id)
+        assert restored_session["relationship_edges"] == seeded["created"][save_id]["relationship_edges"]
 
 
 @pytest.mark.asyncio

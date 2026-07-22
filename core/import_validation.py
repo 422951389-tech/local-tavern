@@ -23,6 +23,16 @@ from core.path_policy import (
     validate_file_id,
     validate_snapshot_filename,
 )
+from core.relationship_edges import (
+    MAX_DISTINCT_EVIDENCE_MESSAGES,
+    MAX_EVIDENCE_PER_EDGE,
+    MAX_RELATIONSHIP_EDGES,
+    MAX_RELATION_TYPE_LENGTH,
+    RelationshipEdgeError,
+    normalize_relation_type,
+    relationship_key,
+    validate_updated_at,
+)
 from core.worldbook_policy import MAX_MANUAL_WORLDBOOK_IDS
 
 
@@ -41,6 +51,11 @@ SummaryItem = Annotated[StrictStr, Field(min_length=1, max_length=200)]
 Affinity = Annotated[StrictInt | StrictFloat, Field(ge=0, le=100)]
 Revision = Annotated[StrictInt, Field(ge=0)]
 SilentTurns = Annotated[StrictInt, Field(ge=0, le=999)]
+RelationshipStrength = Annotated[StrictInt, Field(ge=0, le=100)]
+RelationshipType = Annotated[
+    StrictStr,
+    Field(min_length=1, max_length=MAX_RELATION_TYPE_LENGTH),
+]
 
 
 class ImportModel(BaseModel):
@@ -97,6 +112,60 @@ class ImportedRoleplayPolicy(ImportModel):
     strict_muted_writeback: StrictBool = False
 
 
+class ImportedRelationshipEdge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_character_id: StrictStr
+    target_character_id: StrictStr
+    relation_type: RelationshipType
+    strength: RelationshipStrength
+    evidence_message_ids: Annotated[
+        list[StrictStr],
+        Field(min_length=1, max_length=MAX_EVIDENCE_PER_EDGE),
+    ]
+    updated_at: StrictStr
+
+    @field_validator("source_character_id", "target_character_id")
+    @classmethod
+    def validate_character_id(cls, value: str) -> str:
+        try:
+            return validate_file_id(value, label="关系角色 ID")
+        except PathPolicyError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("relation_type", mode="before")
+    @classmethod
+    def validate_relation_type(cls, value: object) -> str:
+        try:
+            return normalize_relation_type(value)
+        except RelationshipEdgeError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("evidence_message_ids")
+    @classmethod
+    def validate_evidence_message_ids(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for message_id in value:
+            try:
+                canonical = str(UUID(message_id))
+            except ValueError as exc:
+                raise ValueError("证据消息 ID 必须是 UUID") from exc
+            if canonical in seen:
+                raise ValueError("同一关系边不能重复引用证据消息")
+            seen.add(canonical)
+            normalized.append(canonical)
+        return normalized
+
+    @field_validator("updated_at")
+    @classmethod
+    def validate_edge_updated_at(cls, value: str) -> str:
+        try:
+            return validate_updated_at(value)
+        except RelationshipEdgeError as exc:
+            raise ValueError(str(exc)) from exc
+
+
 class ImportedSummary(ImportModel):
     id: StrictStr = ""
     source_snapshot_id: StrictStr | None = None
@@ -138,6 +207,10 @@ class ImportedSession(ImportModel):
     )
     roleplay_policy: ImportedRoleplayPolicy = Field(
         default_factory=ImportedRoleplayPolicy,
+    )
+    relationship_edges: list[ImportedRelationshipEdge] = Field(
+        default_factory=list,
+        max_length=MAX_RELATIONSHIP_EDGES,
     )
     manual_worldbook_ids: list[StrictStr] = Field(
         default_factory=list,
@@ -214,6 +287,42 @@ class ImportedSession(ImportModel):
             if source in seen_sources:
                 raise ValueError("多个摘要不能绑定同一个 trim 快照")
             seen_sources.add(source)
+
+        if self.relationship_edges:
+            message_ids: set[str] = set()
+            for message in self.message_history:
+                if not message.id:
+                    raise ValueError("含关系边的存档要求每条消息都有 UUID")
+                if message.id in message_ids:
+                    raise ValueError("含关系边的存档禁止重复消息 UUID")
+                message_ids.add(message.id)
+
+            character_ids = set(self.characters_state)
+            seen_relationship_keys: set[tuple[str, str, str]] = set()
+            distinct_evidence: set[str] = set()
+            for edge in self.relationship_edges:
+                if edge.source_character_id == edge.target_character_id:
+                    raise ValueError("关系边禁止自环")
+                if edge.source_character_id not in character_ids:
+                    raise ValueError("关系边来源角色不属于当前存档")
+                if edge.target_character_id not in character_ids:
+                    raise ValueError("关系边目标角色不属于当前存档")
+                key = relationship_key(
+                    edge.source_character_id,
+                    edge.target_character_id,
+                    edge.relation_type,
+                )
+                if key in seen_relationship_keys:
+                    raise ValueError("关系边复合键不能重复")
+                seen_relationship_keys.add(key)
+                for message_id in edge.evidence_message_ids:
+                    if message_id not in message_ids:
+                        raise ValueError("关系边证据消息不属于当前存档")
+                    distinct_evidence.add(message_id)
+                    if len(distinct_evidence) > MAX_DISTINCT_EVIDENCE_MESSAGES:
+                        raise ValueError(
+                            f"每个存档最多引用 {MAX_DISTINCT_EVIDENCE_MESSAGES} 条不同证据消息"
+                        )
         return self
 
 

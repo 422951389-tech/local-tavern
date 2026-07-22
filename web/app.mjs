@@ -27,10 +27,16 @@ import {
     renderRoleplayWarnings,
 } from './roleplay.mjs';
 import {
+    coordinateRelationshipEvidenceLocation,
+    createRelationshipEditor,
+    createRelationshipService,
+} from './relationships.mjs';
+import {
     createLatestSearchController,
     createSearchService,
     createSingleFlightGate,
     ensureSummaryAnchor,
+    findMessageById,
     focusSearchTarget,
     navigateToSearchResult,
     renderSearchResults,
@@ -99,6 +105,7 @@ const API = {
     worldbookManual: '/api/session/worldbook/manual',
     roleplaySilence: (id) => `/api/session/characters/${encodeURIComponent(id)}/silence`,
     roleplayPolicy: '/api/session/roleplay-policy',
+    relationships: '/api/session/relationships',
     userSave: '/api/user',
     userDelete: '/api/user',
     settings: '/api/settings',
@@ -122,6 +129,7 @@ const state = {
     summaryPanelExpanded: false,
     lastWorldbookDiagnostics: null,
     roleplayPanel: null,
+    relationshipEditor: null,
     modelParams: {
         temperature: 0.8,
         top_p: 0.9,
@@ -137,6 +145,7 @@ const promptService = createPromptService(apiClient, API);
 const summaryService = createSummaryService(sessionWrite, API);
 const worldbookService = createWorldbookService(apiClient, sessionWrite, API);
 const roleplayService = createRoleplayService(sessionWrite, API);
+const relationshipService = createRelationshipService(sessionWrite, API);
 const searchService = createSearchService(apiClient, { endpoint: API.search });
 const turnPersistence = createTurnPersistence(sessionStorage);
 const modalController = createModalController(
@@ -157,6 +166,7 @@ const searchRequestController = createLatestSearchController({
 const searchNavigationGate = createSingleFlightGate();
 let activeController = null;   // 当前 turn SSE 的 AbortController；业务取消必须调用服务端 cancel API
 let searchModalSerial = 0;
+let relationshipModalSerial = 0;
 let activeFrameRenderer = null;
 let projectListboxController = null;
 let saveListboxController = null;
@@ -229,7 +239,7 @@ async function loadLatestWorldbookDiagnostics(ref) {
 function setNavigationUiState(active) {
     state.navigationBusy = active;
     const blocked = active || Boolean(state.activeTurn && !state.activeTurn.terminal);
-    for (const id of ['project-btn', 'tab-world', 'tab-saves', 'model-select', 'reset-btn', 'search-btn']) {
+    for (const id of ['project-btn', 'tab-world', 'tab-relations', 'tab-saves', 'model-select', 'reset-btn', 'search-btn']) {
         const element = document.getElementById(id);
         if (!element) continue;
         if ('disabled' in element) element.disabled = blocked;
@@ -237,6 +247,7 @@ function setNavigationUiState(active) {
         element.setAttribute('aria-busy', String(active));
     }
     if (state.roleplayPanel) state.roleplayPanel.setDisabled(blocked);
+    if (state.relationshipEditor) state.relationshipEditor.setDisabled(blocked);
 }
 
 function beginSessionTransition(project, save = null) {
@@ -1381,19 +1392,21 @@ function setTurnUiState(active, cancelling = false, syncPending = false) {
     }
 
     const selectors = [
-        '#project-btn', '#tab-world', '#tab-saves', '#model-select', '#reset-btn',
+        '#project-btn', '#tab-world', '#tab-relations', '#tab-saves', '#model-select', '#reset-btn',
         '#save-new-inline', '#save-rename-inline', '#save-delete-inline',
         '#save-import-inline', '#history-btn',
         '.msg-action-btn', '.msg-checkbox',
         '.history-restore', '.ce-save', '.ce-delete',
         '.worldbook-write-control',
         '.roleplay-write-control',
+        '.relationship-write-control',
     ];
     document.querySelectorAll(selectors.join(',')).forEach(element => {
         if ('disabled' in element) element.disabled = active;
         element.setAttribute('aria-disabled', String(active));
     });
     if (state.roleplayPanel) state.roleplayPanel.setDisabled(active || state.navigationBusy);
+    if (state.relationshipEditor) state.relationshipEditor.setDisabled(active || state.navigationBusy);
     const stream = document.getElementById('chat-stream');
     if (stream && state.session) renderSummaryPanel(ensureSummaryAnchor(document, stream), state.session);
 }
@@ -2743,6 +2756,91 @@ async function showPromptsEditor() {
 
 // ===== 事件绑定 =====
 
+async function locateRelationshipEvidence(messageId, editorRef, mount, modalToken) {
+    const assertCurrent = () => {
+        if (modalToken !== relationshipModalSerial || !mount || !mount.isConnected) {
+            throw new ApiError('关系编辑器已关闭', { code: 'relationship_editor_closed' });
+        }
+        if (!sameSessionRef(captureSessionRef(), editorRef)) {
+            throw new ApiError('当前项目或存档已变化', { code: 'stale_session_ref' });
+        }
+        if (state.navigationBusy) {
+            throw new ApiError('正在切换项目或存档，请稍候', { code: 'navigation_busy' });
+        }
+        if (isTurnActiveForRef(editorRef)) {
+            throw new ApiError('当前存档正在生成，请等待完成后再定位', { code: 'active_turn_client' });
+        }
+    };
+    assertCurrent();
+    const expectedRevision = currentRevision(editorRef);
+    return coordinateRelationshipEvidenceLocation({
+        messageId,
+        expectedRevision,
+        loadAuthoritativeSession: () => fetchSession(editorRef),
+        assertCurrent,
+        findMessage: findMessageById,
+        locateTarget: locateMessageForSearch,
+        releasePending: () => modalController.setPending(false),
+        hideModal: () => hideModal({ restoreFocus: false }),
+        focusTarget: focusSearchTarget,
+        makeError: (message, code) => new ApiError(message, { code }),
+    });
+}
+
+function showRelationshipsEditor() {
+    const editorRef = captureSessionRef();
+    if (state.navigationBusy) {
+        showToast('正在切换项目或存档，请稍候');
+        return;
+    }
+    if (!canPerformTurnAction('card_write', editorRef)) {
+        showToast('当前存档正在生成，请等待完成后再编辑关系');
+        return;
+    }
+    if (!sessionBelongsToRef(state.session, editorRef)) {
+        showToast('当前存档尚未加载完成');
+        return;
+    }
+    const modalToken = relationshipModalSerial + 1;
+    let editor = null;
+    editor = createRelationshipEditor({
+        documentRef: document,
+        session: state.session,
+        sessionRef: editorRef,
+        service: relationshipService,
+        isCurrent: () => Boolean(
+            editor
+            && editor.root.isConnected
+            && modalToken === relationshipModalSerial
+            && sameSessionRef(captureSessionRef(), editorRef)
+        ),
+        isBlocked: () => (
+            state.navigationBusy
+            || !canPerformTurnAction('card_write', editorRef)
+            || !sameSessionRef(captureSessionRef(), editorRef)
+        ),
+        onPendingChange: value => {
+            if (editor && editor.root.isConnected && modalToken === relationshipModalSerial) {
+                modalController.setPending(value);
+            }
+        },
+        onLocateEvidence: messageId => locateRelationshipEvidence(
+            messageId,
+            editorRef,
+            editor.root,
+            modalToken,
+        ),
+    });
+    if (!showModal({ title: '角色关系图谱', body: editor.root })) return;
+    relationshipModalSerial = modalToken;
+    state.relationshipEditor = editor;
+    editor.setDisabled(
+        state.navigationBusy
+        || !canPerformTurnAction('card_write', editorRef)
+        || !sameSessionRef(captureSessionRef(), editorRef),
+    );
+}
+
 function searchNavigationMessage(code) {
     const messages = {
         stale_origin: '当前存档已变化，请重新搜索',
@@ -3068,6 +3166,7 @@ function bindUI() {
     document.getElementById('model-params-btn').addEventListener('click', showModelParamsEditor);
     document.getElementById('history-btn').addEventListener('click', showHistoryEditor);
     document.getElementById('search-btn').addEventListener('click', showGlobalSearch);
+    document.getElementById('tab-relations').addEventListener('click', showRelationshipsEditor);
 
     // 发送
     document.getElementById('send-btn').addEventListener('click', () => sendMessage());

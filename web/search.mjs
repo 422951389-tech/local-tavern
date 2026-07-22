@@ -446,7 +446,15 @@ export function focusSearchTarget(target) {
         && !target.hasAttribute('tabindex')) {
         target.setAttribute('tabindex', '-1');
     }
-    if (typeof target.scrollIntoView === 'function') target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    const view = target.ownerDocument && target.ownerDocument.defaultView;
+    const reduceMotion = Boolean(
+        view
+        && typeof view.matchMedia === 'function'
+        && view.matchMedia('(prefers-reduced-motion: reduce)').matches
+    );
+    if (typeof target.scrollIntoView === 'function') {
+        target.scrollIntoView({ block: 'center', behavior: reduceMotion ? 'auto' : 'smooth' });
+    }
     if (typeof target.focus === 'function') {
         try { target.focus({ preventScroll: true }); }
         catch (_error) { target.focus(); }

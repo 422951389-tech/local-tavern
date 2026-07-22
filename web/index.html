@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>本地酒馆</title>
-    <link rel="stylesheet" href="/static/style.css?v=search1-20260722">
+    <link rel="stylesheet" href="/static/style.css?v=rel1-20260722">
 </head>
 <body>
     <!-- 顶栏 v3：世界观做主标题，下属 4 tab -->
@@ -21,12 +21,22 @@
             <span id="project-stats" class="project-stats"></span>
         </div>
 
-        <!-- 中：4 个 tab（角色 / 世界书 / 用户 / 存档） -->
+        <!-- 中：5 个 tab（角色 / 关系 / 世界书 / 用户 / 存档） -->
         <div class="topbar-group tabs-group" role="toolbar" aria-label="世界观编辑工具">
             <button class="tab-btn" data-tab="chars" id="tab-chars" type="button"
                 title="角色卡（当前世界观的演员）" aria-label="编辑角色卡"
                 aria-haspopup="dialog" aria-controls="modal">
                 <span class="ico" aria-hidden="true">👥</span><span class="lbl">角色</span>
+            </button>
+            <button class="tab-btn" data-tab="relations" id="tab-relations" type="button"
+                title="角色关系（当前存档的人工关系记录）" aria-label="编辑角色关系"
+                aria-haspopup="dialog" aria-controls="modal">
+                <svg class="ico relation-tab-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <circle cx="6" cy="7" r="2.5"></circle>
+                    <circle cx="18" cy="7" r="2.5"></circle>
+                    <circle cx="12" cy="18" r="2.5"></circle>
+                    <path d="M8.4 7h6.2M7.5 9.2l3.2 6.2M16.5 9.2l-3.2 6.2"></path>
+                </svg><span class="lbl">关系</span>
             </button>
             <button class="tab-btn" data-tab="world" id="tab-world" type="button"
                 title="世界书（当前世界观的设定）" aria-label="编辑世界书"
@@ -150,7 +160,7 @@
     <script src="/static/api-client.js?v=fe1-20260715"></script>
     <script src="/static/session-ref.js?v=fe1-20260715"></script>
     <script src="/static/turn-client.js?v=fe1-20260715"></script>
-    <script type="module" src="/static/app.mjs?v=search1-20260722"></script>
+    <script type="module" src="/static/app.mjs?v=rel1-20260722"></script>
 
     <!-- 通用 Modal 容器 -->
     <div id="modal-backdrop" class="modal-backdrop hidden" aria-hidden="true">

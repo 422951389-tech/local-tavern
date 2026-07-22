@@ -20,6 +20,11 @@ from core.session_manager import (
     snapshot_session,
     toggle_pinned,
 )
+from core.relationship_edges import (
+    RelationshipEdgeError,
+    reconcile_relationship_evidence,
+    validate_relationship_edges,
+)
 from core.summary_lifecycle import (
     SummaryValidationError,
     annotate_summary_task_state,
@@ -128,6 +133,10 @@ async def api_get_session(
     project = _norm_project(project)
     save = _norm_save(save)
     session = await aload_session(project, save)
+    try:
+        session["relationship_edges"] = validate_relationship_edges(session)
+    except RelationshipEdgeError as exc:
+        raise HTTPException(422, detail=exc.as_detail()) from exc
     return annotate_summary_task_state(session, project, save)
 
 
@@ -189,6 +198,7 @@ async def api_patch_session(
         if req.action == "delete":
             context.snapshot("snapshot", session)
             history.pop(position)
+            reconcile_relationship_evidence(session)
         elif req.action == "edit":
             if req.content is None:
                 raise HTTPException(400, "缺少 content")
@@ -207,6 +217,7 @@ async def api_patch_session(
                     if item.get("pinned")
                 ),
             ]
+            reconcile_relationship_evidence(session)
         elif req.action == "toggle_pinned":
             toggle_pinned(
                 session,

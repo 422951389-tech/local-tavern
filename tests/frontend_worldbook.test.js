@@ -304,7 +304,7 @@ test('worldbook integration clears stale diagnostics, locks writes, and keeps ac
     assert.match(appSource, /worldbookSchema:\s*'\/api\/schema\/worldbook'/);
     assert.match(appSource, /worldbookManual:\s*'\/api\/session\/worldbook\/manual'/);
     assert.match(appSource, /state\.lastWorldbookDiagnostics = null;/);
-    assert.match(appSource, /'#project-btn', '#tab-world', '#tab-saves'/);
+    assert.match(appSource, /'#project-btn', '#tab-world', '#tab-relations', '#tab-saves'/);
     assert.match(appSource, /if \(!canPerformTurnAction\('card_write', editorRef\)\) \{/);
     assert.match(appSource, /加载世界书期间已开始生成，请等待完成后重试/);
     assert.match(appSource, /'\.worldbook-write-control'/);

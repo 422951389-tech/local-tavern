@@ -19,6 +19,7 @@ from core.config import (
     TRASH_RETENTION_DAYS,
 )
 from core.import_validation import validate_import_json
+from core.relationship_edges import relationship_evidence_ids
 from core.path_policy import (
     display_name_to_id,
     resolve_snapshot_path as _resolve_snapshot_path,
@@ -111,6 +112,7 @@ def _empty_session(save_id: str = DEFAULT_SAVE, project: str = "默认项目") -
         },
         "characters_state": {},
         "roleplay_policy": {"strict_muted_writeback": False},
+        "relationship_edges": [],
         "manual_worldbook_ids": [],
         "message_history": [],
         "summaries": [],
@@ -212,16 +214,25 @@ def trim_history(
     del project  # 兼容旧调用签名；读取/纯函数路径不再写盘。
     max_messages = HARD_LIMIT if len(session.get("message_history", [])) > HARD_LIMIT else max_messages
     history = session.get("message_history", [])
-    non_pinned = [message for message in history if not message.get("pinned")]
-    if len(non_pinned) <= max_messages:
+    evidence_ids = relationship_evidence_ids(session)
+    ordinary = [
+        message
+        for message in history
+        if not message.get("pinned") and message.get("id") not in evidence_ids
+    ]
+    if len(ordinary) <= max_messages:
         return []
-    keep_non = non_pinned[-max_messages:]
-    dropped = non_pinned[:-max_messages]
-    keep_ids = {message.get("id") for message in keep_non}
+    keep_ordinary = ordinary[-max_messages:]
+    dropped = ordinary[:-max_messages]
+    keep_ids = {message.get("id") for message in keep_ordinary}
     session["message_history"] = [
         message
         for message in history
-        if message.get("pinned") or message.get("id") in keep_ids
+        if (
+            message.get("pinned")
+            or message.get("id") in evidence_ids
+            or message.get("id") in keep_ids
+        )
     ]
     return dropped
 

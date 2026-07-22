@@ -14,6 +14,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from core.active_turns import ActiveTurnConflict, TurnMaintenanceConflict
@@ -36,6 +37,7 @@ from routes import (
     user,
     worldbook,
     roleplay,
+    relationships,
     settings,
     sessions,
     search,
@@ -157,6 +159,38 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Local Tavern", lifespan=lifespan)
 
 
+def _utf8_safe_validation_value(value):
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(value, list):
+        return [_utf8_safe_validation_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_utf8_safe_validation_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _utf8_safe_validation_value(key): _utf8_safe_validation_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation(_request: Request, exc: RequestValidationError):
+    """422 只返回定位与原因，不回显原始输入或异常上下文。"""
+    errors = [
+        {
+            key: error[key]
+            for key in ("type", "loc", "msg")
+            if key in error
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _utf8_safe_validation_value(errors)},
+    )
+
+
 @app.exception_handler(ActiveTurnConflict)
 async def handle_active_turn_conflict(_request: Request, exc: ActiveTurnConflict):
     return JSONResponse(status_code=409, content={"error": exc.as_detail()})
@@ -275,6 +309,7 @@ app.include_router(characters.router)
 app.include_router(user.router)
 app.include_router(worldbook.router)
 app.include_router(roleplay.router)
+app.include_router(relationships.router)
 app.include_router(settings.router)
 app.include_router(sessions.router)
 app.include_router(search.router)

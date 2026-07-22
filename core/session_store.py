@@ -33,6 +33,7 @@ from core.recovery_store import (
     sha256_file,
 )
 from core.roleplay_policy import normalize_silent_turns
+from core.relationship_edges import reconcile_relationship_evidence
 from core.worldbook_policy import MAX_MANUAL_WORLDBOOK_IDS
 
 
@@ -188,6 +189,8 @@ def normalize_session(session: dict, project: str, save_id: str) -> dict:
         roleplay_policy.get("strict_muted_writeback") is True
     )
     session["roleplay_policy"] = roleplay_policy
+    if "relationship_edges" not in session:
+        session["relationship_edges"] = []
     raw_character_states = session.get("characters_state")
     if not isinstance(raw_character_states, dict):
         raw_character_states = {}
@@ -707,6 +710,7 @@ class SessionStore:
                         turn_id=turn_id,
                         created_at=created_at,
                     )
+                    reconcile_relationship_evidence(working)
                     working = normalize_session(working, project, save_id)
                     working["revision"] = current["revision"] + 1
                     working["updated_at"] = datetime.now().isoformat()

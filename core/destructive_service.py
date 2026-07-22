@@ -19,6 +19,7 @@ from core.recovery_store import (
     VerifiedRecovery,
     sha256_file,
 )
+from core.relationship_edges import remove_incident_relationship_edges
 from core.session_store import (
     RevisionConflict,
     SessionStore,
@@ -450,9 +451,10 @@ class DestructiveService:
             ):
                 assert_project_write_allowed(project)
                 def remove_character(session: dict) -> bool:
+                    changed = remove_incident_relationship_edges(session, char_id)
                     states = session.get("characters_state")
                     if not isinstance(states, dict) or char_id not in states:
-                        return False
+                        return changed
                     del states[char_id]
                     return True
 

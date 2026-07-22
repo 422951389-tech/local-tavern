@@ -2009,6 +2009,272 @@ body {
         width: 100%;
     }
 }
+
+/* REL-1：人工可追溯的角色—角色关系图谱。 */
+.relation-tab-icon {
+    width: 18px;
+    height: 18px;
+    fill: var(--bg-elevated);
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.relationship-editor {
+    width: min(900px, 100%);
+    min-width: 0;
+    display: grid;
+    gap: 18px;
+}
+
+.relationship-scope-note {
+    padding: 10px 12px;
+    color: #d8c5ae;
+    background: rgba(212, 165, 116, 0.08);
+    border: 1px solid var(--accent-dim);
+    border-radius: 8px;
+    line-height: 1.55;
+}
+
+.relationship-section-title {
+    margin-bottom: 10px;
+    color: var(--accent);
+    font-size: 16px;
+}
+
+.relationship-empty {
+    padding: 18px;
+    color: var(--text-dim);
+    text-align: center;
+    background: var(--bg-input);
+    border: 1px dashed #555;
+    border-radius: 8px;
+}
+
+.relationship-graph {
+    display: block;
+    width: 100%;
+    min-height: 260px;
+    max-height: 420px;
+    color: var(--accent);
+    background: radial-gradient(circle at center, #2c2823 0, var(--bg-input) 68%);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+
+.relationship-edge-line {
+    stroke: #c79a68;
+    opacity: 0.88;
+}
+
+#relationship-arrow path { fill: #c79a68; }
+
+.relationship-edge-label {
+    fill: #f0d6b5;
+    paint-order: stroke;
+    stroke: var(--bg-input);
+    stroke-width: 5px;
+    stroke-linejoin: round;
+    font-size: 12px;
+}
+
+.relationship-node circle {
+    fill: #332c25;
+    stroke: var(--accent);
+    stroke-width: 2px;
+}
+
+.relationship-node text {
+    fill: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.relationship-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    list-style: none;
+}
+
+.relationship-card {
+    min-width: 0;
+    padding: 14px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent-dim);
+    border-radius: 8px;
+}
+
+.relationship-card-title {
+    margin-bottom: 10px;
+    color: #f3ddc4;
+    overflow-wrap: anywhere;
+}
+
+.relationship-details {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 5px 10px;
+    font-size: 13px;
+}
+
+.relationship-details dt { color: var(--text-dim); }
+.relationship-details dd { min-width: 0; overflow-wrap: anywhere; }
+
+.relationship-evidence-links,
+.relationship-card-actions,
+.relationship-form-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.relationship-evidence-label { color: var(--text-dim); font-size: 13px; }
+
+.relationship-evidence-button,
+.relationship-edit-button,
+.relationship-delete-button,
+.relationship-save-button,
+.relationship-cancel-edit-button {
+    min-height: 44px;
+    padding: 8px 12px;
+    color: var(--text);
+    background: #34302b;
+    border: 1px solid #5b4b3c;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.relationship-evidence-button:hover:not(:disabled),
+.relationship-edit-button:hover:not(:disabled),
+.relationship-cancel-edit-button:hover:not(:disabled) {
+    color: #fff;
+    border-color: var(--accent);
+    background: #4b3b2e;
+}
+
+.relationship-save-button {
+    color: #17120d;
+    background: var(--accent);
+    border-color: var(--accent);
+    font-weight: 700;
+}
+
+.relationship-delete-button {
+    color: #ffd0c9;
+    border-color: #8d5149;
+    background: #422b28;
+}
+
+.relationship-form-section {
+    padding-top: 4px;
+    border-top: 1px solid var(--border);
+}
+
+.relationship-form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.relationship-field {
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+}
+
+.relationship-field label,
+.relationship-evidence-filter-label,
+.relationship-evidence-fieldset legend {
+    color: #d8c5ae;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.relationship-select,
+.relationship-type-input,
+.relationship-strength-input,
+.relationship-evidence-filter {
+    width: 100%;
+    min-height: 44px;
+    min-width: 0;
+    padding: 9px 10px;
+    color: var(--text);
+    background: var(--bg-input);
+    border: 1px solid #555;
+    border-radius: 6px;
+    font: inherit;
+}
+
+.relationship-evidence-fieldset {
+    grid-column: 1 / -1;
+    min-width: 0;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.relationship-evidence-filter-label {
+    display: block;
+    margin: 8px 0 6px;
+}
+
+.relationship-evidence-options {
+    display: grid;
+    gap: 6px;
+    max-height: min(38dvh, 320px);
+    margin-top: 10px;
+    overflow: auto;
+    overscroll-behavior: contain;
+}
+
+.relationship-evidence-option {
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr);
+    align-items: start;
+    gap: 9px;
+    min-width: 0;
+    min-height: 44px;
+    padding: 9px;
+    color: var(--text);
+    background: #252525;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.relationship-evidence-option:hover,
+.relationship-evidence-option:focus-within { border-color: var(--accent-dim); }
+.relationship-evidence-option span { overflow-wrap: anywhere; line-height: 1.45; }
+.relationship-evidence-checkbox { width: 20px; height: 20px; accent-color: var(--accent); }
+
+.relationship-form-actions { grid-column: 1 / -1; }
+.relationship-status { min-height: 24px; color: #f0d6b5; }
+.relationship-write-control:disabled { cursor: not-allowed; opacity: 0.55; }
+.relationship-editor [aria-invalid="true"] { border-color: #e48778; }
+
+@media (max-width: 720px) {
+    .relationship-list,
+    .relationship-form { grid-template-columns: 1fr; }
+    .relationship-evidence-fieldset,
+    .relationship-form-actions { grid-column: 1; }
+    .relationship-graph { min-height: 220px; }
+}
+
+@media (max-width: 375px) {
+    .relationship-editor { gap: 14px; }
+    .relationship-card,
+    .relationship-evidence-fieldset { padding: 10px; }
+    .relationship-card-actions,
+    .relationship-form-actions { align-items: stretch; flex-direction: column; }
+    .relationship-card-actions button,
+    .relationship-form-actions button { width: 100%; }
+    .relationship-graph { min-height: 190px; }
+}
 /* 仅供读屏器读取的实时状态，不参与视觉布局。 */
 .sr-only {
     position: absolute;
