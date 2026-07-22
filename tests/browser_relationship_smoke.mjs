@@ -7,7 +7,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const python = path.join(projectRoot, '.venv', 'Scripts', 'python.exe');
+const python = process.env.TAVERN_TEST_PYTHON
+    ? path.resolve(process.env.TAVERN_TEST_PYTHON)
+    : path.join(projectRoot, '.venv', 'Scripts', 'python.exe');
 const edgeCandidates = [
     path.join(process.env['ProgramFiles(x86)'] || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     path.join(process.env.ProgramFiles || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),

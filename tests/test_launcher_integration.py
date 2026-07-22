@@ -12,7 +12,7 @@ import httpx
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PYTHON = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+PYTHON = Path(sys.executable).resolve()
 
 
 def _free_loopback_port() -> int:
