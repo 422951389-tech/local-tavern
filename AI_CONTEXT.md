@@ -2,8 +2,8 @@
 
 > **目的**：让下一个 AI 协作者在不询问用户的情况下，能完整理解这个项目并继续工作。
 > **创建日期**：2026-06-27
-> **最后更新**：2026-07-22（SEARCH-1）
-> **当前状态**：阶段 A、B、C、D completed；OPS-1、UX-1、SEARCH-1 completed，OPS-2 开发锁验收仍 in_progress；当前实施 REL-1
+> **最后更新**：2026-07-22（REL-1）
+> **当前状态**：阶段 A、B、C、D completed；OPS-1、UX-1、SEARCH-1、REL-1 completed；当前仅 OPS-2 开发锁与全新环境验收 in_progress
 > **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
 
 ---
@@ -84,6 +84,7 @@ C:\local-tavern\
 │   ├── worldbook_policy.py    # ★ WORLD-1：三态触发、稳定排序与脱敏诊断
 │   ├── roleplay_policy.py     # ★ ROLE-1：发言上下文、身份解析、禁言倒计时
 │   ├── search_service.py      # ★ SEARCH-1：当前权威 Session 有界搜索、脱敏与稳定快照
+│   ├── relationship_edges.py  # ★ REL-1：结构化关系边、严格校验与证据生命周期
 │   ├── token_estimator.py     # ★ PROMPT-1：可替换的保守 token 估算协议
 │   ├── summary_lifecycle.py   # ★ MEMORY-1：稳定 ID、严格校验、异步生成与代际收口
 │   ├── session_store.py       # revision/CAS、旧摘要稳定迁移、来源状态派生
@@ -107,7 +108,7 @@ C:\local-tavern\
     ├── index.html             # 主页面 + Modal 容器
     ├── style.css              # 样式（深色 + 古风暖金强调色）
     ├── app.mjs                # 前端组合入口（原生 ES module）
-    └── *.mjs                  # 项目/存档/聊天/摘要/世界书/角色节奏/搜索/卡片/Prompt/渲染/listbox/帧合并等职责模块
+    └── *.mjs                  # 项目/存档/聊天/摘要/世界书/角色节奏/搜索/关系图/卡片/Prompt/渲染/listbox/帧合并等职责模块
 ```
 
 ---
@@ -161,12 +162,15 @@ C:\local-tavern\
 | **生成代际令牌** | 后台结果只写回相同 `generation_id` 的 pending 段，人工编辑、新重试和乱序任务不会被旧结果覆盖 |
 | **角色发言快照** | turn 接受时冻结 `may_speak/chattiness/remaining_silent_turns`；Prompt 与解析写回使用同一份上下文 |
 | **完成回合计数** | 仅 completed 普通 chat 在唯一 Session 提交内扣减禁言；重生成、取消、失败和中断恢复均不扣减 |
+| **结构化关系事实源** | 只展示人工维护的 `relationship_edges`；不从 affinity、mood、摘要或模型输出推断角色—角色关系 |
 
 **OPS-1/OPS-2 运行边界（提交 `c16ddb4`）**：官方入口只调用项目 Python 3.12 `.venv` 和 `core.launcher serve --workers 1`；启动前逐包比对 22 包 runtime lock，路径/host/port/PID/log/Ollama 配置来自 `core.config`。launcher 预绑定最终 socket，foreign listener 不打开浏览器；hidden 使用轮转日志。lifespan 启动失败与外部取消仍完整清理 PID/任务/client。pytest 476/476、Node 60/60、17 个模块语法、隔离真实子进程 smoke 与独立 P0/P1 终审通过；真实 data 31 文件 / `F20D671B…A68EDF`、backups 97 文件 / `81F28F77…D2C888`、logs 0 文件 / `E3B0C442…B855` 均未变化，95 个历史 ZIP 未删除。coverage/Ruff/Playwright、hash lock 与全新环境安装验收尚未完成。
 
 **UX-1 边界（提交 `f0dcd87`）**：项目统计使用一次聚合 API；现代 parsed 事件只携带 revision 与场景/角色/策略/模型四字段 delta，旧日志缺 warnings 时仍可重放。旧 Session 的 scene_meta 缺失/null/字符串只在内存补六字段。流式文本按动画帧合并，历史消息单 Fragment 挂载；终态权威 reload 前保持写锁。Modal、listbox、角色卡和消息操作具备键盘、焦点恢复与 44px 触控路径。375/600/768px Edge 隔离验收无横向滚动，下拉保留 16px 边界；pytest 487/487、Node 72/72、19 个模块语法和独立 P0/P1 终审通过。axe/Playwright 未运行，仍属于 OPS-2 外部开发依赖门。
 
 **SEARCH-1 边界（提交 `0865f69`）**：`GET /api/search` 只扫描项目当前 `saves/*.json` 的消息正文和总结结构字段，不扫描 `.history`、不建索引、不迁移数据。同一普通文件句柄执行有界稳定快照，固定 500 存档/50,000 来源/64 MiB；坏 JSON、Unicode surrogate、非普通文件和非 JavaScript 安全整数 revision 安全跳过。匹配前完成凭据脱敏，Unicode casefold 字面搜索不构造正则。前端严格白名单、纯 DOM 高亮、Abort latest request、Modal token、single-flight 和权威 Session 重读；消息/总结仅按 UUID 精确定位。pytest 499/499、Node 82/82、20 个模块语法与两轮独立 P0/P1 终审通过。真实守卫当前为 data 31 / `F20D671B…A68EDF`、backups 98 / `E09A261B…91ED7`、logs 1 / `AB0A840B…D46A`；既有备份和日志未触碰。Playwright/axe 与应用内浏览器插件未执行。
+
+**REL-1 边界（提交 `4ed1025`）**：Session 新增纯人工维护的 `relationship_edges`；有向复合键执行 NFKC/casefold 唯一性，禁止自环，strength 为 0–100 严格整数，每边 1–20 条当前消息证据，整档最多 200 边/50 个不同证据。旧档缺字段纯读为空，坏旧边稳定 422 且不回写。自动 trim 保护证据，消息删除/truncate/regenerate 收敛证据，角色删除跨存档清边并受补偿/恢复保护；关系不进入 Prompt、parsed delta 或模型写回。前端 SVG 图与语义列表共享结构化模型，人工编辑和证据定位受 active-turn、single-flight、SessionRef、revision、UUID 与 DOM 目标门禁。pytest 521/521、Node 94/94、21 个 Web 模块语法通过；375×812 Edge 交互最小控件 44px、横向溢出 0、最终 revision 5，测试残留 0。
 
 ---
 
@@ -204,6 +208,7 @@ C:\local-tavern\
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/session?project=...&save=...` | 读会话（含摘要来源与进程内生成状态） |
+| GET/PUT/DELETE | `/api/session/relationships` | 读取或按 revision CAS 人工维护结构化角色关系边；服务端生成更新时间 |
 | POST | `/api/session/reset` | 重置当前会话（清空历史、保留会话） |
 | PATCH | `/api/session?project=...&save=...` | 按稳定 `message_id` 执行消息编辑、删除、钉选与 Prompt 开关 |
 | GET | `/api/session/history?project=...&save=...` | 列出历史快照 |
@@ -330,7 +335,7 @@ active: true              # 是否默认出场
 
 ## 10. 待办 / 未实现
 
-完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。OPS-1、UX-1、SEARCH-1 已完成；当前实施 REL-1。OPS-2 的 coverage/Ruff/Playwright、hash lock 与全新环境安装在取得外部下载确认后收口。
+完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。OPS-1、UX-1、SEARCH-1、REL-1 已完成；当前只剩 OPS-2。coverage/Ruff/Playwright、hash lock 与全新环境安装在取得外部下载确认后收口。
 
 ---
 
@@ -348,6 +353,7 @@ active: true              # 是否默认出场
 2. **日常使用**：
    - 顶部下拉切换会话（多时间线）
    - 顶部搜索按钮可按消息/总结/钉选范围搜索当前项目全部权威存档，并精确跳转到消息或总结段
+   - 顶部关系页可人工新增/编辑/删除当前存档角色—角色关系，并从证据标签精确跳回原消息
    - 消息 hover 可删/编辑/重生成
    - 顶部 ⚙ 提示词可编辑 system/group_chat/summary；摘要面板可按段查看原文、编辑、重生成或重试
    - 世界书页可编辑项目共享条目，并为当前存档单独选择 manual 条目；命中诊断不显示正文
@@ -376,7 +382,7 @@ active: true              # 是否默认出场
 | 启动/运行 | `core/launcher.py`、`core/runtime_validation.py`、`core/logging_config.py`、`core/health.py`、`core/process_guard.py` |
 | 数据事务 | `core/session_store.py`、`core/recovery_store.py`、`core/backup_store.py`、`core/library_lock.py` |
 | 聊天/Prompt | `core/chat_turns.py`、`core/prompt_assembler.py`、`core/token_estimator.py`、`core/ollama_client.py` |
-| 记忆/世界/角色/搜索 | `core/summary_lifecycle.py`、`core/worldbook_policy.py`、`core/roleplay_policy.py`、`core/search_service.py`、`routes/search.py` |
+| 记忆/世界/角色/搜索/关系 | `core/summary_lifecycle.py`、`core/worldbook_policy.py`、`core/roleplay_policy.py`、`core/search_service.py`、`core/relationship_edges.py`、`routes/search.py`、`routes/relationships.py` |
 | 前端 | `web/app.mjs`、`web/api-client.js`、`web/session-ref.js`、`web/turn-client.js`、`web/*.mjs` |
 | 安装锁 | `.python-version`、`requirements.lock.txt`、`requirements-dev.lock.txt`、`setup.bat` |
 
@@ -384,15 +390,15 @@ active: true              # 是否默认出场
 
 ## 14. 下次接手时建议先做的事
 
-1. **先读桌面优化规划的 REL-1 段** — 当前任务是结构化关系边、证据生命周期与可访问图谱
-2. **读 `core/session_store.py`、`core/session_manager.py`、`routes/messages.py`、`core/destructive_service.py`** — 关系边需接入 trim/delete/truncate/regenerate/角色删除事务
-3. **读 `web/search.mjs` 与 `web/app.mjs`** — 证据选择和定位复用 SEARCH-1 的安全组件
+1. **先读桌面优化规划的 OPS-2 段** — 当前唯一任务是开发工具精确锁、hash lock 与全新环境验收
+2. **先核对 `requirements*.txt`、`core/runtime_validation.py` 与 `setup.bat`** — 保持 runtime/dev 分层和官方 Python 3.12 `.venv` 入口
+3. **外部下载前取得明确确认** — coverage、Ruff、Playwright 包和浏览器二进制均不得在未确认时联网安装
 4. **检查启动链**：首次运行 `setup.bat`，随后使用 `start.bat` 或 `run_hidden.vbs`；不要绕过 launcher 直接调用 uvicorn
 5. **确认 Ollama 在跑**（`ollama ps`）
 6. **如果用户说"X 不工作"**，先 curl 测 API → 看 server 日志 → 看前端 console
 
 ---
 
-**最后更新**：2026-07-18  UX-1 响应式、可访问性、前端性能与轻量 parsed 事件
+**最后更新**：2026-07-22  REL-1 可追溯角色关系图、证据生命周期与人工编辑
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目
