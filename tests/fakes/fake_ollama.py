@@ -28,6 +28,8 @@ NORMAL_REPLY = """📍 隔离测试酒馆 | ⏱️ 午后 / 晴
 - 继续验证
 """
 
+SUMMARY_REPLY = "前情提要: fake Ollama 测试总结"
+
 
 class FakeOllamaClient:
     """提供可脚本化事件的内存客户端，并记录全部调用。"""
@@ -148,7 +150,7 @@ class FakeOllamaClient:
             "num_predict": num_predict,
             "temperature": temperature,
         })
-        return "前情提要: fake Ollama 测试总结"
+        return SUMMARY_REPLY
 
     async def close(self) -> None:
         self.closed = True
