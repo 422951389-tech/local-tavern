@@ -2,8 +2,8 @@
 
 > **目的**：让下一个 AI 协作者在不询问用户的情况下，能完整理解这个项目并继续工作。
 > **创建日期**：2026-06-27
-> **最后更新**：2026-07-22（OPS-2 离线质量门与浏览器 E2E 预检）
-> **当前状态**：阶段 A、B、C、D completed；OPS-1、UX-1、SEARCH-1、REL-1 completed；OPS-2 的离线锁校验/E2E/质量门已落地，精确开发锁与全新环境发布验收 in_progress
+> **最后更新**：2026-07-22（OPS-2 浏览器门工具链精确清单）
+> **当前状态**：阶段 A、B、C、D completed；OPS-1、UX-1、SEARCH-1、REL-1 completed；OPS-2 的离线锁/E2E/质量门及 Node 精确开发清单已落地，制品 hash/integrity 与全新环境发布验收 in_progress
 > **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
 
 ---
@@ -46,7 +46,7 @@
 | Web 框架 | **FastAPI 0.115.0** | uvicorn 0.32.0，lifespan 启动 |
 | LLM 通信 | **httpx 0.27.0** 异步流式 | 直接调 Ollama `/api/chat`，不用 OpenAI SDK |
 | LLM 后端 | **Ollama 0.30.7** | 监听 11434 |
-| 前端 | **原生 HTML/CSS/JS** | 无构建工具，无 npm，零前端依赖 |
+| 前端 | **原生 HTML/CSS/JS** | 生产无构建工具、零 npm 依赖；Playwright/axe 仅在私有 dev manifest |
 | 数据存储 | **本地 JSON 文件** | 无数据库 |
 | 角色卡/世界书格式 | **YAML** | PyYAML 6.0.1 |
 | 数据校验 | **Pydantic 2.9.0** | |
@@ -68,10 +68,11 @@ C:\local-tavern\
 ├── setup.bat                  # Python 3.12 .venv + 精确 runtime lock 安装/校验
 ├── start.bat / run_hidden.vbs / stop_tavern.bat  # 统一安全 launcher 与精确停止
 ├── requirements.txt / requirements.lock.txt       # 直接 runtime 依赖 / 22 包闭包
-├── requirements-dev.txt / requirements-dev.lock.txt # pytest 工具链；coverage/Ruff/浏览器工具精确锁待生成
+├── requirements-dev.txt / requirements-dev.lock.txt # pytest 工具链；coverage/Ruff hash lock 待生成
+├── .node-version / package.json # Node/npm/Playwright/axe 精确 dev 清单；package-lock 待生成
 ├── README.md                  # 用户文档（启动说明）
 ├── AI_CONTEXT.md              # ← 本文档（AI 协作者交接）
-├── tools/dependency_locks.py / quality_gate.py # OPS-2 锁校验与 preflight/release 质量门
+├── tools/dependency_locks.py / node_dependency_lock.py / quality_gate.py # OPS-2 锁校验与双模式质量门
 │
 ├── core/                      # Python 核心模块
 │   ├── ollama_client.py       # Ollama 流式客户端 + /api/show 上下文缓存
@@ -174,7 +175,7 @@ C:\local-tavern\
 
 **REL-1 边界（提交 `4ed1025`）**：Session 新增纯人工维护的 `relationship_edges`；有向复合键执行 NFKC/casefold 唯一性，禁止自环，strength 为 0–100 严格整数，每边 1–20 条当前消息证据，整档最多 200 边/50 个不同证据。旧档缺字段纯读为空，坏旧边稳定 422 且不回写。自动 trim 保护证据，消息删除/truncate/regenerate 收敛证据，角色删除跨存档清边并受补偿/恢复保护；关系不进入 Prompt、parsed delta 或模型写回。前端 SVG 图与语义列表共享结构化模型，人工编辑和证据定位受 active-turn、single-flight、SessionRef、revision、UUID 与 DOM 目标门禁。pytest 521/521、Node 94/94、21 个 Web 模块语法通过；375×812 Edge 交互最小控件 44px、横向溢出 0、最终 revision 5，测试残留 0。
 
-**OPS-2 离线质量门边界（提交 `6dcb104`、`7d7ddd4`）**：`dependency_locks.py` 已具备 runtime/dev 语义锁、hash 对应关系和精确环境集合校验；`quality_gate.py --preflight` 编排语义锁、pip、编译、逐文件 JS 语法、全量 Python/Node 测试与真实 data/backups/logs 前后清单，`--release` 额外强制 hash lock、精确 dev 环境、Ruff、branch coverage、Node 依赖、Playwright 管理浏览器和 axe。回环 fake Ollama、显式隔离种子和 `browser_e2e.mjs` 覆盖 8 条 T6 功能流，阻断非回环请求；缓存 Playwright 1.60.0 + 系统 Edge 150 的预检在 375/600/768px 零横向溢出，但输出固定为 `reproducible_browser:false`、`axe_executed:false`、`release_gate:false`。质量门 preflight 29/29、pytest 537/537、Node 94/94 通过，真实目录摘要不变；正式发布验收仍等待外部下载确认。
+**OPS-2 离线质量门边界（提交 `6dcb104`、`7d7ddd4`、`0dd52c4`）**：`dependency_locks.py` 已具备 runtime/dev 语义锁、hash 对应关系和精确环境集合校验；`.node-version`/私有 `package.json` 固定 Node 24.15.0、npm 11.12.1、Playwright 1.61.1 与 axe 4.12.1，生产保持零 npm 依赖。`node_dependency_lock.py` 关闭重复键、范围版本、生产依赖、registry/integrity、四包闭包、工具版本及安装树漂移。`quality_gate.py --preflight` 编排语义锁、pip、编译、逐文件 JS 语法、全量 Python/Node 测试与真实 data/backups/logs 前后清单，`--release` 额外强制 hash/integrity lock、精确 dev 环境、Ruff、branch coverage、Playwright 管理浏览器和 axe。回环 fake Ollama、显式隔离种子和 `browser_e2e.mjs` 覆盖 8 条 T6 功能流，阻断非回环请求；缓存 Playwright 1.60.0 + 系统 Edge 150 的预检在 375/600/768px 零横向溢出，但输出固定为 `reproducible_browser:false`、`axe_executed:false`、`release_gate:false`。质量门 preflight 30/30、pytest 543/543、Node 94/94 通过，真实目录摘要不变；完整 `package-lock.json`、Python hash lock、固定浏览器及正式发布验收仍等待外部下载确认。
 
 ---
 
@@ -339,7 +340,7 @@ active: true              # 是否默认出场
 
 ## 10. 待办 / 未实现
 
-完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。OPS-1、UX-1、SEARCH-1、REL-1 已完成；当前只剩 OPS-2。离线校验和功能预检已完成；coverage/Ruff/Node Playwright/axe 精确锁、hash lock、固定浏览器与全新环境安装在取得外部下载确认后收口。
+完整剩余项与验收矩阵只维护在桌面《本地酒馆-功能优化规划.md》。OPS-1、UX-1、SEARCH-1、REL-1 已完成；当前只剩 OPS-2。离线校验、功能预检和 Node 精确开发清单已完成；Python/Node 制品 hash/integrity、固定浏览器、Ruff/branch coverage/axe 与全新环境安装在取得外部下载确认后收口。
 
 ---
 
@@ -388,15 +389,15 @@ active: true              # 是否默认出场
 | 聊天/Prompt | `core/chat_turns.py`、`core/prompt_assembler.py`、`core/token_estimator.py`、`core/ollama_client.py` |
 | 记忆/世界/角色/搜索/关系 | `core/summary_lifecycle.py`、`core/worldbook_policy.py`、`core/roleplay_policy.py`、`core/search_service.py`、`core/relationship_edges.py`、`routes/search.py`、`routes/relationships.py` |
 | 前端 | `web/app.mjs`、`web/api-client.js`、`web/session-ref.js`、`web/turn-client.js`、`web/*.mjs` |
-| 安装锁 | `.python-version`、`requirements.lock.txt`、`requirements-dev.lock.txt`、`setup.bat` |
-| 质量门 | `tools/dependency_locks.py`、`tools/quality_gate.py`、`tests/e2e_fake_ollama.py`、`tests/browser_e2e.mjs` |
+| 安装锁 | `.python-version`、`.node-version`、`requirements.lock.txt`、`requirements-dev.lock.txt`、`package.json`、`setup.bat`；hash lock 与 `package-lock.json` 待正式生成 |
+| 质量门 | `tools/dependency_locks.py`、`tools/node_dependency_lock.py`、`tools/quality_gate.py`、`tests/e2e_fake_ollama.py`、`tests/browser_e2e.mjs` |
 
 ---
 
 ## 14. 下次接手时建议先做的事
 
-1. **先读桌面优化规划的 OPS-2 段** — 当前唯一任务是开发工具精确锁、hash lock、固定浏览器与全新环境验收
-2. **先核对 `requirements*.txt`、`tools/dependency_locks.py`、`tools/quality_gate.py` 与 `setup.bat`** — 保持 runtime/dev 分层和官方 Python 3.12 `.venv` 入口
+1. **先读桌面优化规划的 OPS-2 段** — 当前唯一任务是生成可验证 hash/integrity 锁、安装固定浏览器并完成全新环境发布验收
+2. **先核对 `requirements*.txt`、`package.json`、`tools/dependency_locks.py`、`tools/node_dependency_lock.py`、`tools/quality_gate.py` 与 `setup.bat`** — 保持 runtime/dev 分层和官方 Python 3.12 `.venv` 入口
 3. **外部下载前取得明确确认** — coverage、Ruff、Node Playwright、axe 和 Playwright 浏览器二进制均不得在未确认时联网安装；系统 Edge 不能作为发布证据
 4. **检查启动链**：首次运行 `setup.bat`，随后使用 `start.bat` 或 `run_hidden.vbs`；不要绕过 launcher 直接调用 uvicorn
 5. **确认 Ollama 在跑**（`ollama ps`）
@@ -404,6 +405,6 @@ active: true              # 是否默认出场
 
 ---
 
-**最后更新**：2026-07-22  OPS-2 离线锁校验、质量门与隔离浏览器 E2E 预检
+**最后更新**：2026-07-22  OPS-2 浏览器门工具链精确清单与 30/30 离线质量门
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目
