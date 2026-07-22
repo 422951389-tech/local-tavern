@@ -119,6 +119,14 @@ def build_steps(mode: str, root: Path, python: str, node: str, npm: str | None) 
         raise GateFailure("web 目录中没有 JavaScript 文件")
     if not node_tests:
         raise GateFailure("tests 目录中没有 Node 测试")
+    if mode == "release" and npm is None:
+        raise GateFailure("发布质量门需要 npm")
+
+    node_lock_arguments = (
+        ("--semantic-only",)
+        if mode == "preflight"
+        else ("--environment", "--node", node, "--npm", npm)
+    )
 
     steps = [
         GateStep(
@@ -127,6 +135,14 @@ def build_steps(mode: str, root: Path, python: str, node: str, npm: str | None) 
                 python,
                 "tools/dependency_locks.py",
                 *(('--semantic-only',) if mode == "preflight" else ('--environment', 'dev')),
+            ),
+        ),
+        GateStep(
+            "node-dependency-locks",
+            (
+                python,
+                "tools/node_dependency_lock.py",
+                *node_lock_arguments,
             ),
         ),
         GateStep("pip-check", (python, "-m", "pip", "check")),
@@ -154,12 +170,7 @@ def build_steps(mode: str, root: Path, python: str, node: str, npm: str | None) 
         steps.append(GateStep("python-tests", (python, "-m", "pytest", "-q")))
     steps.append(GateStep("node-tests", (node, "--test", *node_tests)))
     if mode == "release":
-        if npm is None:
-            raise GateFailure("发布质量门需要 npm")
-        steps.extend([
-            GateStep("node-dependencies", (npm, "ls", "--depth=0", "--json")),
-            GateStep("browser-e2e-axe", (node, "tests/browser_e2e.mjs")),
-        ])
+        steps.append(GateStep("browser-e2e-axe", (node, "tests/browser_e2e.mjs")))
     steps.append(GateStep("diff-check", ("git", "diff", "--check")))
     return steps
 

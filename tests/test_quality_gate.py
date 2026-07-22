@@ -31,6 +31,7 @@ def test_preflight_is_explicitly_smaller_than_the_release_gate():
     assert any(name.startswith("javascript-syntax:web/") for name in preflight)
     assert "javascript-syntax:tests/browser_e2e.mjs" in preflight
     assert "python-tests" in preflight
+    assert "node-dependency-locks" in preflight
     assert "ruff" not in preflight
     assert "browser-e2e-axe" not in preflight
     assert "python-tests-coverage" in release
