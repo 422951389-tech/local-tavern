@@ -38,6 +38,7 @@ from routes import (
     roleplay,
     settings,
     sessions,
+    search,
     chat,
     messages,
     migrations,
@@ -276,6 +277,7 @@ app.include_router(worldbook.router)
 app.include_router(roleplay.router)
 app.include_router(settings.router)
 app.include_router(sessions.router)
+app.include_router(search.router)
 app.include_router(chat.router)
 app.include_router(messages.router)
 app.include_router(migrations.router)

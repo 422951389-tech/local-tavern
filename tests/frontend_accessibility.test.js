@@ -56,6 +56,7 @@ test('静态顶栏、下拉、输入和 Thinking 控件具有稳定可访问名�
         ['reset-btn', '重置当前存档内容'],
         ['model-params-btn', '调整 AI 参数'],
         ['history-btn', '查看历史快照'],
+        ['search-btn', '全局剧情搜索'],
         ['prompts-btn', '编辑提示词'],
         ['send-cancel-btn', '取消生成'],
         ['thinking-close', '收起 AI 思考面板'],
@@ -69,6 +70,8 @@ test('静态顶栏、下拉、输入和 Thinking 控件具有稳定可访问名�
     assertAttribute(tagById('save-list'), 'role', 'listbox');
     assertAttribute(tagById('thinking-panel'), 'role', 'region');
     assertAttribute(tagById('modal'), 'tabindex', '-1');
+    assertAttribute(tagById('search-btn'), 'aria-haspopup', 'dialog');
+    assertAttribute(tagById('search-btn'), 'aria-controls', 'modal');
 });
 
 test('CSS 固定 4.5:1 文本对比、44px 触控、焦点和 reduced-motion 契约', () => {
@@ -99,6 +102,24 @@ test('Modal、卡片编辑器、下拉与 Thinking 具有窄屏边界契约', ()
     assert.match(APP, /syncCardListSelection\(\);\s*renderForm\(\);/);
     assert.match(STYLE, /\.chat-stream\s*\{[\s\S]*?overflow-x:\s*hidden/);
     assert.match(STYLE, /\.msg \.content,[\s\S]*?overflow-wrap:\s*anywhere/);
+});
+
+test('全局剧情搜索具有表单标签、实时状态、焦点和窄屏契约', () => {
+    assert.match(APP, /queryLabel\.htmlFor = 'global-search-query'/);
+    assert.match(APP, /query\.maxLength = 128/);
+    assert.match(APP, /query\.setAttribute\('aria-describedby', 'global-search-status'\)/);
+    assert.match(APP, /scopeLabel\.htmlFor = 'global-search-scope'/);
+    assert.match(APP, /status\.setAttribute\('role', 'status'\)/);
+    assert.match(APP, /status\.setAttribute\('aria-live', 'polite'\)/);
+    assert.match(APP, /searchNavigationGate\.acquire\(\)/);
+    assert.match(APP, /searchNavigationGate\.release\(navigationToken\)/);
+    assert.match(APP, /querySelectorAll\('button, input, select'\)/);
+    assert.match(APP, /modalController\.setPending\(true\)/);
+    assert.match(APP, /results\.setAttribute\('aria-label', '搜索结果'\)/);
+    assert.match(STYLE, /\.search-form[\s\S]*?min-height:\s*44px/);
+    assert.match(STYLE, /\.search-result:focus-visible/);
+    assert.match(STYLE, /@media\s*\(max-width:\s*600px\)[\s\S]*?\.search-form\s*\{[\s\S]*?grid-template-columns:\s*1fr/);
+    assert.match(STYLE, /\.search-result-snippet\s*\{[\s\S]*?overflow-wrap:\s*anywhere/);
 });
 
 class FakeClassList {

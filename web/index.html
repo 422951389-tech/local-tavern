@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>本地酒馆</title>
-    <link rel="stylesheet" href="/static/style.css?v=ux1-20260718">
+    <link rel="stylesheet" href="/static/style.css?v=search1-20260722">
 </head>
 <body>
     <!-- 顶栏 v3：世界观做主标题，下属 4 tab -->
@@ -60,6 +60,8 @@
                 aria-label="调整 AI 参数" aria-haspopup="dialog" aria-controls="modal"><span aria-hidden="true">🎛</span></button>
             <button id="history-btn" class="icon-btn" type="button" title="查看历史快照"
                 aria-label="查看历史快照" aria-haspopup="dialog" aria-controls="modal"><span aria-hidden="true">🕐</span></button>
+            <button id="search-btn" class="icon-btn" type="button" title="全局剧情搜索"
+                aria-label="全局剧情搜索" aria-haspopup="dialog" aria-controls="modal"><span aria-hidden="true">🔎</span></button>
             <button id="prompts-btn" class="icon-btn" type="button" title="编辑提示词"
                 aria-label="编辑提示词" aria-haspopup="dialog" aria-controls="modal"><span aria-hidden="true">📝</span></button>
         </div>
@@ -148,7 +150,7 @@
     <script src="/static/api-client.js?v=fe1-20260715"></script>
     <script src="/static/session-ref.js?v=fe1-20260715"></script>
     <script src="/static/turn-client.js?v=fe1-20260715"></script>
-    <script type="module" src="/static/app.mjs?v=role1-20260718"></script>
+    <script type="module" src="/static/app.mjs?v=search1-20260722"></script>
 
     <!-- 通用 Modal 容器 -->
     <div id="modal-backdrop" class="modal-backdrop hidden" aria-hidden="true">

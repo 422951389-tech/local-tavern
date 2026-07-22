@@ -26,6 +26,15 @@ import {
     createRoleplayService,
     renderRoleplayWarnings,
 } from './roleplay.mjs';
+import {
+    createLatestSearchController,
+    createSearchService,
+    createSingleFlightGate,
+    ensureSummaryAnchor,
+    focusSearchTarget,
+    navigateToSearchResult,
+    renderSearchResults,
+} from './search.mjs';
 
 // 本地酒馆 — 前端逻辑 v2（项目+存档双层架构）
 // 流式对话、角色卡渲染、行动建议、会话管理、提示词编辑
@@ -66,6 +75,7 @@ const API = {
     // 项目
     projects: '/api/projects',
     projectStats: '/api/projects/stats',
+    search: '/api/search',
     // 多存档
     sessions: '/api/sessions',
     sessionCreate: '/api/sessions',
@@ -127,6 +137,7 @@ const promptService = createPromptService(apiClient, API);
 const summaryService = createSummaryService(sessionWrite, API);
 const worldbookService = createWorldbookService(apiClient, sessionWrite, API);
 const roleplayService = createRoleplayService(sessionWrite, API);
+const searchService = createSearchService(apiClient, { endpoint: API.search });
 const turnPersistence = createTurnPersistence(sessionStorage);
 const modalController = createModalController(
     modalElementsFromDocument(document),
@@ -138,7 +149,14 @@ const hideModal = options => modalController.hide(options);
 
 const sessionRefs = new SessionRefTracker(state.currentProject, state.currentSave);
 let committedSessionRef = sessionRefs.capture();
+const searchRequestController = createLatestSearchController({
+    service: searchService,
+    captureSessionRef,
+    isCurrentSessionRef,
+});
+const searchNavigationGate = createSingleFlightGate();
 let activeController = null;   // 当前 turn SSE 的 AbortController；业务取消必须调用服务端 cancel API
+let searchModalSerial = 0;
 let activeFrameRenderer = null;
 let projectListboxController = null;
 let saveListboxController = null;
@@ -211,7 +229,7 @@ async function loadLatestWorldbookDiagnostics(ref) {
 function setNavigationUiState(active) {
     state.navigationBusy = active;
     const blocked = active || Boolean(state.activeTurn && !state.activeTurn.terminal);
-    for (const id of ['project-btn', 'tab-world', 'tab-saves', 'model-select', 'reset-btn']) {
+    for (const id of ['project-btn', 'tab-world', 'tab-saves', 'model-select', 'reset-btn', 'search-btn']) {
         const element = document.getElementById(id);
         if (!element) continue;
         if ('disabled' in element) element.disabled = blocked;
@@ -309,8 +327,7 @@ function commitSummaryRefresh(session, ref) {
     state.session = commit.session;
     state.saveList = commit.saveList;
     const stream = document.getElementById('chat-stream');
-    const lastAssistant = stream && stream.querySelector('.msg.assistant:last-of-type');
-    if (lastAssistant) renderSummaryPanel(lastAssistant, commit.session);
+    if (stream) renderSummaryPanel(ensureSummaryAnchor(document, stream), commit.session);
     watchPendingSummaries(ref, commit.session);
     return true;
 }
@@ -635,25 +652,28 @@ async function loadCurrentSession(requestRef = captureSessionRef()) {
 }
 
 async function switchSave(newSaveId) {
-    if (!newSaveId || newSaveId === state.currentSave) return;
+    if (!newSaveId) return false;
+    if (newSaveId === state.currentSave) return true;
     if (state.navigationBusy) {
         showToast('正在切换项目或存档，请稍候');
-        return;
+        return false;
     }
     if (isTurnActiveForRef(committedSessionRef)) {
         showToast('当前存档正在生成，请先取消或等待完成');
-        return;
+        return false;
     }
     const candidateRef = beginSessionTransition(state.currentProject, newSaveId);
     try {
         const session = await fetchSession(candidateRef);
-        if (!isCurrentSessionRef(candidateRef)) return;
-        if (!commitSessionState(session, candidateRef)) return;
+        if (!isCurrentSessionRef(candidateRef)) return false;
+        if (!commitSessionState(session, candidateRef)) return false;
         document.getElementById('suggestions').innerHTML = '';
         document.getElementById('thinking-panel').classList.add('hidden');
+        return true;
     } catch (error) {
         rollbackSessionTransition(candidateRef);
         showToast(`切换存档失败：${errorDetail(error)}`, 3000);
+        return false;
     }
 }
 
@@ -862,9 +882,8 @@ function renderHistory(history) {
         if (msg.role === 'assistant') return buildAssistantMessage(msg.content, msg.thinking || '', msg).container;
         return null;
     });
-    // 重渲染历史时，给最新一条 AI 消息补上「📋 剧情记忆」折叠面板（已有 summaries 才显示）
-    const lastAI = stream.querySelector('.msg.assistant:last-of-type');
-    if (lastAI) renderSummaryPanel(lastAI, state.session);
+    // 独立锚点保证空消息历史中也能展示并定位剧情记忆。
+    renderSummaryPanel(ensureSummaryAnchor(document, stream), state.session);
     scrollToBottom();
 }
 
@@ -883,7 +902,7 @@ function buildUserMessage(text, msgData = null) {
 function appendUserMessage(text, msgData = null) {
     const stream = document.getElementById('chat-stream');
     const div = buildUserMessage(text, msgData);
-    stream.appendChild(div);
+    stream.insertBefore(div, ensureSummaryAnchor(document, stream));
     scrollToBottom();
 }
 
@@ -905,7 +924,7 @@ function buildAssistantMessage(content, thinking = '', msgData = null) {
 function appendAssistantMessage(content, thinking = '', msgData = null) {
     const stream = document.getElementById('chat-stream');
     const rendered = buildAssistantMessage(content, thinking, msgData);
-    stream.appendChild(rendered.container);
+    stream.insertBefore(rendered.container, ensureSummaryAnchor(document, stream));
     scrollToBottom();
     return rendered.contentElement;
 }
@@ -1143,7 +1162,7 @@ function renderParsedResponse(parsed, warningSource = parsed) {
     if (parsed.suggestions && parsed.suggestions.length > 0) renderSuggestions(parsed.suggestions);
     else document.getElementById('suggestions').innerHTML = '';
 
-    renderSummaryPanel(lastAssistant, state.session);
+    renderSummaryPanel(ensureSummaryAnchor(document, stream), state.session);
     scrollToBottom();
 }
 
@@ -1375,8 +1394,8 @@ function setTurnUiState(active, cancelling = false, syncPending = false) {
         element.setAttribute('aria-disabled', String(active));
     });
     if (state.roleplayPanel) state.roleplayPanel.setDisabled(active || state.navigationBusy);
-    const lastAI = document.querySelector('#chat-stream .msg.assistant:last-of-type');
-    if (lastAI && state.session) renderSummaryPanel(lastAI, state.session);
+    const stream = document.getElementById('chat-stream');
+    if (stream && state.session) renderSummaryPanel(ensureSummaryAnchor(document, stream), state.session);
 }
 
 function makeProvisionalTurn(ref) {
@@ -2724,6 +2743,211 @@ async function showPromptsEditor() {
 
 // ===== 事件绑定 =====
 
+function searchNavigationMessage(code) {
+    const messages = {
+        stale_origin: '当前存档已变化，请重新搜索',
+        navigation_busy: '正在切换项目或存档，请稍候',
+        active_turn: '当前存档正在生成，请先取消或等待完成',
+        project_mismatch: '搜索结果不属于当前项目',
+        switch_unavailable: '当前无法切换到目标存档',
+        switch_failed: '切换目标存档失败',
+        target_ref_mismatch: '目标存档加载结果不一致',
+        session_mismatch: '目标存档加载结果不一致',
+        session_unavailable: '目标存档读取失败，请重新搜索',
+        revision_mismatch: '目标存档已更新，请重新搜索',
+        message_not_found: '目标消息已不存在，请重新搜索',
+        message_target_unavailable: '目标消息无法定位',
+        message_target_not_found: '目标消息无法定位',
+        summary_not_found: '目标剧情记忆已不存在，请重新搜索',
+        summary_target_unavailable: '目标剧情记忆无法定位',
+        summary_target_not_found: '目标剧情记忆无法定位',
+        invalid_result: '搜索结果结构无效',
+        navigation_cancelled: '搜索定位已取消',
+    };
+    return messages[code] || '搜索结果定位失败，请重新搜索';
+}
+
+function locateMessageForSearch(messageId) {
+    const stream = document.getElementById('chat-stream');
+    if (!stream) return null;
+    return Array.from(stream.querySelectorAll('.msg[data-message-id]'))
+        .find(element => element.dataset.messageId === messageId) || null;
+}
+
+function revealSummaryForSearch(summaryId) {
+    const stream = document.getElementById('chat-stream');
+    if (!stream) return null;
+    const summary = state.session && Array.isArray(state.session.summaries)
+        ? state.session.summaries.find(item => item && item.id === summaryId)
+        : null;
+    if (!summary) return null;
+    state.selectedSummaryId = summaryId;
+    state.summaryPanelExpanded = true;
+    const anchor = ensureSummaryAnchor(document, stream);
+    renderSummaryPanel(anchor, state.session);
+    const panel = anchor.nextElementSibling;
+    if (!panel || !panel.classList.contains('summary-panel')) return null;
+    const select = panel.querySelector('#summary-segment-select');
+    if (!select || select.value !== summaryId) return null;
+    return panel.querySelector('.summary-panel-body') || panel;
+}
+
+async function openSearchResult(result, originRef, status, mount, modalToken) {
+    const isMounted = () => Boolean(
+        mount && mount.isConnected && modalToken === searchModalSerial
+    );
+    if (!isMounted()) return;
+    const navigationToken = searchNavigationGate.acquire();
+    if (!navigationToken) return;
+    const setNavigationControlsDisabled = disabled => {
+        if (!mount || typeof mount.querySelectorAll !== 'function') return;
+        for (const control of mount.querySelectorAll('button, input, select')) {
+            control.disabled = disabled;
+        }
+    };
+    setNavigationControlsDisabled(true);
+    status.textContent = '正在定位搜索结果…';
+    modalController.setPending(true);
+    try {
+        const outcome = await navigateToSearchResult({
+            result,
+            originRef,
+            captureSessionRef,
+            sameSessionRef,
+            isMounted,
+            isNavigationBusy: () => state.navigationBusy,
+            isTurnActive: ref => isTurnActiveForRef(ref),
+            switchSave,
+            getSession: targetRef => fetchSession(targetRef),
+            locateMessage: locateMessageForSearch,
+            revealSummary: revealSummaryForSearch,
+        });
+        if (!isMounted()) return;
+        if (outcome.ok) {
+            modalController.setPending(false);
+            if (hideModal({ restoreFocus: false })) focusSearchTarget(outcome.target);
+            return;
+        }
+        status.textContent = searchNavigationMessage(outcome.code);
+    } catch (error) {
+        if (isMounted()) status.textContent = `定位失败：${errorDetail(error)}`;
+    } finally {
+        if (searchNavigationGate.release(navigationToken) && isMounted()) {
+            setNavigationControlsDisabled(false);
+            modalController.setPending(false);
+        }
+    }
+}
+
+function showGlobalSearch() {
+    if (state.navigationBusy) {
+        showToast('正在切换项目或存档，请稍候');
+        return;
+    }
+    searchRequestController.cancel();
+    const modalToken = ++searchModalSerial;
+    const body = document.createElement('div');
+    body.className = 'search-dialog';
+    const form = document.createElement('form');
+    form.className = 'search-form';
+
+    const queryGroup = document.createElement('div');
+    queryGroup.className = 'search-query-group';
+    const queryLabel = document.createElement('label');
+    queryLabel.htmlFor = 'global-search-query';
+    queryLabel.textContent = '搜索剧情内容';
+    const query = document.createElement('input');
+    query.id = 'global-search-query';
+    query.type = 'text';
+    query.required = true;
+    query.maxLength = 128;
+    query.autocomplete = 'off';
+    query.placeholder = '输入消息或剧情记忆中的文字';
+    query.setAttribute('aria-describedby', 'global-search-status');
+    queryGroup.appendChild(queryLabel);
+    queryGroup.appendChild(query);
+
+    const scopeGroup = document.createElement('div');
+    scopeGroup.className = 'search-scope-group';
+    const scopeLabel = document.createElement('label');
+    scopeLabel.htmlFor = 'global-search-scope';
+    scopeLabel.textContent = '搜索范围';
+    const scope = document.createElement('select');
+    scope.id = 'global-search-scope';
+    for (const [value, label] of [
+        ['all', '全部'],
+        ['messages', '消息'],
+        ['summaries', '剧情记忆'],
+        ['pinned', '已钉选消息'],
+    ]) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        scope.appendChild(option);
+    }
+    scopeGroup.appendChild(scopeLabel);
+    scopeGroup.appendChild(scope);
+
+    const submit = document.createElement('button');
+    submit.type = 'submit';
+    submit.className = 'search-submit';
+    submit.textContent = '搜索';
+    form.appendChild(queryGroup);
+    form.appendChild(scopeGroup);
+    form.appendChild(submit);
+
+    const status = document.createElement('p');
+    status.id = 'global-search-status';
+    status.className = 'search-status';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    status.textContent = '搜索当前项目的全部存档';
+    const results = document.createElement('div');
+    results.className = 'search-results';
+    results.setAttribute('aria-label', '搜索结果');
+
+    body.appendChild(form);
+    body.appendChild(status);
+    body.appendChild(results);
+    form.addEventListener('submit', async event => {
+        event.preventDefault();
+        const q = query.value.trim();
+        if (!q) {
+            status.textContent = '请输入搜索词';
+            query.focus();
+            return;
+        }
+        submit.disabled = true;
+        status.textContent = '正在搜索…';
+        results.replaceChildren();
+        const requestRef = captureSessionRef();
+        const outcome = await searchRequestController.run({
+            project: requestRef.project,
+            q,
+            scope: scope.value,
+            limit: 50,
+            mount: body,
+        });
+        if (!body.isConnected) return;
+        if (outcome.accepted) {
+            const response = outcome.response;
+            const shown = response.results.length;
+            const suffix = response.truncated ? `，显示前 ${shown} 处` : '';
+            const skipped = response.skipped.length ? `，跳过 ${response.skipped.length} 个损坏存档` : '';
+            status.textContent = `找到 ${response.total_matches} 处${suffix}${skipped}`;
+            renderSearchResults(document, results, response.results, result => {
+                void openSearchResult(result, outcome.originRef, status, body, modalToken);
+            });
+        } else if (outcome.reason === 'error') {
+            status.textContent = `搜索失败：${errorDetail(outcome.error)}`;
+        } else if (outcome.reason === 'stale_session') {
+            status.textContent = '当前项目或存档已变化，请重新搜索';
+        }
+        if (!searchRequestController.isActive()) submit.disabled = false;
+    });
+    showModal({ title: '全局剧情搜索', body });
+}
+
 function bindUI() {
     // ===== 新顶栏 v3 =====
 
@@ -2843,6 +3067,7 @@ function bindUI() {
     document.getElementById('prompts-btn').addEventListener('click', showPromptsEditor);
     document.getElementById('model-params-btn').addEventListener('click', showModelParamsEditor);
     document.getElementById('history-btn').addEventListener('click', showHistoryEditor);
+    document.getElementById('search-btn').addEventListener('click', showGlobalSearch);
 
     // 发送
     document.getElementById('send-btn').addEventListener('click', () => sendMessage());
