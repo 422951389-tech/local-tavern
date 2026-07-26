@@ -21,7 +21,6 @@ from core.recovery_store import (
 )
 from core.relationship_edges import remove_incident_relationship_edges
 from core.session_store import (
-    RevisionConflict,
     SessionStore,
     atomic_write,
     normalize_session,

@@ -27,7 +27,8 @@ def test_repository_semantic_locks_are_exact_sorted_and_compatible():
     dev = parse_semantic_lock(ROOT / "requirements-dev.lock.txt")
     verify_lock_overlap(runtime, dev)
     assert len(runtime) == 22
-    assert {"pytest", "pytest-asyncio"} <= set(dev)
+    assert len(dev) == 8
+    assert {"coverage", "pytest", "pytest-asyncio", "ruff"} <= set(dev)
 
 
 def test_hash_lock_requires_sorted_unique_sha256_and_matches_semantic(tmp_path: Path):

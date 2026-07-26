@@ -40,6 +40,14 @@ def test_preflight_is_explicitly_smaller_than_the_release_gate():
     assert release[-1] == "diff-check"
 
 
+def test_release_browser_gate_pins_tools_and_rejects_module_overrides():
+    source = (ROOT / "tests" / "browser_e2e.mjs").read_text(encoding="utf-8")
+    assert "EXPECTED_PLAYWRIGHT_VERSION = '1.61.1'" in source
+    assert "EXPECTED_AXE_VERSION = '4.12.1'" in source
+    assert "EXPECTED_BROWSER_VERSION = '149.0.7827.55'" in source
+    assert "发布门禁止本地模块覆盖" in source
+
+
 def test_real_data_guard_reports_exact_changed_path(tmp_path: Path):
     data = tmp_path / "data"
     backups = tmp_path / "backups"

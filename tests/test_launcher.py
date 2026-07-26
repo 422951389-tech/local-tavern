@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import socket
 from logging.handlers import RotatingFileHandler
 
 import pytest

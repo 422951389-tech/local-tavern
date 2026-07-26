@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Generic, TypeVar
+from typing import Callable, Generic, TypeVar
 from uuid import UUID, uuid4, uuid5
 
 from core.active_turns import assert_write_allowed

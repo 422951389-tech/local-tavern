@@ -17,9 +17,7 @@ import math
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
-
-logger = logging.getLogger(__name__)
+from typing import Iterator
 
 import yaml
 
@@ -52,6 +50,8 @@ from core.worldbook_policy import (
     normalize_worldbook_entry,
 )
 
+
+logger = logging.getLogger(__name__)
 ROOT_DIR = PROJECTS_DIR
 OLD_DATA_DIR = DATA_DIR  # 只读兼容别名；迁移必须通过 LegacyMigrationService 显式执行。
 _YAML_WRITE_LOCK = threading.RLock()

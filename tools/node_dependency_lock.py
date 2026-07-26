@@ -18,13 +18,18 @@ PACKAGE_JSON = ROOT / "package.json"
 PACKAGE_LOCK = ROOT / "package-lock.json"
 EXPECTED_NODE = "24.15.0"
 EXPECTED_NPM = "11.12.1"
-EXPECTED_DIRECT = frozenset({"@axe-core/playwright", "playwright"})
-EXPECTED_CLOSURE = frozenset({
-    "@axe-core/playwright",
-    "axe-core",
-    "playwright",
-    "playwright-core",
-})
+EXPECTED_DIRECT = {
+    "@axe-core/playwright": "4.12.1",
+    "playwright": "1.61.1",
+}
+EXPECTED_OVERRIDES = {"playwright-core": "1.61.1"}
+EXPECTED_CLOSURE = {
+    "@axe-core/playwright": "4.12.1",
+    "axe-core": "4.12.1",
+    "fsevents": "2.3.2",
+    "playwright": "1.61.1",
+    "playwright-core": "1.61.1",
+}
 _EXACT_VERSION = re.compile(
     r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
@@ -94,10 +99,13 @@ def validate_manifest(manifest: Mapping[str, object]) -> dict[str, str]:
     if manifest.get("packageManager") != f"npm@{EXPECTED_NPM}":
         raise NodeLockValidationError("packageManager must pin the approved npm version")
     dev = _exact_dependencies(manifest.get("devDependencies"), "devDependencies")
-    if set(dev) != EXPECTED_DIRECT:
+    if dev != EXPECTED_DIRECT:
         raise NodeLockValidationError(
-            "devDependencies must contain only the approved browser gate packages"
+            "devDependencies must match the approved browser gate packages"
         )
+    overrides = _exact_dependencies(manifest.get("overrides"), "overrides")
+    if overrides != EXPECTED_OVERRIDES:
+        raise NodeLockValidationError("overrides must pin the approved Playwright core")
     return dev
 
 
@@ -105,7 +113,10 @@ def _package_name(lock_path: str) -> str:
     prefix = "node_modules/"
     if not lock_path.startswith(prefix):
         raise NodeLockValidationError(f"lock contains a non-registry package path: {lock_path}")
-    return lock_path[len(prefix):]
+    name = lock_path[len(prefix):]
+    if "/node_modules/" in name:
+        raise NodeLockValidationError(f"lock contains a nested package path: {lock_path}")
+    return name
 
 
 def _validate_registry_artifact(name: str, record: Mapping[str, object]) -> str:
@@ -136,6 +147,13 @@ def _validate_registry_artifact(name: str, record: Mapping[str, object]) -> str:
         raise NodeLockValidationError(f"lock package has invalid SHA-512 integrity: {name}")
     if record.get("dev") is not True:
         raise NodeLockValidationError(f"browser gate package is not marked dev-only: {name}")
+    if name == "fsevents":
+        if record.get("optional") is not True or record.get("os") != ["darwin"]:
+            raise NodeLockValidationError(
+                "fsevents must remain optional and restricted to darwin"
+            )
+    elif record.get("optional") is True:
+        raise NodeLockValidationError(f"approved browser gate package became optional: {name}")
     return version
 
 
@@ -167,11 +185,19 @@ def validate_lock(lock: Mapping[str, object], direct: Mapping[str, str]) -> dict
             name,
             _mapping(raw_record, f"package-lock record {name}"),
         )
-    if set(locked) != EXPECTED_CLOSURE:
-        missing = sorted(EXPECTED_CLOSURE - set(locked))
-        extra = sorted(set(locked) - EXPECTED_CLOSURE)
+    if set(locked) != set(EXPECTED_CLOSURE):
+        missing = sorted(set(EXPECTED_CLOSURE) - set(locked))
+        extra = sorted(set(locked) - set(EXPECTED_CLOSURE))
         raise NodeLockValidationError(
             f"package-lock closure differs from the approved set (missing={missing}, extra={extra})"
+        )
+    mismatched = sorted(
+        name for name, version in EXPECTED_CLOSURE.items()
+        if locked[name] != version
+    )
+    if mismatched:
+        raise NodeLockValidationError(
+            f"package-lock closure versions differ from the approved set: {mismatched}"
         )
     for name, version in direct.items():
         if locked.get(name) != version:

@@ -23,23 +23,54 @@ for (const argument of args) {
 }
 const useSystemEdge = args.has('--system-edge');
 const skipAxe = args.has('--skip-axe');
+const releaseMode = !useSystemEdge && !skipAxe;
+const EXPECTED_PLAYWRIGHT_VERSION = '1.61.1';
+const EXPECTED_AXE_VERSION = '4.12.1';
+const EXPECTED_BROWSER_VERSION = '149.0.7827.55';
+const moduleOverrideKeys = ['TAVERN_PLAYWRIGHT_MODULE', 'TAVERN_AXE_MODULE'];
+if (releaseMode) {
+    const configuredOverrides = moduleOverrideKeys.filter(key => process.env[key]);
+    if (configuredOverrides.length) {
+        throw new Error(`发布门禁止本地模块覆盖：${configuredOverrides.join(', ')}`);
+    }
+}
+
+function packageManifest(name, configured, resolvedEntry) {
+    if (configured) {
+        const packageFile = path.join(path.resolve(configured), 'package.json');
+        return JSON.parse(readFileSync(packageFile, 'utf8'));
+    }
+    let directory = path.dirname(resolvedEntry);
+    while (true) {
+        const packageFile = path.join(directory, 'package.json');
+        if (existsSync(packageFile)) {
+            const manifest = JSON.parse(readFileSync(packageFile, 'utf8'));
+            if (manifest.name === name) return manifest;
+        }
+        const parent = path.dirname(directory);
+        if (parent === directory) break;
+        directory = parent;
+    }
+    throw new Error(`无法定位 ${name} 的 package.json`);
+}
 
 function loadPackage(name, environmentKey) {
     const configured = process.env[environmentKey];
     const entry = configured ? path.resolve(configured) : name;
     try {
         const loaded = require(entry);
-        const packageFile = configured
-            ? path.join(path.resolve(configured), 'package.json')
-            : `${name}/package.json`;
-        const version = JSON.parse(readFileSync(require.resolve(packageFile), 'utf8')).version;
-        return { loaded, version, entry };
+        const resolvedEntry = require.resolve(entry);
+        const version = packageManifest(name, configured, resolvedEntry).version;
+        return { loaded, version, entry: resolvedEntry };
     } catch (error) {
         throw new Error(`缺少 ${name}（可用 ${environmentKey} 指定本地包目录）：${error.message}`);
     }
 }
 
 const playwrightPackage = loadPackage('playwright', 'TAVERN_PLAYWRIGHT_MODULE');
+if (playwrightPackage.version !== EXPECTED_PLAYWRIGHT_VERSION) {
+    throw new Error(`Playwright 版本必须为 ${EXPECTED_PLAYWRIGHT_VERSION}`);
+}
 const { chromium } = playwrightPackage.loaded;
 if (!chromium) throw new Error('playwright 包未导出 chromium');
 let AxeBuilder = null;
@@ -48,6 +79,9 @@ if (!skipAxe) {
     const axePackage = loadPackage('@axe-core/playwright', 'TAVERN_AXE_MODULE');
     AxeBuilder = axePackage.loaded.default || axePackage.loaded.AxeBuilder;
     axeVersion = axePackage.version;
+    if (axeVersion !== EXPECTED_AXE_VERSION) {
+        throw new Error(`axe Playwright 版本必须为 ${EXPECTED_AXE_VERSION}`);
+    }
     if (typeof AxeBuilder !== 'function') throw new Error('@axe-core/playwright 未导出 AxeBuilder');
 }
 
@@ -453,6 +487,10 @@ try {
         ...(useSystemEdge ? { executablePath: edgeExecutable } : {}),
         args: ['--disable-background-networking', '--disable-extensions'],
     });
+    const browserVersion = browser.version();
+    if (releaseMode && browserVersion !== EXPECTED_BROWSER_VERSION) {
+        throw new Error(`Chromium 版本必须为 ${EXPECTED_BROWSER_VERSION}，实际为 ${browserVersion}`);
+    }
     context = await browser.newContext({
         viewport: { width: 375, height: 812 },
         reducedMotion: 'reduce',
@@ -615,7 +653,7 @@ try {
         release_gate: !useSystemEdge && !skipAxe,
         playwright_version: playwrightPackage.version,
         axe_version: axeVersion,
-        browser_version: browser.version(),
+        browser_version: browserVersion,
         functional_flows: [
             'send', 'cancel', 'suggestion', 'project_switch', 'save_switch',
             'message_edit', 'snapshot_preview_restore', 'malicious_import',

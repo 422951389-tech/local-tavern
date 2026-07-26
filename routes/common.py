@@ -255,7 +255,11 @@ def apply_character_state(state: dict, parsed_char: dict):
         default=old_affinity,
     )
 
-    if parsed_char.get("inner_thought"): state["inner_thought"] = parsed_char["inner_thought"]
-    if parsed_char.get("outfit"): state["outfit"] = parsed_char["outfit"]
-    if parsed_char.get("posture"): state["posture"] = parsed_char["posture"]
-    if parsed_char.get("dialogue"): state["dialogue"] = parsed_char["dialogue"]
+    if parsed_char.get("inner_thought"):
+        state["inner_thought"] = parsed_char["inner_thought"]
+    if parsed_char.get("outfit"):
+        state["outfit"] = parsed_char["outfit"]
+    if parsed_char.get("posture"):
+        state["posture"] = parsed_char["posture"]
+    if parsed_char.get("dialogue"):
+        state["dialogue"] = parsed_char["dialogue"]

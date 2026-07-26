@@ -101,18 +101,26 @@ def test_direct_runtime_versions_remain_at_the_verified_baseline():
 def test_development_lock_uses_only_exact_verified_entries():
     direct = _active_requirements(REPO_ROOT / "requirements-dev.txt")
     locked = _active_requirements(REPO_ROOT / "requirements-dev.lock.txt")
-    assert direct == {"pytest": "8.3.5", "pytest-asyncio": "0.25.3"}
+    assert direct == {
+        "coverage": "7.15.2",
+        "pytest": "8.3.5",
+        "pytest-asyncio": "0.25.3",
+        "ruff": "0.15.22",
+    }
     assert direct.items() <= locked.items()
+    assert len(locked) == 8
     assert {"iniconfig", "packaging", "pluggy", "colorama"} <= locked.keys()
 
 
-def test_setup_is_explicit_python_312_venv_install_from_runtime_lock():
+def test_setup_is_explicit_python_312_venv_install_from_runtime_hash_lock():
     source = (REPO_ROOT / "setup.bat").read_text(encoding="utf-8")
     assert "%~dp0" in source
     assert "py -3.12" in source
     assert "-m venv" in source
     assert '"%~dp0.venv\\Scripts\\python.exe"' in source
-    assert '--requirement "%~dp0requirements.lock.txt"' in source
+    assert '--requirement "%~dp0requirements.hashes.txt"' in source
+    assert "--require-hashes" in source
+    assert "--only-binary=:all:" in source
     assert "from core.runtime_validation import assert_runtime" in source
     assert "uvicorn server:app" not in source
     assert (REPO_ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.12"

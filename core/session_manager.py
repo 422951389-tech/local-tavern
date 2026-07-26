@@ -28,9 +28,9 @@ from core.path_policy import (
 from core.session_store import (
     MutationContext,
     MutationResult,
-    RevisionConflict,
+    RevisionConflict as RevisionConflict,
     SessionStore,
-    atomic_write,
+    atomic_write as atomic_write,
 )
 from core.recovery_store import RecoveryStore
 

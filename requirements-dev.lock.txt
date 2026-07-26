@@ -1,8 +1,10 @@
-# Verified pytest toolchain closure. Runtime dependencies stay in requirements.lock.txt.
-# coverage, ruff and playwright await explicit reviewed versions; see requirements-dev.txt.
+# Python 3.12 / Windows development toolchain closure.
+# Runtime dependencies stay in requirements.lock.txt; identical overlap is explicit.
 colorama==0.4.6
+coverage==7.15.2
 iniconfig==2.3.0
 packaging==26.2
 pluggy==1.6.0
 pytest==8.3.5
 pytest-asyncio==0.25.3
+ruff==0.15.22

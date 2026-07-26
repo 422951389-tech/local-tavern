@@ -24,6 +24,7 @@ def manifest() -> dict:
         "private": True,
         "engines": {"node": "24.15.0", "npm": "11.12.1"},
         "packageManager": "npm@11.12.1",
+        "overrides": {"playwright-core": "1.61.1"},
         "devDependencies": {
             "@axe-core/playwright": "4.12.1",
             "playwright": "1.61.1",
@@ -42,6 +43,8 @@ def artifact(version: str) -> dict:
 
 def lock() -> dict:
     direct = manifest()["devDependencies"]
+    fsevents = artifact("2.3.2")
+    fsevents.update({"optional": True, "os": ["darwin"]})
     return {
         "name": "local-tavern-dev-tools",
         "version": "0.0.0",
@@ -55,18 +58,20 @@ def lock() -> dict:
             },
             "node_modules/@axe-core/playwright": artifact("4.12.1"),
             "node_modules/axe-core": artifact("4.12.1"),
+            "node_modules/fsevents": fsevents,
             "node_modules/playwright": artifact("1.61.1"),
             "node_modules/playwright-core": artifact("1.61.1"),
         },
     }
 
 
-def test_manifest_and_lock_require_an_exact_dev_only_four_package_closure():
+def test_manifest_and_lock_require_an_exact_dev_only_cross_platform_closure():
     direct = validate_manifest(manifest())
     locked = validate_lock(lock(), direct)
     assert locked == {
         "@axe-core/playwright": "4.12.1",
         "axe-core": "4.12.1",
+        "fsevents": "2.3.2",
         "playwright": "1.61.1",
         "playwright-core": "1.61.1",
     }
@@ -92,6 +97,10 @@ def test_manifest_rejects_ranges_production_dependencies_and_unsorted_names():
     }
     with pytest.raises(NodeLockValidationError, match="sorted"):
         validate_manifest(unsorted)
+    missing_override = manifest()
+    missing_override.pop("overrides")
+    with pytest.raises(NodeLockValidationError, match="overrides"):
+        validate_manifest(missing_override)
 
 
 def test_lock_rejects_non_registry_missing_integrity_and_extra_packages():
@@ -115,6 +124,14 @@ def test_lock_rejects_non_registry_missing_integrity_and_extra_packages():
     invalid = lock()
     invalid["packages"][""]["dependencies"] = None
     with pytest.raises(NodeLockValidationError, match="production"):
+        validate_lock(invalid, direct)
+    invalid = lock()
+    invalid["packages"]["node_modules/fsevents"].pop("optional")
+    with pytest.raises(NodeLockValidationError, match="optional"):
+        validate_lock(invalid, direct)
+    invalid = lock()
+    invalid["packages"]["node_modules/playwright-core"]["version"] = "1.62.0"
+    with pytest.raises(NodeLockValidationError, match="versions differ"):
         validate_lock(invalid, direct)
 
 

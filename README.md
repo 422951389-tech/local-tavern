@@ -5,7 +5,7 @@
 ## 首次安装
 
 1. 安装 Python 3.12 与 Windows Python Launcher（`py.exe`）。
-2. 双击 `setup.bat`。脚本会在项目目录创建独立 `.venv`，按 `requirements.lock.txt` 的精确版本安装并校验运行依赖。
+2. 双击 `setup.bat`。脚本会在项目目录创建独立 `.venv`，按 `requirements.hashes.txt` 的精确版本和 SHA-256 安装并校验运行依赖。
 3. 启动 Ollama，并确保至少有一个可用模型。
 4. 双击 `start.bat`。
 
@@ -40,6 +40,7 @@ C:\local-tavern\
 ├── stop_tavern.bat
 ├── requirements.txt           直接运行依赖
 ├── requirements.lock.txt      完整运行依赖闭包
+├── requirements.hashes.txt    Windows/Python 3.12 运行制品 SHA-256 锁
 ├── core\                       领域与基础设施代码
 ├── routes\                     HTTP API
 ├── web\                        前端
@@ -89,7 +90,7 @@ C:\local-tavern\
 - PyYAML 6.0.1
 - Pydantic 2.9.0
 
-完整传递依赖以 `requirements.lock.txt` 为准。开发锁目前覆盖 pytest 与 pytest-asyncio；coverage、Ruff 和 Playwright 尚未进入已验证的开发锁，不能据此声明完整浏览器与覆盖率门禁已建立。
+完整传递依赖以 `requirements.lock.txt` 为准，Windows x86-64 / Python 3.12 安装制品以 `requirements.hashes.txt` 为准。开发工具固定 coverage 7.15.2、pytest 8.3.5、pytest-asyncio 0.25.3、Ruff 0.15.22；浏览器门固定 Node 24.15.0、npm 11.12.1、Playwright 1.61.1 与 axe 4.12.1。
 
 ## 验证
 
@@ -97,6 +98,7 @@ C:\local-tavern\
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m compileall -q core routes tests server.py
 .\.venv\Scripts\python.exe -m pip check
+.\.venv-dev\Scripts\python.exe tools\quality_gate.py --release
 ```
 
 前端模块测试使用 Node.js 自带测试运行器，具体命令以仓库测试文件和项目上下文文档为准。

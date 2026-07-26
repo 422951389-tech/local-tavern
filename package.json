@@ -9,6 +9,9 @@
     "npm": "11.12.1"
   },
   "packageManager": "npm@11.12.1",
+  "overrides": {
+    "playwright-core": "1.61.1"
+  },
   "scripts": {
     "test:e2e": "node tests/browser_e2e.mjs",
     "test:e2e:preflight": "node tests/browser_e2e.mjs --system-edge --skip-axe"

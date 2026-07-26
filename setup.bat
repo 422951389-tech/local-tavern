@@ -29,7 +29,7 @@ if errorlevel 1 (
 )
 
 echo [依赖] 按精确运行时锁安装……
-"%~dp0.venv\Scripts\python.exe" -m pip install --no-deps --requirement "%~dp0requirements.lock.txt"
+"%~dp0.venv\Scripts\python.exe" -m pip install --no-deps --only-binary=:all: --require-hashes --requirement "%~dp0requirements.hashes.txt"
 if errorlevel 1 exit /b 1
 
 "%~dp0.venv\Scripts\python.exe" -m pip check

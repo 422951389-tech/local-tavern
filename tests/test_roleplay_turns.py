@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
 from datetime import datetime
 import json
 from uuid import uuid4

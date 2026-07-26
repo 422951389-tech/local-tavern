@@ -1687,14 +1687,13 @@ class LegacyMigrationService:
             current = by_path.get(item["target"])
             if current is None:
                 try:
-                    receipt = self._read_receipt(journal["plan_id"], item)
+                    self._read_receipt(journal["plan_id"], item)
                 except MigrationIntegrityError:
                     if item["state"] != "installing":
                         raise
                     # 发布目标前硬退出会留下不完整的内部凭据。该路径位于
                     # 专用保留目录，且目标尚不存在，可以精确移除后重试。
                     self._remove_receipt(journal["plan_id"], item)
-                    receipt = None
                 if action == "resume" and item["state"] in {
                     "installed", "removing", "removed",
                 }:

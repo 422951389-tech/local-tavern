@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from core import session_manager
 from core.session_store import RevisionConflict, SessionStore, atomic_write
 
 
@@ -338,3 +339,7 @@ def test_atomic_write_failure_keeps_previous_complete_file(tmp_path, monkeypatch
 
     assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1}
     assert list(tmp_path.glob("*.tmp")) == []
+
+def test_session_manager_explicitly_reexports_compatibility_primitives():
+    assert session_manager.RevisionConflict is RevisionConflict
+    assert session_manager.atomic_write is atomic_write

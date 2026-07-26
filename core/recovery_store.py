@@ -688,7 +688,7 @@ class RecoveryStore:
                     recovery_id = self.validate_recovery_id(entry_dir.name)
                     verified = self.get_verified(recovery_id)
                     manifest = verified.manifest
-                except (ValueError, RecoveryIntegrityError) as exc:
+                except (ValueError, RecoveryIntegrityError):
                     entries.append({
                         "recovery_id": None,
                         "category": current_category,
