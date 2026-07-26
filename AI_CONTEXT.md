@@ -2,8 +2,8 @@
 
 > **目的**：让下一个 AI 协作者在不询问用户的情况下，能完整理解这个项目并继续工作。
 > **创建日期**：2026-06-27
-> **最后更新**：2026-07-22（OPS-2 浏览器门工具链精确清单）
-> **当前状态**：阶段 A、B、C、D completed；OPS-1、UX-1、SEARCH-1、REL-1 completed；OPS-2 的离线锁/E2E/质量门及 Node 精确开发清单已落地，制品 hash/integrity 与全新环境发布验收 in_progress
+> **最后更新**：2026-07-27（SEC-2 与离线安全缺口收口）
+> **当前状态**：阶段 A、B、C、D completed；SEC-2、OPS-1、UX-1、SEARCH-1、REL-1 completed；OPS-2 的离线锁/E2E/质量门及 Node 精确开发清单已落地，制品 hash/integrity 与全新环境发布验收 in_progress
 > **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
 
 ---
@@ -175,11 +175,15 @@ C:\local-tavern\
 
 **REL-1 边界（提交 `4ed1025`）**：Session 新增纯人工维护的 `relationship_edges`；有向复合键执行 NFKC/casefold 唯一性，禁止自环，strength 为 0–100 严格整数，每边 1–20 条当前消息证据，整档最多 200 边/50 个不同证据。旧档缺字段纯读为空，坏旧边稳定 422 且不回写。自动 trim 保护证据，消息删除/truncate/regenerate 收敛证据，角色删除跨存档清边并受补偿/恢复保护；关系不进入 Prompt、parsed delta 或模型写回。前端 SVG 图与语义列表共享结构化模型，人工编辑和证据定位受 active-turn、single-flight、SessionRef、revision、UUID 与 DOM 目标门禁。pytest 521/521、Node 94/94、21 个 Web 模块语法通过；375×812 Edge 交互最小控件 44px、横向溢出 0、最终 revision 5，测试残留 0。
 
-**OPS-2 离线质量门边界（提交 `6dcb104`、`7d7ddd4`、`0dd52c4`）**：`dependency_locks.py` 已具备 runtime/dev 语义锁、hash 对应关系和精确环境集合校验；`.node-version`/私有 `package.json` 固定 Node 24.15.0、npm 11.12.1、Playwright 1.61.1 与 axe 4.12.1，生产保持零 npm 依赖。`node_dependency_lock.py` 关闭重复键、范围版本、生产依赖、registry/integrity、四包闭包、工具版本及安装树漂移。`quality_gate.py --preflight` 编排语义锁、pip、编译、逐文件 JS 语法、全量 Python/Node 测试与真实 data/backups/logs 前后清单，`--release` 额外强制 hash/integrity lock、精确 dev 环境、Ruff、branch coverage、Playwright 管理浏览器和 axe。回环 fake Ollama、显式隔离种子和 `browser_e2e.mjs` 覆盖 8 条 T6 功能流，阻断非回环请求；缓存 Playwright 1.60.0 + 系统 Edge 150 的预检在 375/600/768px 零横向溢出，但输出固定为 `reproducible_browser:false`、`axe_executed:false`、`release_gate:false`。质量门 preflight 30/30、pytest 543/543、Node 94/94 通过，真实目录摘要不变；完整 `package-lock.json`、Python hash lock、固定浏览器及正式发布验收仍等待外部下载确认。
+**SEC-2/P2 离线安全边界（提交 `73dd90e`）**：`core.api_errors` 统一 API 异常/写入错误为 v1 `error` envelope 与安全头；41 条写路由有显式清单门禁，422 不回显 input/ctx/url，未分类 500 不泄露异常正文，8 个 raw JSON 对象入口对坏 JSON/非对象在写盘前拒绝。前端生产 JS/MJS 的 HTML 解析型 sink 为 0，动态表单使用 DOM API、显式标签、状态、焦点、pending 与 single-flight。Prompt/parser 使用显式 `📖 场景旁白` 边界；角色卡、旧档、模型输出与 Session 写回 affinity 统一 `0..100`，单轮变化限制 `±10`。
+
+**OPS-2 离线质量门边界（提交 `6dcb104`、`7d7ddd4`、`0dd52c4`、`73dd90e`）**：`dependency_locks.py` 已具备 runtime/dev 语义锁、hash 对应关系和精确环境集合校验；`.node-version`/私有 `package.json` 固定 Node 24.15.0、npm 11.12.1、Playwright 1.61.1 与 axe 4.12.1，生产保持零 npm 依赖。`node_dependency_lock.py` 关闭重复键、范围版本、生产依赖、registry/integrity、四包闭包、工具版本及安装树漂移。`quality_gate.py --preflight` 编排语义锁、pip、编译、逐文件 JS 语法、全量 Python/Node 测试与真实 data/backups/logs 前后清单，`--release` 额外强制 hash/integrity lock、精确 dev 环境、Ruff、branch coverage、Playwright 管理浏览器和 axe。回环 fake Ollama、显式隔离种子和 `browser_e2e.mjs` 覆盖 8 条 T6 功能流，阻断非回环请求；本机既有 Codex runtime 的 Playwright 1.61.1 + 系统 Edge 150.0.4078.83 连续两轮通过，主页面 375/600/768px 与 6 类动态 Modal 在 375px 零横向溢出，但输出固定为 `reproducible_browser:false`、`axe_executed:false`、`release_gate:false`。质量门 preflight 31/31、pytest 579/579、Node 100/100 通过，真实目录摘要不变；完整 `package-lock.json`、Python hash lock、固定浏览器及正式发布验收仍等待外部下载确认。
 
 ---
 
 ## 5. API 完整列表
+
+**统一错误合约**：除 `/health/*` 探测与已开始 SSE 的流内 terminal 合约外，API HTTP 错误顶层仅含 `error`，其字段固定为 `schema_version:1`、`code`、`message`、`details`；前端 `ApiClient` 优先读取该结构，并仅为历史环境保留旧 `detail` 兼容。
 
 ### 模型与基础
 | 方法 | 路径 | 说明 |
@@ -386,9 +390,9 @@ active: true              # 是否默认出场
 |------|------|
 | 启动/运行 | `core/launcher.py`、`core/runtime_validation.py`、`core/logging_config.py`、`core/health.py`、`core/process_guard.py` |
 | 数据事务 | `core/session_store.py`、`core/recovery_store.py`、`core/backup_store.py`、`core/library_lock.py` |
-| 聊天/Prompt | `core/chat_turns.py`、`core/prompt_assembler.py`、`core/token_estimator.py`、`core/ollama_client.py` |
+| HTTP/聊天/Prompt | `core/api_errors.py`、`core/chat_turns.py`、`core/prompt_assembler.py`、`core/token_estimator.py`、`core/ollama_client.py` |
 | 记忆/世界/角色/搜索/关系 | `core/summary_lifecycle.py`、`core/worldbook_policy.py`、`core/roleplay_policy.py`、`core/search_service.py`、`core/relationship_edges.py`、`routes/search.py`、`routes/relationships.py` |
-| 前端 | `web/app.mjs`、`web/api-client.js`、`web/session-ref.js`、`web/turn-client.js`、`web/*.mjs` |
+| 前端 | `web/app.mjs`、`web/api-client.js`、`web/model-params.mjs`、`web/session-ref.js`、`web/turn-client.js`、`web/*.mjs` |
 | 安装锁 | `.python-version`、`.node-version`、`requirements.lock.txt`、`requirements-dev.lock.txt`、`package.json`、`setup.bat`；hash lock 与 `package-lock.json` 待正式生成 |
 | 质量门 | `tools/dependency_locks.py`、`tools/node_dependency_lock.py`、`tools/quality_gate.py`、`tests/e2e_fake_ollama.py`、`tests/browser_e2e.mjs` |
 
@@ -405,6 +409,6 @@ active: true              # 是否默认出场
 
 ---
 
-**最后更新**：2026-07-22  OPS-2 浏览器门工具链精确清单与 30/30 离线质量门
+**最后更新**：2026-07-27  SEC-2/P2 离线安全收口与 31/31 离线质量门
 **作者**：用户通过 AI 协作者完成
 **许可**：用户私有项目
