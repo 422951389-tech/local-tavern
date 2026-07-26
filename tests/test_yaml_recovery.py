@@ -48,7 +48,8 @@ def _sha256(content: bytes) -> str:
 
 def _api_error(response) -> dict:
     body = response.json()
-    return body.get("error") or body.get("detail")
+    assert set(body) == {"error"}, body
+    return body["error"]
 
 
 def test_yaml_corruption_fingerprint_uses_the_parsed_bytes(tmp_path, monkeypatch):
@@ -116,8 +117,8 @@ async def test_invalid_yaml_disk_id_does_not_offer_unusable_quarantine(app_clien
     assert response.status_code == 422, response.text
     error = _api_error(response)
     assert error["code"] == "data_corrupt"
-    assert error["entity_id"] == "bad name"
-    assert error["quarantine_available"] is False
+    assert error["details"]["entity_id"] == "bad name"
+    assert error["details"]["quarantine_available"] is False
 
 
 @pytest.mark.asyncio
@@ -149,12 +150,13 @@ async def test_yaml_get_reports_corruption_without_any_write(
     assert response.status_code == 422, response.text
     error = _api_error(response)
     assert error["code"] == "data_corrupt"
-    assert error["entity_type"] == entity_type
-    assert error["project"] == project
-    assert error["entity_id"] == entity_id
-    assert error["fingerprint"] == _sha256(content)
-    assert error["quarantine_available"] is True
-    assert "reason" not in error
+    details = error["details"]
+    assert details["entity_type"] == entity_type
+    assert details["project"] == project
+    assert details["entity_id"] == entity_id
+    assert details["fingerprint"] == _sha256(content)
+    assert details["quarantine_available"] is True
+    assert "reason" not in details
     assert str(path.resolve(strict=False)) not in response.text
     assert str(isolated_paths["root"]) not in response.text
     assert file_manifest(isolated_paths["root"]) == before
@@ -223,7 +225,7 @@ async def test_yaml_quarantine_is_cas_idempotent_and_restore_is_journaled(
 
     still_corrupt = await app_client.get(endpoint, params={"project": project})
     assert still_corrupt.status_code == 422
-    assert _api_error(still_corrupt)["fingerprint"] == _sha256(raw)
+    assert _api_error(still_corrupt)["details"]["fingerprint"] == _sha256(raw)
 
 
 @pytest.mark.asyncio

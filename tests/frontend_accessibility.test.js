@@ -97,11 +97,26 @@ test('Modal、卡片编辑器、下拉与 Thinking 具有窄屏边界契约', ()
     assert.match(STYLE, /@media\s*\(max-width:\s*375px\)[\s\S]*\.dropdown-panel\s*\{[\s\S]*bottom:\s*16px/);
     assert.match(STYLE, /@media\s*\(max-width:\s*375px\)[\s\S]*\.thinking-panel\s*\{[\s\S]*left:\s*16px/);
     assert.match(STYLE, /\.worldbook-editor\s*\{[\s\S]*width:\s*100%[\s\S]*max-width:\s*100%/);
-    assert.match(APP, /<button type="button" class="card-row/);
-    assert.doesNotMatch(APP, /<div class="card-row/);
+    assert.match(APP, /const row = domElement\('button', 'card-row'\)/);
+    assert.match(APP, /row\.type = 'button'/);
     assert.match(APP, /syncCardListSelection\(\);\s*renderForm\(\);/);
     assert.match(STYLE, /\.chat-stream\s*\{[\s\S]*?overflow-x:\s*hidden/);
     assert.match(STYLE, /\.msg \.content,[\s\S]*?overflow-wrap:\s*anywhere/);
+});
+
+test('动态表单、历史恢复和卡片编辑器具有标签、状态与单次提交契约', () => {
+    assert.match(APP, /function labeledModalTextInput\(/);
+    assert.match(APP, /label\.htmlFor = id/);
+    assert.match(APP, /label\.htmlFor = inp\.id/);
+    assert.match(APP, /status\.setAttribute\('aria-live', 'polite'\)/);
+    assert.match(APP, /function setCardPending\(/);
+    assert.match(APP, /modalController\.setPending\(cardPending\)/);
+    assert.match(APP, /if \(restorePending \|\| !isMounted\(\)\) return/);
+    assert.match(APP, /restore\.setAttribute\('aria-busy', 'true'\)/);
+    assert.match(APP, /modelSwitchGate\.acquire\(\)/);
+    assert.match(APP, /resetGate\.acquire\(\)/);
+    assert.match(STYLE, /\.modal-body input\[type="text"\]:focus-visible/);
+    assert.match(STYLE, /\.param-switch input:focus-visible \+ \.switch-slider/);
 });
 
 test('全局剧情搜索具有表单标签、实时状态、焦点和窄屏契约', () => {

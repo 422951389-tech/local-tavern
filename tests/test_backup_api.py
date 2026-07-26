@@ -82,9 +82,10 @@ def _seed_api_library(project: str) -> Path:
 
 def _error(response) -> dict:
     body = response.json()
-    detail = body.get("error") or body.get("detail")
-    assert isinstance(detail, dict), body
-    return detail
+    assert set(body) == {"error"}, body
+    error = body["error"]
+    assert isinstance(error, dict), body
+    return error
 
 
 def _assert_no_absolute_path(response) -> None:

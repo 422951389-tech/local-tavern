@@ -9,6 +9,7 @@ from core.prompt_editor import (
     reset_prompt_to_default,
     write_prompt,
 )
+from routes.common import _json_object
 
 router = APIRouter()
 
@@ -20,8 +21,16 @@ async def api_get_prompts():
 
 @router.put("/api/prompts/{name}")
 async def api_save_prompt(name: str, req: Request):
-    body = await req.json()
+    body = await _json_object(req)
     content = body.get("content", "")
+    if not isinstance(content, str):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_request_body",
+                "message": "prompt content 必须是字符串",
+            },
+        )
     if name not in VALID_NAMES:
         raise HTTPException(400, "未知 prompt 名")
     await asyncio.to_thread(write_prompt, name, content)

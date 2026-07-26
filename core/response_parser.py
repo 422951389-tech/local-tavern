@@ -11,6 +11,16 @@ import re
 from typing import Optional
 
 
+_NARRATION_RE = re.compile(
+    r"^[ \t]*📖[ \t]*场景旁白"
+    r"(?:[ \t]*[:：][ \t]*(?P<inline>[^\r\n]*))?"
+    r"[ \t]*\r?\n"
+    r"(?P<body>.*?)"
+    r"(?=^[ \t]*💡[ \t]*行动建议[ \t]*\r?$)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
 def parse_response(raw: str) -> dict:
     """解析 AI 回复
 
@@ -49,7 +59,7 @@ def parse_response(raw: str) -> dict:
 
     # 1. 解析场景元数据条（📍 开头到第一个 🎭 之前）
     scene_match = re.search(
-        r"📍.*?(?=🎭|💡|$)",
+        r"📍.*?(?=🎭|📖|💡|$)",
         text,
         re.DOTALL,
     )
@@ -67,7 +77,20 @@ def parse_response(raw: str) -> dict:
         if char_data:
             result["characters"].append(char_data)
 
-    # 3. 解析行动建议（💡 行动建议 之后的内容）
+    # 3. 解析显式场景旁白。旁白范围必须由行动建议标签闭合，避免吞掉尾部文本。
+    narration_match = _NARRATION_RE.search(text)
+    if narration_match:
+        narration_parts = [
+            part.strip()
+            for part in (
+                narration_match.group("inline") or "",
+                narration_match.group("body") or "",
+            )
+            if part.strip()
+        ]
+        result["narration"] = "\n".join(narration_parts)
+
+    # 4. 解析行动建议（💡 行动建议 之后的内容）
     sug_match = re.search(
         r"💡\s*行动建议\s*\n(.*?)(?=$|```)",
         text,
@@ -136,11 +159,11 @@ def _parse_character_block(block: str) -> Optional[dict]:
     block_normalized = re.sub(r"\n\s*💬", "\n💬", block_normalized)
 
     # 角色名和好感度：🎭 xxx | 💝 ...
-    header_match = re.search(r"🎭\s*([^|\n]+?)\s*\|\s*💝\s*([█░▏▎▍▌▋▊▉\s]*?[█░▏▎▍▌▋▊▉]+\s*)(\d+)%?", block_normalized)
+    header_match = re.search(r"🎭\s*([^|\n]+?)\s*\|\s*💝\s*([█░▏▎▍▌▋▊▉\s]*?[█░▏▎▍▌▋▊▉]+\s*)([+-]?\d+)%?", block_normalized)
     if not header_match:
         # 退化：只匹配 🎭 xxx 后面某处有 💝 和数字
         fallback_name = re.search(r"🎭\s*(\S[^\n|]*?)\s*$", block_normalized, re.MULTILINE)
-        fallback_aff = re.search(r"💝[^\d]*(\d+)%?", block_normalized)
+        fallback_aff = re.search(r"💝[^\d+\-]*?([+-]?\d+)%?", block_normalized)
         if not fallback_name or not fallback_aff:
             return None
         name = fallback_name.group(1).strip()
@@ -177,7 +200,7 @@ def _parse_character_block(block: str) -> Optional[dict]:
     # D4：name 长度上限防御（防止幻觉输出垃圾）
     if len(name) > 50:
         name = name[:50]
-    affinity = max(-100, min(100, affinity))  # 限制在 [-100, 100]
+    affinity = max(0, min(100, affinity))  # 好感度统一限制在 [0, 100]
 
     return {
         "name": name,

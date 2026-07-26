@@ -14,6 +14,7 @@
             this.code = options.code || 'request_failed';
             this.status = Number.isInteger(options.status) ? options.status : 0;
             this.payload = options.payload ?? null;
+            this.details = options.details ?? payloadDetails(this.payload, null);
             this.method = options.method || '';
             this.url = options.url || '';
             this.cause = options.cause;
@@ -30,11 +31,11 @@
 
     function payloadCode(payload, fallback = 'request_failed') {
         if (!payload || typeof payload !== 'object') return fallback;
-        if (payload.detail && typeof payload.detail === 'object' && payload.detail.code) {
-            return String(payload.detail.code);
-        }
         if (payload.error && typeof payload.error === 'object' && payload.error.code) {
             return String(payload.error.code);
+        }
+        if (payload.detail && typeof payload.detail === 'object' && payload.detail.code) {
+            return String(payload.detail.code);
         }
         if (typeof payload.code === 'string') return payload.code;
         return fallback;
@@ -43,6 +44,10 @@
     function payloadMessage(payload, fallback = '请求失败') {
         if (!payload) return fallback;
         if (typeof payload === 'string') return payload || fallback;
+        if (typeof payload.error === 'string') return payload.error || fallback;
+        if (payload.error && typeof payload.error === 'object') {
+            return payload.error.message || payload.error.code || fallback;
+        }
         if (typeof payload.detail === 'string') return payload.detail;
         if (Array.isArray(payload.detail)) {
             const messages = payload.detail
@@ -53,11 +58,24 @@
         if (payload.detail && typeof payload.detail === 'object') {
             return payload.detail.message || payload.detail.code || fallback;
         }
-        if (typeof payload.error === 'string') return payload.error;
-        if (payload.error && typeof payload.error === 'object') {
-            return payload.error.message || payload.error.code || fallback;
-        }
         if (typeof payload.message === 'string') return payload.message;
+        return fallback;
+    }
+
+    function payloadDetails(payload, fallback = null) {
+        if (!payload || typeof payload !== 'object') return fallback;
+        if (payload.error && typeof payload.error === 'object'
+            && payload.error.details && typeof payload.error.details === 'object'
+            && !Array.isArray(payload.error.details)) {
+            return payload.error.details;
+        }
+        if (payload.detail && typeof payload.detail === 'object' && !Array.isArray(payload.detail)) {
+            if (payload.detail.details && typeof payload.detail.details === 'object'
+                && !Array.isArray(payload.detail.details)) {
+                return payload.detail.details;
+            }
+            return payload.detail;
+        }
         return fallback;
     }
 
@@ -347,6 +365,7 @@
         ApiClient,
         ApiError,
         payloadCode,
+        payloadDetails,
         payloadMessage,
         parseJsonText,
         parseSseFrame,

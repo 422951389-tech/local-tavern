@@ -11,6 +11,7 @@ from core.destructive_service import DestructiveOperationError
 from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
 from core.session_manager import RevisionConflict, delete_character_data
 from routes.common import (
+    _json_object,
     _norm_save,
     _norm_project,
     _raise_destructive_error,
@@ -37,8 +38,16 @@ async def api_character_schema():
 @router.put("/api/characters/{char_id}")
 async def api_save_character(char_id: str, req: Request, project: str = Query("默认项目")):
     project = _norm_project(project)
-    body = await req.json()
+    body = await _json_object(req)
     data = body.get("data", {})
+    if not isinstance(data, dict):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_request_body",
+                "message": "角色卡 data 必须是 JSON 对象",
+            },
+        )
     try:
         save_character(project, char_id, data)
         return {"saved": True, "id": char_id}

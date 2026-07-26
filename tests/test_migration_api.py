@@ -84,9 +84,10 @@ def _seed_legacy_api(target_project: str) -> dict:
 
 def _error(response) -> dict:
     body = response.json()
-    detail = body.get("error") or body.get("detail")
-    assert isinstance(detail, dict), body
-    return detail
+    assert set(body) == {"error"}, body
+    error = body["error"]
+    assert isinstance(error, dict), body
+    return error
 
 
 def _assert_private(response) -> None:
@@ -254,6 +255,8 @@ async def test_recover_api_rejects_invalid_action_with_structured_error(app_clie
 
     assert response.status_code == 400, response.text
     assert _error(response) == {
+        "schema_version": 1,
         "code": "invalid_migration_request",
         "message": "迁移请求体无效",
+        "details": {},
     }

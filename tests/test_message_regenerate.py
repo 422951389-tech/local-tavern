@@ -101,8 +101,9 @@ async def _wait_terminal(app_client, turn_id: str, timeout: float = 3.0) -> dict
 
 def _error_code(response) -> str | None:
     payload = response.json()
-    detail = payload.get("detail", payload.get("error"))
-    return detail.get("code") if isinstance(detail, dict) else None
+    assert set(payload) == {"error"}, payload
+    error = payload["error"]
+    return error.get("code") if isinstance(error, dict) else None
 
 
 def _snapshot_paths(project: str) -> list:

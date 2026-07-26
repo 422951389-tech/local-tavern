@@ -55,6 +55,8 @@ from core.worldbook_policy import (
 ROOT_DIR = PROJECTS_DIR
 OLD_DATA_DIR = DATA_DIR  # 只读兼容别名；迁移必须通过 LegacyMigrationService 显式执行。
 _YAML_WRITE_LOCK = threading.RLock()
+MIN_AFFINITY = 0
+MAX_AFFINITY = 100
 
 # 角色卡 schema：单一事实源，前后端共用。
 # 前端编辑器从此 schema 渲染表单，避免前后端字段表漂移。
@@ -110,7 +112,7 @@ CHARACTER_SCHEMA = {
             "label": "初始状态",
             "builtin": True,
             "fields": [
-                {"key": "initial_stats.affinity", "label": "好感度 (0-100)", "type": "number", "min": 0, "max": 100},
+                {"key": "initial_stats.affinity", "label": "好感度 (0-100)", "type": "number", "min": MIN_AFFINITY, "max": MAX_AFFINITY},
                 {"key": "initial_stats.mood", "label": "初始心情", "type": "text"},
                 {"key": "initial_stats.posture", "label": "初始姿势", "type": "text"},
                 {"key": "active", "label": "默认出场", "type": "checkbox", "checkboxLabel": "当前角色参与场景"},
@@ -386,11 +388,41 @@ def _safe_id(char_id: str) -> str:
 
 # ========== 角色卡 ==========
 
+def _is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and (not isinstance(value, float) or math.isfinite(value))
+    )
+
+
+def validate_affinity(value: object) -> int | float:
+    """校验写入角色卡的好感度，不对错误输入做静默修正。"""
+    if not _is_finite_number(value):
+        raise ValueError("initial_stats.affinity 必须是 0 到 100 的有限数字")
+    if not MIN_AFFINITY <= value <= MAX_AFFINITY:
+        raise ValueError("initial_stats.affinity 必须在 0 到 100 之间")
+    return value
+
+
+def normalize_affinity(value: object, *, default: int | float = 0) -> int | float:
+    """兼容旧存档/模型输出：回退到安全默认值并钳制到合法区间。"""
+    fallback = default if _is_finite_number(default) else MIN_AFFINITY
+    normalized = value if _is_finite_number(value) else fallback
+    return max(MIN_AFFINITY, min(MAX_AFFINITY, normalized))
+
+
 def _normalize_character_card(data: dict) -> dict:
     normalized = dict(data)
     normalized["chattiness"] = normalize_chattiness(
         normalized.get("chattiness", DEFAULT_CHATTINESS)
     )
+    initial_stats = normalized.get("initial_stats", {})
+    initial_stats = dict(initial_stats) if isinstance(initial_stats, dict) else {}
+    initial_stats["affinity"] = normalize_affinity(
+        initial_stats.get("affinity", MIN_AFFINITY)
+    )
+    normalized["initial_stats"] = initial_stats
     return normalized
 
 def load_character(project: str, char_id: str) -> dict:
@@ -434,6 +466,15 @@ def save_character(project: str, char_id: str, data: dict) -> Path:
     data["chattiness"] = validate_chattiness(
         data.get("chattiness", DEFAULT_CHATTINESS)
     )
+    if "initial_stats" in data:
+        if not isinstance(data["initial_stats"], dict):
+            raise ValueError("initial_stats 必须是对象")
+        initial_stats = dict(data["initial_stats"])
+        if "affinity" in initial_stats:
+            initial_stats["affinity"] = validate_affinity(
+                initial_stats["affinity"]
+            )
+        data["initial_stats"] = initial_stats
     with yaml_write_transaction():
         d = resolve_under(ensure_project(project), "characters")
         path = resolve_under(d, f"{char_id}.yaml")

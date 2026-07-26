@@ -6,6 +6,7 @@ from core.destructive_service import DestructiveOperationError
 from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
 from core.session_manager import RevisionConflict, delete_user_data
 from routes.common import (
+    _json_object,
     _norm_save,
     _norm_project,
     _raise_destructive_error,
@@ -25,8 +26,16 @@ async def api_get_user(project: str = Query("默认项目")):
 @router.put("/api/user")
 async def api_save_user(req: Request, project: str = Query("默认项目")):
     project = _norm_project(project)
-    body = await req.json()
+    body = await _json_object(req)
     data = body.get("data", {})
+    if not isinstance(data, dict):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_request_body",
+                "message": "用户档案 data 必须是 JSON 对象",
+            },
+        )
     try:
         save_user_profile(project, data)
         return {"saved": True, "id": data.get("id", "user")}

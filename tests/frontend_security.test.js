@@ -38,7 +38,7 @@ test('client import preflight enforces extension and 8 MiB limit', () => {
     assert.match(security.validateImportFile({ name: 'save.json', size: 9 * 1024 * 1024 }), /8 MiB/);
 });
 
-test('security module loads before the ES module app and app has one escaping entry point', () => {
+test('security module loads before the ES module app', () => {
     const root = path.resolve(__dirname, '..');
     const html = fs.readFileSync(path.join(root, 'web', 'index.html'), 'utf8');
     const app = fs.readFileSync(path.join(root, 'web', 'app.mjs'), 'utf8');
@@ -47,9 +47,18 @@ test('security module loads before the ES module app and app has one escaping en
     assert.ok(html.indexOf('session-ref.js') < html.indexOf('app.mjs'));
     assert.ok(html.indexOf('turn-client.js') < html.indexOf('app.mjs'));
     assert.match(html, /<script\s+type="module"\s+src="\/static\/app\.mjs/);
-    assert.equal((app.match(/function escapeHtml\s*\(/g) || []).length, 1);
     assert.match(app, /aria-live/);
     assert.doesNotMatch(app, /\$\{c\.affinity\}/);
+});
+
+test('全部前端生产模块禁用 HTML 解析型注入入口', () => {
+    const webRoot = path.resolve(__dirname, '..', 'web');
+    const files = fs.readdirSync(webRoot).filter(name => /\.(?:js|mjs)$/.test(name));
+    const forbidden = /\.(?:innerHTML|outerHTML)\b|\.insertAdjacentHTML\s*\(|\bdocument\.write\s*\(/;
+    for (const name of files) {
+        const source = fs.readFileSync(path.join(webRoot, name), 'utf8');
+        assert.doesNotMatch(source, forbidden, name);
+    }
 });
 
 test('session writes use ApiClient, immutable refs and persistent turn APIs', () => {
@@ -66,6 +75,7 @@ test('session writes use ApiClient, immutable refs and persistent turn APIs', ()
     assert.match(app, /function commitSessionState\(/);
     assert.match(app, /function commitSummaryRefresh\(/);
     assert.doesNotMatch(app, /chat:\s*['"]\/api\/chat['"]/);
+    assert.match(app, /const details = error\.details/);
     assert.equal((app.match(/function enterMessageEditMode\s*\(/g) || []).length, 1);
     assert.equal((app.match(/function showSummaryEditor\s*\(/g) || []).length, 1);
     assert.doesNotMatch(app, /function enterEditMode\s*\(/);

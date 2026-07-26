@@ -195,8 +195,9 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(stale.status_code, 409, stale.text)
-        self.assertEqual(stale.json()["detail"], {
-            "code": "revision_conflict",
+        error = stale.json()["error"]
+        self.assertEqual(error["code"], "revision_conflict")
+        self.assertEqual(error["details"], {
             "expected_revision": created["revision"],
             "current_revision": created["revision"] + 1,
         })

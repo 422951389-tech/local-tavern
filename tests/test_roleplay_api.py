@@ -85,6 +85,77 @@ async def test_legacy_character_defaults_schema_and_strict_save(
         assert path.read_bytes() == before_invalid
 
 
+@pytest.mark.asyncio
+async def test_character_affinity_save_is_strict_bounded_and_zero_write(
+    app_client,
+    isolated_paths,
+):
+    project = "roleplay_affinity"
+    ensure_project(project)
+    character_dir = isolated_paths["projects"] / project / "characters"
+    path = character_dir / "affinity.yaml"
+    base = {"id": "affinity", "name": "边界角色"}
+
+    for affinity in (0, 50.5, 100):
+        response = await app_client.put(
+            "/api/characters/affinity",
+            params={"project": project},
+            json={
+                "data": {
+                    **base,
+                    "initial_stats": {"affinity": affinity},
+                }
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert yaml.safe_load(path.read_text(encoding="utf-8"))[
+            "initial_stats"
+        ]["affinity"] == affinity
+
+    def snapshot_character_dir() -> dict[str, bytes]:
+        return {
+            item.name: item.read_bytes()
+            for item in character_dir.iterdir()
+            if item.is_file()
+        }
+
+    before_invalid = snapshot_character_dir()
+    invalid_affinities = (
+        True,
+        "50",
+        None,
+        -1,
+        101,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    )
+    for affinity in invalid_affinities:
+        payload = {
+            "data": {
+                **base,
+                "initial_stats": {"affinity": affinity},
+            }
+        }
+        response = await app_client.put(
+            "/api/characters/affinity",
+            params={"project": project},
+            content=json.dumps(payload, ensure_ascii=False, allow_nan=True),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 400, response.text
+        assert snapshot_character_dir() == before_invalid
+
+    for initial_stats in (True, "invalid", [], None):
+        response = await app_client.put(
+            "/api/characters/affinity",
+            params={"project": project},
+            json={"data": {**base, "initial_stats": initial_stats}},
+        )
+        assert response.status_code == 400, response.text
+        assert snapshot_character_dir() == before_invalid
+
+
 def test_import_roleplay_fields_are_strict_and_bounded():
     base = {
         "session_id": "roleplay_import",
@@ -194,7 +265,7 @@ async def test_roleplay_patch_success_boundaries_and_cas_are_atomic(
             **body,
         })
         assert response.status_code == 409, response.text
-        assert response.json()["detail"]["code"] == "revision_conflict"
+        assert response.json()["error"]["code"] == "revision_conflict"
         assert path.read_bytes() == before
 
 

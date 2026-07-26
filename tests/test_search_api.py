@@ -120,9 +120,10 @@ class SearchApiTests(unittest.IsolatedAsyncioTestCase):
     def assert_error_code(self, response: httpx.Response, status: int, code: str) -> None:
         self.assertEqual(response.status_code, status, response.text)
         body = response.json()
-        detail = body.get("detail", body)
-        self.assertIsInstance(detail, dict, body)
-        self.assertEqual(detail.get("code"), code, body)
+        self.assertEqual(set(body), {"error"}, body)
+        error = body["error"]
+        self.assertIsInstance(error, dict, body)
+        self.assertEqual(error.get("code"), code, body)
 
     def assert_top_level_contract(self, body: dict) -> None:
         self.assertEqual(set(body), {

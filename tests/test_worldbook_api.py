@@ -289,7 +289,7 @@ async def test_yml_restore_rejects_sibling_yaml_without_overwrite(
         json={},
     )
     assert restored.status_code == 409, restored.text
-    assert restored.json()["detail"]["code"] == "target_changed"
+    assert restored.json()["error"]["code"] == "target_changed"
     assert yaml_path.read_bytes() == before
     assert not yml_path.exists()
 
@@ -308,7 +308,7 @@ async def test_corrupt_yml_quarantine_restore_keeps_exact_extension(
     corrupt = await app_client.get("/api/worldbook", params={"project": project})
     assert corrupt.status_code == 422, corrupt.text
     error = corrupt.json()["error"]
-    assert error["fingerprint"] == hashlib.sha256(raw).hexdigest()
+    assert error["details"]["fingerprint"] == hashlib.sha256(raw).hexdigest()
 
     quarantined = await app_client.post(
         "/api/recovery/quarantine",
@@ -316,7 +316,7 @@ async def test_corrupt_yml_quarantine_restore_keeps_exact_extension(
             "entity_type": "worldbook",
             "project": project,
             "entity_id": "broken",
-            "fingerprint": error["fingerprint"],
+            "fingerprint": error["details"]["fingerprint"],
         },
     )
     assert quarantined.status_code == 200, quarantined.text
@@ -331,7 +331,7 @@ async def test_corrupt_yml_quarantine_restore_keeps_exact_extension(
         json={},
     )
     assert blocked.status_code == 409, blocked.text
-    assert blocked.json()["detail"]["code"] == "target_exists"
+    assert blocked.json()["error"]["code"] == "target_exists"
     assert sibling.is_file()
     assert not source.exists()
 

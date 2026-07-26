@@ -1,12 +1,17 @@
 """server.py 与路由模块共享的依赖与工具函数。"""
+import json
 from typing import Annotated, Optional
 from uuid import UUID
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, field_validator
 
 from core.ollama_client import get_client
-from core.character_loader import list_characters, load_user_profile
+from core.character_loader import (
+    list_characters,
+    load_user_profile,
+    normalize_affinity,
+)
 from core.config import DEFAULT_SAVE
 from core.destructive_service import DestructiveOperationError
 from core.recovery_store import RecoveryIntegrityError
@@ -119,6 +124,34 @@ class MessageAction(BaseModel):
             raise ValueError("message_id 必须是 UUID") from exc
 
 
+async def _json_object(
+    req: Request,
+    *,
+    object_error_code: str = "invalid_request_body",
+    object_error_message: str = "请求体必须是 JSON 对象",
+) -> dict:
+    """仅在请求边界解析 JSON 对象，失败时不回显原始字节。"""
+    try:
+        body = await req.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_json_body",
+                "message": "请求体必须是有效 JSON 对象",
+            },
+        ) from exc
+    if not isinstance(body, dict):
+        raise HTTPException(
+            400,
+            detail={
+                "code": object_error_code,
+                "message": object_error_message,
+            },
+        )
+    return body
+
+
 def _expected_revision(body: dict) -> int:
     value = body.get("expected_revision")
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -131,6 +164,7 @@ def _raise_revision_conflict(exc: RevisionConflict) -> None:
         409,
         detail={
             "code": "revision_conflict",
+            "message": "存档版本已更新，请重新加载后再试",
             "expected_revision": exc.expected,
             "current_revision": exc.current,
         },
@@ -183,9 +217,10 @@ async def _initialize_session_from_profiles(session: dict, project: str):
     for c in list_characters(project):
         if c.get("active", True):
             stats = c.get("initial_stats", {})
+            stats = stats if isinstance(stats, dict) else {}
             session["characters_state"][c["id"]] = {
                 "name": c.get("name", c["id"]),
-                "affinity": stats.get("affinity", 0),
+                "affinity": normalize_affinity(stats.get("affinity", 0)),
                 "mood": stats.get("mood", ""),
                 "inner_thought": "",
                 "outfit": c.get("appearance", {}).get("outfit", ""),
@@ -209,10 +244,16 @@ def apply_character_state(state: dict, parsed_char: dict):
 
     C3：affinity 单轮变化钳制 ±10，防止模型跳变。
     """
-    old_affinity = state.get("affinity", 0)
-    new_affinity = parsed_char.get("affinity", old_affinity)
+    old_affinity = normalize_affinity(state.get("affinity", 0))
+    new_affinity = normalize_affinity(
+        parsed_char.get("affinity", old_affinity),
+        default=old_affinity,
+    )
     delta = max(-10, min(10, new_affinity - old_affinity))
-    state["affinity"] = old_affinity + delta
+    state["affinity"] = normalize_affinity(
+        old_affinity + delta,
+        default=old_affinity,
+    )
 
     if parsed_char.get("inner_thought"): state["inner_thought"] = parsed_char["inner_thought"]
     if parsed_char.get("outfit"): state["outfit"] = parsed_char["outfit"]

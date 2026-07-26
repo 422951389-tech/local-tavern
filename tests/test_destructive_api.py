@@ -80,7 +80,8 @@ async def _seed_project(project: str, *, saves: tuple[str, ...] = SAVE_IDS) -> d
 
 def _error(response) -> dict:
     body = response.json()
-    error = body.get("error") or body.get("detail")
+    assert set(body) == {"error"}, body
+    error = body["error"]
     assert isinstance(error, dict), body
     return error
 

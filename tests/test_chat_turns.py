@@ -109,6 +109,7 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
         "session_delta",
     }
     assert "session" not in parsed_event
+    assert parsed_event["parsed"]["narration"] == "隔离测试的灯光保持稳定。"
     assert set(parsed_event["session_delta"]) == {
         "scene_meta",
         "characters_state",

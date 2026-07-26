@@ -41,7 +41,7 @@ async def test_settings_and_prompts_write_only_to_sandbox(app_client, isolated_p
     real_summary_hash_before = hashlib.sha256(real_summary.read_bytes()).hexdigest()
     original_summary = (isolated_paths["prompts"] / "summary.md").read_text(encoding="utf-8")
 
-    response = await app_client.put("/api/settings", json={"temperature": 0.25, "ignored": "x"})
+    response = await app_client.put("/api/settings", json={"temperature": 0.25})
     assert response.status_code == 200
     assert isolated_paths["settings"].exists()
     assert isolated_paths["settings"].is_relative_to(isolated_paths["root"])

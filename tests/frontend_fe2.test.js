@@ -331,6 +331,18 @@ test('Modal 双击确认只写一次，pending 期间取消和 Escape 均无效'
     assert.equal(calls, 1);
 });
 
+test('Modal 字符串正文仅作为纯文本呈现', async () => {
+    const { createModalController } = await loadModule('modal');
+    const { documentRef, elements } = modalFixture();
+    const malicious = '<img src=x onerror="globalThis.pwned=true"><script>alert(1)</script>';
+    const controller = createModalController(elements, { documentRef });
+
+    assert.equal(controller.show({ title: '纯文本', body: malicious }), true);
+    assert.equal(elements.body.textContent, malicious);
+    assert.equal(elements.body.children.length, 0);
+    assert.equal(elements.body.innerHTML, '');
+});
+
 function fieldRow(documentRef, { key = '', type = '', array = false, value = '', checked = false, customKey }) {
     const row = documentRef.createElement('div');
     row.className = 'fld-row';

@@ -94,8 +94,9 @@ async def _wait_summary(project: str, save: str, summary_id: str, status: str) -
 
 def _detail_code(response) -> str | None:
     payload = response.json()
-    detail = payload.get("detail") or payload.get("error") or {}
-    return detail.get("code") if isinstance(detail, dict) else None
+    assert set(payload) == {"error"}, payload
+    error = payload["error"]
+    return error.get("code") if isinstance(error, dict) else None
 
 
 @pytest.mark.parametrize(

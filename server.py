@@ -15,9 +15,15 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from core.active_turns import ActiveTurnConflict, TurnMaintenanceConflict
+from core.api_errors import (
+    apply_security_headers,
+    error_response,
+    http_error_response,
+    validation_error_detail,
+)
 from core.backup_store import BackupError
 from core.backup_scheduler import run_backup_scheduler
 from core.config import (
@@ -159,46 +165,29 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Local Tavern", lifespan=lifespan)
 
 
-def _utf8_safe_validation_value(value):
-    if isinstance(value, str):
-        return value.encode("utf-8", errors="replace").decode("utf-8")
-    if isinstance(value, list):
-        return [_utf8_safe_validation_value(item) for item in value]
-    if isinstance(value, tuple):
-        return [_utf8_safe_validation_value(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            _utf8_safe_validation_value(key): _utf8_safe_validation_value(item)
-            for key, item in value.items()
-        }
-    return value
+@app.exception_handler(StarletteHTTPException)
+async def handle_http_exception(_request: Request, exc: StarletteHTTPException):
+    return http_error_response(
+        exc.status_code,
+        exc.detail,
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(RequestValidationError)
 async def handle_request_validation(_request: Request, exc: RequestValidationError):
     """422 只返回定位与原因，不回显原始输入或异常上下文。"""
-    errors = [
-        {
-            key: error[key]
-            for key in ("type", "loc", "msg")
-            if key in error
-        }
-        for error in exc.errors()
-    ]
-    return JSONResponse(
-        status_code=422,
-        content={"detail": _utf8_safe_validation_value(errors)},
-    )
+    return http_error_response(422, validation_error_detail(exc.errors()))
 
 
 @app.exception_handler(ActiveTurnConflict)
 async def handle_active_turn_conflict(_request: Request, exc: ActiveTurnConflict):
-    return JSONResponse(status_code=409, content={"error": exc.as_detail()})
+    return http_error_response(409, exc.as_detail())
 
 
 @app.exception_handler(TurnMaintenanceConflict)
 async def handle_turn_maintenance(_request: Request, exc: TurnMaintenanceConflict):
-    return JSONResponse(status_code=503, content={"error": exc.as_detail()})
+    return http_error_response(503, exc.as_detail())
 
 
 @app.exception_handler(DataCorruptionError)
@@ -207,7 +196,25 @@ async def handle_data_corruption(_request: Request, exc: DataCorruptionError):
     detail = exc.as_detail()
     detail["message"] = "项目数据损坏，请先隔离原件后再恢复"
     detail.pop("reason", None)
-    return JSONResponse(status_code=422, content={"error": detail})
+    return http_error_response(422, detail)
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, exc: Exception):
+    """未分类异常只在服务端记录，响应不暴露路径或异常文本。"""
+    logger.error(
+        "api_unhandled method=%s path=%s exception=%s",
+        request.method,
+        request.url.path,
+        type(exc).__name__,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    return error_response(
+        500,
+        "internal_error",
+        "服务内部错误",
+        {},
+    )
 
 
 @app.middleware("http")
@@ -218,15 +225,11 @@ async def enforce_restore_maintenance(request: Request, call_next):
 
         maintenance = maintenance_operation()
         if maintenance is not None:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": {
-                        "code": "turn_maintenance",
-                        "message": "整库维护期间写入已暂停",
-                        "operation": maintenance,
-                    }
-                },
+            return error_response(
+                503,
+                "turn_maintenance",
+                "整库维护期间写入已暂停",
+                {"operation": maintenance},
             )
         parts = request.url.path.strip("/").split("/")
         is_recovery_action = (
@@ -241,25 +244,18 @@ async def enforce_restore_maintenance(request: Request, call_next):
                 )
             except (BackupError, OSError, ValueError):
                 logger.exception("整库恢复维护态检测失败")
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": {
-                            "code": "restore_maintenance_check_failed",
-                            "message": "整库恢复状态无法验证，写入已暂停",
-                        }
-                    },
+                return error_response(
+                    503,
+                    "restore_maintenance_check_failed",
+                    "整库恢复状态无法验证，写入已暂停",
+                    {},
                 )
             if pending:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": {
-                            "code": "restore_maintenance_required",
-                            "message": "存在未完成的整库恢复，写入已暂停",
-                            "restore_ids": pending,
-                        }
-                    },
+                return error_response(
+                    503,
+                    "restore_maintenance_required",
+                    "存在未完成的整库恢复，写入已暂停",
+                    {"restore_ids": pending},
                 )
             from core.chat_turns import get_turn_coordinator
 
@@ -267,14 +263,11 @@ async def enforce_restore_maintenance(request: Request, call_next):
                 await get_turn_coordinator().ensure_recovered()
             except Exception:
                 logger.exception("中断 turn 恢复失败")
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": {
-                            "code": "turn_recovery_failed",
-                            "message": "中断聊天状态未完成恢复，写入已暂停",
-                        }
-                    },
+                return error_response(
+                    503,
+                    "turn_recovery_failed",
+                    "中断聊天状态未完成恢复，写入已暂停",
+                    {},
                 )
     return await call_next(request)
 
@@ -282,22 +275,7 @@ async def enforce_restore_maintenance(request: Request, call_next):
 @app.middleware("http")
 async def add_security_headers(request, call_next):
     response = await call_next(request)
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "script-src 'self'; "
-        "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data: blob:; "
-        "font-src 'self' data:; "
-        "connect-src 'self'; "
-        "object-src 'none'; "
-        "base-uri 'none'; "
-        "frame-ancestors 'none'; "
-        "form-action 'self'"
-    )
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    return response
+    return apply_security_headers(response)
 
 # 静态文件（需在 include_router 之前 mount，避免被路由覆盖）
 static.mount_static(app)

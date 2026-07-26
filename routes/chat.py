@@ -52,6 +52,7 @@ from core.session_manager import (
 from routes.common import (
     ChatRequest,
     RegenerateRequest,
+    _json_object,
     _norm_save,
     _norm_project,
     _initialize_session_from_profiles,
@@ -787,7 +788,7 @@ def _turn_worker(prepared: dict):
             ))
         except RevisionConflict as conflict:
             await runtime.terminal("failed", error=_revision_error(conflict))
-        except Exception as exc:
+        except Exception:
             # Session completed commit 是权威终态；完成后的 parsed/terminal
             # 日志故障交由 coordinator 以 completed 收口，禁止走失败写回。
             if runtime.session_committed_revision is not None:
@@ -799,7 +800,7 @@ def _turn_worker(prepared: dict):
                 full_content,
                 full_thinking,
                 status="failed",
-                error={"code": "internal_error", "message": str(exc)},
+                error={"code": "internal_error", "message": "生成失败，请重试"},
             )
 
     return run
@@ -1036,10 +1037,18 @@ async def api_chat(req: ChatRequest, request: Request):
 
 @router.post("/api/model/switch")
 async def api_switch_model(req: Request):
-    body = await req.json()
+    body = await _json_object(req)
     project = _norm_project(body.get("project", "默认项目"))
     save = _norm_save(body.get("save", "默认存档"))
     model = body.get("model", "")
+    if not isinstance(model, str):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_request_body",
+                "message": "model 必须是字符串",
+            },
+        )
     expected_revision = _expected_revision(body)
 
     def switch_model(session: dict, context) -> None:

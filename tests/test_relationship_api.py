@@ -236,9 +236,11 @@ async def test_relationship_api_rejects_unicode_controls_and_concurrent_revision
             json={**base, "edge": {**base["edge"], "relation_type": unsafe}},
         )
         assert response.status_code == 422, response.text
-        for detail in response.json()["detail"]:
-            assert set(detail) <= {"type", "loc", "msg"}
-            assert "input" not in detail
+        error = response.json()["error"]
+        assert error["code"] == "request_validation_failed"
+        for issue in error["details"]["issues"]:
+            assert set(issue) <= {"type", "loc", "msg"}
+            assert "input" not in issue
         assert path.read_bytes() == before
 
     first, second = await asyncio.gather(

@@ -693,9 +693,9 @@ async def test_chat_budget_rejection_is_422_before_turn_model_or_session_write(
     })
 
     assert response.status_code == 422, response.text
-    detail = response.json()["detail"]
-    assert detail["code"] == "prompt_budget_exceeded"
-    assert detail["diagnostics"]["context_limit_source"] == "forced_too_small"
+    error = response.json()["error"]
+    assert error["code"] == "prompt_budget_exceeded"
+    assert error["details"]["diagnostics"]["context_limit_source"] == "forced_too_small"
     after_session = store.read_sync(project, SAVE)
     assert after_session == before_session
     assert after_session["revision"] == before_session["revision"]
@@ -770,7 +770,7 @@ async def test_regenerate_budget_rejection_preserves_history_revision_and_turns(
     })
 
     assert response.status_code == 422, response.text
-    assert response.json()["detail"]["code"] == "prompt_budget_exceeded"
+    assert response.json()["error"]["code"] == "prompt_budget_exceeded"
     assert store.read_sync(project, SAVE) == before_session
     assert coordinator.store.list_turn_ids() == before_turn_ids
     assert coordinator._records == before_records

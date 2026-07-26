@@ -36,6 +36,7 @@ from core.summary_lifecycle import (
 from routes.common import (
     MessageAction,
     _expected_revision,
+    _json_object,
     _norm_project,
     _norm_save,
     _raise_revision_conflict,
@@ -65,18 +66,6 @@ def _required_summary_id(body: dict) -> str:
                 "message": "summary_id 必须是 UUID",
             },
         ) from exc
-
-
-def _require_summary_request_body(value: object) -> dict:
-    if not isinstance(value, dict):
-        raise HTTPException(
-            400,
-            detail={
-                "code": "summary_request_invalid",
-                "message": "摘要请求体必须是 JSON 对象",
-            },
-        )
-    return value
 
 
 def _find_summary(session: dict, summary_id: str) -> dict:
@@ -297,7 +286,13 @@ async def api_get_snapshot(
     try:
         snapshot = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        raise HTTPException(400, f"快照读取失败: {exc}") from exc
+        raise HTTPException(
+            400,
+            detail={
+                "code": "snapshot_read_failed",
+                "message": "快照无法读取",
+            },
+        ) from exc
     _validate_snapshot_owner(snapshot, project, save, snapshot_type)
     messages = (
         snapshot.get("dropped_messages", [])
@@ -315,7 +310,7 @@ async def api_get_snapshot(
 
 @router.post("/api/session/restore")
 async def api_restore_snapshot(req: Request):
-    body = await req.json()
+    body = await _json_object(req)
     project = _norm_project(body.get("project", "默认项目"))
     save = _norm_save(body.get("save", "默认存档"))
     expected_revision = _expected_revision(body)
@@ -336,7 +331,13 @@ async def api_restore_snapshot(req: Request):
     try:
         snapshot = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        raise HTTPException(400, f"快照读取失败: {exc}") from exc
+        raise HTTPException(
+            400,
+            detail={
+                "code": "snapshot_read_failed",
+                "message": "快照无法读取",
+            },
+        ) from exc
     _validate_snapshot_owner(snapshot, project, save, snapshot_type)
     replacement = deepcopy(snapshot)
     replacement.pop("_snapshot_at", None)
@@ -371,7 +372,11 @@ async def api_restore_snapshot(req: Request):
 
 @router.post("/api/session/summary/regenerate", status_code=202)
 async def api_regenerate_summary(req: Request):
-    body = _require_summary_request_body(await req.json())
+    body = await _json_object(
+        req,
+        object_error_code="summary_request_invalid",
+        object_error_message="摘要请求体必须是 JSON 对象",
+    )
     project = _norm_project(body.get("project", "默认项目"))
     save = _norm_save(body.get("save", "默认存档"))
     expected_revision = _expected_revision(body)
@@ -550,7 +555,11 @@ async def api_regenerate_summary(req: Request):
 
 @router.patch("/api/session/summary")
 async def api_patch_summary(req: Request):
-    body = _require_summary_request_body(await req.json())
+    body = await _json_object(
+        req,
+        object_error_code="summary_request_invalid",
+        object_error_message="摘要请求体必须是 JSON 对象",
+    )
     project = _norm_project(body.get("project", "默认项目"))
     save = _norm_save(body.get("save", "默认存档"))
     expected_revision = _expected_revision(body)

@@ -17,6 +17,11 @@ import { clampAnchoredLeft, createListboxController } from './listbox.mjs';
 import { createFrameRenderer } from './frame-renderer.mjs';
 import { affinityBar, createMessageElement, mountMessageHistory } from './render.mjs';
 import {
+    DEFAULT_MODEL_PARAMS,
+    createModelParamsEditor,
+    normalizeModelParams,
+} from './model-params.mjs';
+import {
     createWorldbookEditor,
     createWorldbookService,
     sanitizeWorldbookDiagnostics,
@@ -130,13 +135,7 @@ const state = {
     lastWorldbookDiagnostics: null,
     roleplayPanel: null,
     relationshipEditor: null,
-    modelParams: {
-        temperature: 0.8,
-        top_p: 0.9,
-        top_k: 40,
-        num_predict: 4096,
-        think: true,
-    },
+    modelParams: { ...DEFAULT_MODEL_PARAMS },
 };
 
 const projectService = createProjectService(apiClient, API);
@@ -164,9 +163,12 @@ const searchRequestController = createLatestSearchController({
     isCurrentSessionRef,
 });
 const searchNavigationGate = createSingleFlightGate();
+const modelSwitchGate = createSingleFlightGate();
+const resetGate = createSingleFlightGate();
 let activeController = null;   // 当前 turn SSE 的 AbortController；业务取消必须调用服务端 cancel API
 let searchModalSerial = 0;
 let relationshipModalSerial = 0;
+let historyModalSerial = 0;
 let activeFrameRenderer = null;
 let projectListboxController = null;
 let saveListboxController = null;
@@ -182,6 +184,18 @@ function currentRevision(ref = captureSessionRef()) {
 function errorDetail(payload, fallback = '请求失败') {
     if (payload instanceof Error) return payload.message || fallback;
     return payloadMessage(payload, fallback);
+}
+
+function domElement(tag, className = '', text = null) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== null) node.textContent = String(text);
+    return node;
+}
+
+function clearSuggestions() {
+    const suggestions = document.getElementById('suggestions');
+    if (suggestions) suggestions.replaceChildren();
 }
 
 function captureSessionRef() {
@@ -426,14 +440,22 @@ async function renderProjectDropdown(requestRef = captureSessionRef()) {
 
     if (!isCurrentSessionRef(requestRef) || requestId !== latestRequest.projectStats) return;
 
-    listEl.innerHTML = projectList.map(p => {
+    listEl.replaceChildren();
+    projectList.forEach(p => {
         const st = stats[p] || { characters:0, worldbook:0, saves:0 };
-        const active = p === state.currentProject ? 'active' : '';
-        return `<div class="dropdown-item ${active}" data-project="${escapeHtml(p)}">
-            <span class="item-name">📁 ${escapeHtml(p)}</span>
-            <span class="project-item-stats">👥${projectStatValue(st, 'characters', 'characters_unavailable')} 📖${projectStatValue(st, 'worldbook', 'worldbook_unavailable')} 💾${projectStatValue(st, 'saves', 'sessions_unavailable')}</span>
-        </div>`;
-    }).join('');
+        const item = domElement('div', 'dropdown-item');
+        item.classList.toggle('active', p === state.currentProject);
+        item.dataset.project = String(p);
+        item.appendChild(domElement('span', 'item-name', `📁 ${p}`));
+        item.appendChild(domElement(
+            'span',
+            'project-item-stats',
+            `👥${projectStatValue(st, 'characters', 'characters_unavailable')} `
+                + `📖${projectStatValue(st, 'worldbook', 'worldbook_unavailable')} `
+                + `💾${projectStatValue(st, 'saves', 'sessions_unavailable')}`,
+        ));
+        listEl.appendChild(item);
+    });
     if (projectListboxController) projectListboxController.refresh();
 
     // 更新顶栏项目名 + 元信息
@@ -446,7 +468,11 @@ function updateProjectButton(statsMap) {
     if (nameEl) nameEl.textContent = state.currentProject;
     if (statsEl && statsMap) {
         const st = statsMap[state.currentProject] || { characters:0, worldbook:0, saves:0 };
-        statsEl.innerHTML = `<span class="stat">👥${projectStatValue(st, 'characters', 'characters_unavailable')}</span><span class="stat">📖${projectStatValue(st, 'worldbook', 'worldbook_unavailable')}</span><span class="stat">💾${projectStatValue(st, 'saves', 'sessions_unavailable')}</span>`;
+        statsEl.replaceChildren(
+            domElement('span', 'stat', `👥${projectStatValue(st, 'characters', 'characters_unavailable')}`),
+            domElement('span', 'stat', `📖${projectStatValue(st, 'worldbook', 'worldbook_unavailable')}`),
+            domElement('span', 'stat', `💾${projectStatValue(st, 'saves', 'sessions_unavailable')}`),
+        );
     }
 }
 
@@ -512,17 +538,14 @@ async function loadSettings() {
         const s = await apiClient.get(API.settings, {
             schema: body => Boolean(body && typeof body === 'object' && !Array.isArray(body)) || '设置响应无效',
         });
-        if (s.temperature !== undefined) state.modelParams.temperature = s.temperature;
-        if (s.top_p !== undefined) state.modelParams.top_p = s.top_p;
-        if (s.top_k !== undefined) state.modelParams.top_k = s.top_k;
-        if (s.num_predict !== undefined) state.modelParams.num_predict = s.num_predict;
-        if (s.think !== undefined) state.modelParams.think = s.think;
+        state.modelParams = { ...normalizeModelParams(s) };
     } catch (e) { console.warn('读取设置失败', e); }
 }
 
 async function saveSettings(params = state.modelParams) {
-    await apiClient.put(API.settings, { data: params });
-    return params;
+    const normalized = normalizeModelParams(params);
+    await apiClient.put(API.settings, { data: normalized });
+    return normalized;
 }
 
 async function loadModels() {
@@ -530,7 +553,7 @@ async function loadModels() {
         schema: body => Array.isArray(body && body.models) || '模型列表响应无效',
     });
     const select = document.getElementById('model-select');
-    select.innerHTML = '';
+    select.replaceChildren();
     data.models.forEach(m => {
         const opt = document.createElement('option');
         opt.value = m;
@@ -641,18 +664,26 @@ function renderSaveListControls() {
 function renderSaveDropdown() {
     const listEl = document.getElementById('save-list');
     if (!listEl) return;
+    listEl.replaceChildren();
     if (state.saveList.length === 0) {
-        listEl.innerHTML = '<div class="dropdown-item" style="color:var(--text-dim);cursor:default">— 无存档 —</div>';
+        const empty = domElement('div', 'dropdown-item', '— 无存档 —');
+        empty.style.color = 'var(--text-dim)';
+        empty.style.cursor = 'default';
+        listEl.appendChild(empty);
         if (saveListboxController) saveListboxController.refresh();
         return;
     }
-    listEl.innerHTML = state.saveList.map(s => {
-        const active = s.session_id === state.currentSave ? 'active' : '';
-        return `<div class="dropdown-item ${active}" data-save="${escapeHtml(s.session_id)}">
-            <span class="item-name">💾 ${escapeHtml(s.name)}</span>
-            <span class="item-meta">${s.message_count || 0} 条</span>
-        </div>`;
-    }).join('');
+    state.saveList.forEach(s => {
+        const item = domElement('div', 'dropdown-item');
+        item.classList.toggle('active', s.session_id === state.currentSave);
+        item.dataset.save = String(s.session_id || '');
+        item.appendChild(domElement('span', 'item-name', `💾 ${s.name || ''}`));
+        const messageCount = Number.isSafeInteger(s.message_count) && s.message_count >= 0
+            ? s.message_count
+            : 0;
+        item.appendChild(domElement('span', 'item-meta', `${messageCount} 条`));
+        listEl.appendChild(item);
+    });
     if (saveListboxController) saveListboxController.refresh();
 }
 
@@ -678,7 +709,7 @@ async function switchSave(newSaveId) {
         const session = await fetchSession(candidateRef);
         if (!isCurrentSessionRef(candidateRef)) return false;
         if (!commitSessionState(session, candidateRef)) return false;
-        document.getElementById('suggestions').innerHTML = '';
+        clearSuggestions();
         document.getElementById('thinking-panel').classList.add('hidden');
         return true;
     } catch (error) {
@@ -702,7 +733,7 @@ async function createNewSave(name) {
         if (!isCurrentSessionRef(candidateRef)) return null;
         state.saveList = saves;
         if (!commitSessionState(session, candidateRef)) return null;
-        document.getElementById('suggestions').innerHTML = '';
+        clearSuggestions();
         return session;
     } catch (error) {
         rollbackSessionTransition(candidateRef);
@@ -1124,24 +1155,39 @@ function renderParsedResponse(parsed, warningSource = parsed) {
         document.getElementById('thinking-panel').classList.add('hidden');
         return;
     }
-    contentEl.innerHTML = '';
+    contentEl.replaceChildren();
     document.getElementById('thinking-panel').classList.add('hidden');
 
     if (parsed.warnings && parsed.warnings.length > 0) {
         const warnDiv = document.createElement('div');
         warnDiv.className = 'voice-warning';
-        warnDiv.innerHTML = '⚠️ 检测到角色语气可能串味：' + parsed.warnings.map(w => escapeHtml(w)).join('；');
+        warnDiv.textContent = '⚠️ 检测到角色语气可能串味：'
+            + parsed.warnings.map(warning => String(warning)).join('；');
         contentEl.appendChild(warnDiv);
     }
 
     if (parsed.scene_meta && parsed.scene_meta.location) {
         const metaDiv = document.createElement('div');
         metaDiv.className = 'character-card';
-        metaDiv.innerHTML = `
-            <div><strong>📍 ${escapeHtml(parsed.scene_meta.location)}</strong> | <span style="color:var(--text-dim)">⏱️ ${escapeHtml(parsed.scene_meta.time_weather || '')}</span></div>
-            ${parsed.scene_meta.main_quest ? `<div style="font-size:12px;color:var(--text-dim);margin-top:4px">🎯 ${escapeHtml(parsed.scene_meta.main_quest)}</div>` : ''}
-            ${parsed.scene_meta.current_scene ? `<div style="font-size:12px;color:var(--text-dim)">📌 ${escapeHtml(parsed.scene_meta.current_scene)}</div>` : ''}
-            ${parsed.scene_meta.next_goal ? `<div style="font-size:12px;color:var(--text-dim)">➡️ ${escapeHtml(parsed.scene_meta.next_goal)}</div>` : ''}`;
+        const locationLine = domElement('div');
+        locationLine.appendChild(domElement('strong', '', `📍 ${parsed.scene_meta.location}`));
+        locationLine.appendChild(document.createTextNode(' | '));
+        const time = domElement('span', '', `⏱️ ${parsed.scene_meta.time_weather || ''}`);
+        time.style.color = 'var(--text-dim)';
+        locationLine.appendChild(time);
+        metaDiv.appendChild(locationLine);
+        for (const [value, prefix, withMargin] of [
+            [parsed.scene_meta.main_quest, '🎯 ', true],
+            [parsed.scene_meta.current_scene, '📌 ', false],
+            [parsed.scene_meta.next_goal, '➡️ ', false],
+        ]) {
+            if (!value) continue;
+            const row = domElement('div', '', `${prefix}${value}`);
+            row.style.fontSize = '12px';
+            row.style.color = 'var(--text-dim)';
+            if (withMargin) row.style.marginTop = '4px';
+            metaDiv.appendChild(row);
+        }
         contentEl.appendChild(metaDiv);
     }
 
@@ -1149,17 +1195,28 @@ function renderParsedResponse(parsed, warningSource = parsed) {
         const card = document.createElement('div');
         card.className = 'character-card';
         const affinity = TavernSecurity.normalizeAffinity(c.affinity);
-        card.innerHTML = `
-            <div class="char-header">
-                <span class="char-name">🎭 ${escapeHtml(c.name)}</span>
-                <span class="char-affinity">${renderAffinityBar(affinity)} ${affinity}%</span>
-            </div>
-            ${c.inner_thought ? `<div class="char-row"><strong>💭 内心:</strong> ${escapeHtml(c.inner_thought)}</div>` : ''}
-            ${c.outfit ? `<div class="char-row"><strong>👗 穿着:</strong> ${escapeHtml(c.outfit)}</div>` : ''}
-            ${c.posture ? `<div class="char-row"><strong>🧍 姿势:</strong> ${escapeHtml(c.posture)}</div>` : ''}
-            <div class="char-dialogue">💬 "${escapeHtml(c.dialogue)}"
-                ${c.expected_effect ? `<div class="effect">(预期影响: ${escapeHtml(c.expected_effect)})</div>` : ''}
-            </div>`;
+        const header = domElement('div', 'char-header');
+        header.appendChild(domElement('span', 'char-name', `🎭 ${c.name || ''}`));
+        header.appendChild(domElement(
+            'span', 'char-affinity', `${renderAffinityBar(affinity)} ${affinity}%`,
+        ));
+        card.appendChild(header);
+        for (const [value, label] of [
+            [c.inner_thought, '💭 内心:'],
+            [c.outfit, '👗 穿着:'],
+            [c.posture, '🧍 姿势:'],
+        ]) {
+            if (!value) continue;
+            const row = domElement('div', 'char-row');
+            row.appendChild(domElement('strong', '', label));
+            row.appendChild(document.createTextNode(` ${value}`));
+            card.appendChild(row);
+        }
+        const dialogue = domElement('div', 'char-dialogue', `💬 "${c.dialogue || ''}"`);
+        if (c.expected_effect) {
+            dialogue.appendChild(domElement('div', 'effect', `(预期影响: ${c.expected_effect})`));
+        }
+        card.appendChild(dialogue);
         contentEl.appendChild(card);
     });
 
@@ -1171,7 +1228,7 @@ function renderParsedResponse(parsed, warningSource = parsed) {
     }
 
     if (parsed.suggestions && parsed.suggestions.length > 0) renderSuggestions(parsed.suggestions);
-    else document.getElementById('suggestions').innerHTML = '';
+    else clearSuggestions();
 
     renderSummaryPanel(ensureSummaryAnchor(document, stream), state.session);
     scrollToBottom();
@@ -1200,10 +1257,6 @@ function renderSummaryPanel(lastAssistant, sess) {
         },
     });
     state.selectedSummaryId = result ? result.selectedId : null;
-}
-
-function escapeHtml(str) {
-    return TavernSecurity.escapeHtml(str);
 }
 
 function appendSummaryEditorField(form, summaryId, config) {
@@ -1346,7 +1399,7 @@ async function regenerateSummary(summary) {
 
 function renderSuggestions(suggestions) {
     const container = document.getElementById('suggestions');
-    container.innerHTML = '';
+    container.replaceChildren();
     suggestions.forEach(s => {
         const btn = document.createElement('button');
         btn.className = 'suggestion-btn';
@@ -1766,11 +1819,11 @@ async function runTurnLifecycle(turnRequest, requestRef, options = {}) {
         await finalizeActiveTurn(turn.turn_id);
     } catch (error) {
         if (error instanceof ApiError && error.code === 'active_turn_conflict') {
-            const detail = error.payload && (error.payload.error || error.payload.detail);
-            if (detail && detail.turn_id) {
+            const details = error.details;
+            if (details && typeof details.turn_id === 'string' && details.turn_id) {
                 clearPersistedTurn();
                 try {
-                    const meta = await turnClient.get(detail.turn_id);
+                    const meta = await turnClient.get(details.turn_id);
                     installActiveTurn(meta, requestRef);
                     const targetEl = appendAssistantMessage(meta.content || '（恢复生成状态…）');
                     state.activeTurn = { ...state.activeTurn, targetEl };
@@ -1871,17 +1924,48 @@ async function createCardEditor(config) {
     // 2. 构造 modal HTML
     const body = document.createElement('div');
     body.className = `card-editor card-editor-${config.prefix}`;
-    body.innerHTML = `
-        <div class="cards-panel-inner">
-            ${config.allowNew ? '<div class="cards-list" id="ce-list"></div>' : ''}
-            <div class="cards-form" id="ce-form"></div>
-        </div>`;
+    const panel = domElement('div', 'cards-panel-inner');
+    if (config.allowNew) {
+        const list = domElement('div', 'cards-list');
+        list.id = 'ce-list';
+        panel.appendChild(list);
+    }
+    const cardForm = domElement('div', 'cards-form');
+    cardForm.id = 'ce-form';
+    panel.appendChild(cardForm);
+    body.appendChild(panel);
     showModal({ title: config.title, body });
 
     const listEl = body.querySelector('#ce-list');
     const formEl = body.querySelector('#ce-form');
     let currentItem = null;
     let fieldIdCounter = 0;
+    let cardPending = false;
+    let cardStatusMessage = '';
+    let cardStatusError = false;
+
+    function updateCardStatus(message, error = false) {
+        cardStatusMessage = String(message || '');
+        cardStatusError = Boolean(error);
+        const status = formEl.querySelector('.ce-status');
+        if (!status) return;
+        status.setAttribute('role', cardStatusError ? 'alert' : 'status');
+        status.setAttribute('aria-live', cardStatusError ? 'assertive' : 'polite');
+        status.textContent = cardStatusMessage;
+    }
+
+    function applyCardDisabled() {
+        const disabled = cardPending || isTurnActiveForRef(editorRef) || !isCurrentSessionRef(editorRef);
+        for (const control of body.querySelectorAll('button, input, textarea, select')) {
+            control.disabled = disabled;
+        }
+    }
+
+    function setCardPending(value) {
+        cardPending = Boolean(value);
+        modalController.setPending(cardPending);
+        applyCardDisabled();
+    }
 
     // ===== 列表渲染（仅 allowNew）=====
     function syncCardListSelection() {
@@ -1899,16 +1983,30 @@ async function createCardEditor(config) {
             row.classList.toggle('active', selected);
             row.setAttribute('aria-current', selected ? 'true' : 'false');
         });
+        applyCardDisabled();
     }
 
     function renderList() {
         if (!listEl) return;
-        listEl.innerHTML = `
-            <button type="button" class="modal-btn new-card-btn" id="ce-new">＋ 新建</button>
-            ${items.map(it => `
-                <button type="button" class="card-row ${currentItem && currentItem[config.idField] === it[config.idField] ? 'active' : ''}" data-id="${escapeHtml(it[config.idField])}" aria-label="编辑卡片 ${escapeHtml(it.name || it[config.idField] || it.id || '')}">
-                    <span class="card-row-name">${escapeHtml(it.name || it[config.idField] || it.id || '')}</span>
-                </button>`).join('')}`;
+        listEl.replaceChildren();
+        const newButton = domElement('button', 'modal-btn new-card-btn', '＋ 新建');
+        newButton.type = 'button';
+        newButton.id = 'ce-new';
+        listEl.appendChild(newButton);
+        items.forEach(it => {
+            const id = String(it[config.idField] || '');
+            const name = String(it.name || it[config.idField] || it.id || '');
+            const row = domElement('button', 'card-row');
+            row.type = 'button';
+            row.classList.toggle(
+                'active',
+                Boolean(currentItem && currentItem[config.idField] === it[config.idField]),
+            );
+            row.dataset.id = id;
+            row.setAttribute('aria-label', `编辑卡片 ${name}`);
+            row.appendChild(domElement('span', 'card-row-name', name));
+            listEl.appendChild(row);
+        });
         syncCardListSelection();
         listEl.querySelector('#ce-new').addEventListener('click', () => {
             currentItem = null;
@@ -2084,22 +2182,47 @@ async function createCardEditor(config) {
 
         const titleText = !config.allowNew
             ? config.title.replace(/^[^—]+—/, '').trim()  // 单条模式不显示"新建/编辑"
-            : (isNew ? '新建' : `编辑：${escapeHtml(currentItem.name || currentItem[config.idField])}`);
+            : (isNew ? '新建' : `编辑：${currentItem.name || currentItem[config.idField]}`);
 
-        formEl.innerHTML = `
-            <h4 class="form-title">${titleText}</h4>
-            <div class="ce-groups"></div>
-            <button class="modal-btn ce-group-add" style="margin-top:8px;width:100%">＋ 添加分组</button>
-            <div class="form-actions" style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                <span class="ce-status" style="color:var(--text-dim);font-size:12px;flex:1"></span>
-                ${canDelete ? `<button class="modal-btn danger ce-delete">删除</button>` : ''}
-                <button class="modal-btn primary ce-save">保存</button>
-            </div>`;
+        formEl.replaceChildren();
+        formEl.appendChild(domElement('h4', 'form-title', titleText));
+        const groupsRoot = domElement('div', 'ce-groups');
+        formEl.appendChild(groupsRoot);
+        const groupAdd = domElement('button', 'modal-btn ce-group-add', '＋ 添加分组');
+        groupAdd.type = 'button';
+        groupAdd.style.marginTop = '8px';
+        groupAdd.style.width = '100%';
+        formEl.appendChild(groupAdd);
+        const actions = domElement('div', 'form-actions');
+        actions.style.marginTop = '12px';
+        actions.style.display = 'flex';
+        actions.style.gap = '8px';
+        actions.style.alignItems = 'center';
+        actions.style.flexWrap = 'wrap';
+        const status = domElement('span', 'ce-status');
+        status.id = 'ce-status';
+        status.setAttribute('role', cardStatusError ? 'alert' : 'status');
+        status.setAttribute('aria-live', cardStatusError ? 'assertive' : 'polite');
+        status.textContent = cardStatusMessage;
+        status.style.color = 'var(--text-dim)';
+        status.style.fontSize = '12px';
+        status.style.flex = '1';
+        actions.appendChild(status);
+        if (canDelete) {
+            const remove = domElement('button', 'modal-btn danger ce-delete', '删除');
+            remove.type = 'button';
+            actions.appendChild(remove);
+        }
+        const save = domElement('button', 'modal-btn primary ce-save', '保存');
+        save.type = 'button';
+        actions.appendChild(save);
+        formEl.appendChild(actions);
 
         const groupsEl = formEl.querySelector('.ce-groups');
         const statusEl = formEl.querySelector('.ce-status');
 
         groups.forEach((g, i) => groupsEl.appendChild(makeGroup(g, i)));
+        applyCardDisabled();
 
         groupsEl.addEventListener('dragend', () => {
             clearDragState(groupsEl);
@@ -2113,16 +2236,22 @@ async function createCardEditor(config) {
 
         formEl.querySelector('.ce-save').addEventListener('click', async (event) => {
             const saveButton = event.currentTarget;
+            if (cardPending) return;
             if (!isCurrentSessionRef(editorRef)) {
-                statusEl.textContent = '✗ 当前项目或存档已切换，请重新打开编辑器';
+                updateCardStatus('✗ 当前项目或存档已切换，请重新打开编辑器', true);
                 return;
             }
             if (!canPerformTurnAction('card_write', editorRef)) {
-                statusEl.textContent = '✗ 当前存档正在生成，请先取消或等待完成';
+                updateCardStatus('✗ 当前存档正在生成，请先取消或等待完成', true);
                 return;
             }
-            saveButton.disabled = true;
-            statusEl.textContent = '保存中…';
+            for (const control of groupsEl.querySelectorAll('[aria-invalid="true"]')) {
+                control.removeAttribute('aria-invalid');
+                control.removeAttribute('aria-describedby');
+            }
+            updateCardStatus('保存中…');
+            setCardPending(true);
+            let focusTarget = null;
             try {
                 const collected = collectCardEditorData(groupsEl, { idField: config.idField });
                 const data = mergeCardEditorData(currentItem || extraData || {}, collected.data);
@@ -2132,7 +2261,8 @@ async function createCardEditor(config) {
                 if (!saveUrl) throw new Error('缺少保存 API');
                 await apiClient.put(saveUrl, { data });
                 if (!isCurrentSessionRef(editorRef)) return;
-                statusEl.textContent = '✓ 已保存';
+                cardStatusMessage = '✓ 已保存';
+                cardStatusError = false;
                 // 刷新列表
                 if (config.allowNew) {
                     const fresh = await apiClient.get(config.listApi, {
@@ -2144,45 +2274,51 @@ async function createCardEditor(config) {
                     renderList(); renderForm();
                 }
                 if (config.postSave) await config.postSave(data);
+                updateCardStatus('✓ 已保存');
             } catch (e) {
-                statusEl.textContent = '✗ ' + e.message;
+                updateCardStatus(`✗ ${errorDetail(e)}`, true);
                 const invalidField = e && e.field
                     ? groupsEl.querySelector(`.fld-row[data-key="${CSS.escape(e.field)}"] .ce-field-val`)
                     : null;
                 if (invalidField) {
                     invalidField.setAttribute('aria-invalid', 'true');
-                    invalidField.focus();
+                    invalidField.setAttribute('aria-describedby', 'ce-status');
+                    focusTarget = invalidField;
                 } else if (saveButton.isConnected) {
-                    saveButton.focus();
+                    focusTarget = saveButton;
                 }
             } finally {
-                if (saveButton.isConnected) saveButton.disabled = isTurnActiveForRef(editorRef);
+                setCardPending(false);
+                if (focusTarget && focusTarget.isConnected) focusTarget.focus();
             }
         });
 
         const delBtn = formEl.querySelector('.ce-delete');
         if (delBtn) {
             delBtn.addEventListener('click', async () => {
+                if (cardPending) return;
                 const deleteId = config.idField ? (currentItem && currentItem[config.idField]) : 'user';
                 const displayName = config.idField ? (currentItem && (currentItem.name || currentItem[config.idField])) : '用户档案';
                 if (!deleteId) return;
                 const requestRef = editorRef;
                 if (!isCurrentSessionRef(requestRef)) {
-                    statusEl.textContent = '✗ 当前存档已切换，请重新打开编辑器';
+                    updateCardStatus('✗ 当前存档已切换，请重新打开编辑器', true);
                     return;
                 }
                 if (config.project && state.currentProject !== config.project) {
-                    statusEl.textContent = '✗ 当前项目已切换，请重新打开编辑器';
+                    updateCardStatus('✗ 当前项目已切换，请重新打开编辑器', true);
                     return;
                 }
                 if (!canPerformTurnAction('card_write', editorRef)) {
-                    statusEl.textContent = '✗ 当前存档正在生成，请先取消或等待完成';
+                    updateCardStatus('✗ 当前存档正在生成，请先取消或等待完成', true);
                     return;
                 }
                 if (!confirm(`确定要删除「${displayName}」吗？删除后将移入回收区，可以恢复。`)) return;
 
                 const deleteUrl = config.deleteApi(deleteId);
-                statusEl.textContent = '删除中…';
+                updateCardStatus('删除中…');
+                setCardPending(true);
+                let deleteFailed = false;
                 try {
                     let result;
                     try {
@@ -2233,7 +2369,10 @@ async function createCardEditor(config) {
                         }
                     } catch (refreshError) {
                         if (!isCurrentSessionRef(requestRef)) return;
-                        statusEl.textContent = `✓ 已移入回收区，可恢复${impactText}；列表刷新失败：${refreshError.message}`;
+                        updateCardStatus(
+                            `✓ 已移入回收区，可恢复${impactText}；列表刷新失败：${errorDetail(refreshError)}`,
+                            true,
+                        );
                         if (recoveryId) statusEl.title = `恢复记录：${recoveryId}`;
                         showToast('已移入回收区，可恢复');
                         return;
@@ -2251,7 +2390,7 @@ async function createCardEditor(config) {
                     }
                     const nextStatusEl = formEl.querySelector('.ce-status');
                     if (nextStatusEl) {
-                        nextStatusEl.textContent = `✓ 已移入回收区，可恢复${impactText}`;
+                        updateCardStatus(`✓ 已移入回收区，可恢复${impactText}`);
                         if (recoveryId) nextStatusEl.title = `恢复记录：${recoveryId}`;
                     }
                     showToast('已移入回收区，可恢复');
@@ -2259,7 +2398,13 @@ async function createCardEditor(config) {
                         try { await config.postDelete(deleteId, result); }
                         catch (postDeleteError) { console.warn('删除后刷新失败', postDeleteError); }
                     }
-                } catch (e) { statusEl.textContent = '✗ ' + e.message; }
+                } catch (e) {
+                    deleteFailed = true;
+                    updateCardStatus(`✗ ${errorDetail(e)}`, true);
+                } finally {
+                    setCardPending(false);
+                    if (deleteFailed && delBtn.isConnected) delBtn.focus();
+                }
             });
         }
     }
@@ -2435,163 +2580,222 @@ async function openUserEditor() {
 
 // ===== 模型参数面板 =====
 
-function slider(label, id, min, max, step, value, hint) {
-    return `<div class="form-slider">
-      <div class="slider-top"><span class="slider-label">${label}</span><span class="slider-value" id="val-${id}">${value}</span></div>
-      <input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${value}">
-      <div class="slider-hint">${hint}</div></div>`;
-}
-
 function showModelParamsEditor() {
-    const p = state.modelParams;
-    const body = document.createElement('div');
-    body.innerHTML = `
-        <div class="param-intro">这里的滑块控制 AI 这轮"说话的风格"。调完点「保存」，下次发消息生效。<b>往左调小 = 更稳、更老实跟你设定走；往右调大 = 更天马行空、更"放"。</b></div>
-        ${slider('活跃度（温度）', 'p-temp', 0, 2, 0.1, p.temperature, '越小越老实，越大越奔放。常用 0.6~1.0')}
-        ${slider('收口（top_p）', 'p-topp', 0.1, 1, 0.05, p.top_p, '越小AI越只挑最有把握的词，越稳。')}
-        ${slider('候选（top_k）', 'p-topk', 0, 200, 1, p.top_k, '0=不限。越小越保守。')}
-        ${slider('最多字数', 'p-nump', 256, 16384, 256, p.num_predict, 'AI 一轮最多写多少字。太短会被截断。')}
-        <div class="form-slider">
-          <div class="slider-top"><span class="slider-label">开"内心思考"</span>
-            <label class="param-switch"><input type="checkbox" id="p-think" ${p.think ? 'checked' : ''}><span class="switch-slider"></span></label>
-          </div>
-          <div class="slider-hint">开了AI先想再写（质量好但慢几秒）；关了直接写（快、但略糙）。</div>
-        </div>`;
+    const editor = createModelParamsEditor(document, state.modelParams);
 
     const saveParams = async () => {
-        const next = {
-            temperature: Number(body.querySelector('#p-temp').value),
-            top_p: Number(body.querySelector('#p-topp').value),
-            top_k: Number(body.querySelector('#p-topk').value),
-            num_predict: Number(body.querySelector('#p-nump').value),
-            think: body.querySelector('#p-think').checked,
-        };
-        await saveSettings(next);
-        state.modelParams = next;
-        return true;
+        editor.setDisabled(true);
+        try {
+            const next = await saveSettings(editor.read());
+            state.modelParams = { ...next };
+            return true;
+        } finally {
+            editor.setDisabled(false);
+        }
     };
 
-    // 只调用一次，footer 一次性到位
-    showModal({ title: '🎛 AI 说话风格', body, footer: { confirmText: '保存', cancelText: '取消', onConfirm: saveParams } });
-
-    // showModal 之后 body 已挂 DOM，此时挂 input 监听
-    const upd = (id, fmt) => {
-        const el = body.querySelector(`#val-${id}`);
-        const inp = body.querySelector(`#${id}`);
-        const f = () => { el.textContent = fmt ? fmt(inp.value) : inp.value; };
-        inp.addEventListener('input', f); f();
-    };
-    upd('p-temp', v => Number(v).toFixed(1));
-    upd('p-topp', v => Number(v).toFixed(2));
-    upd('p-topk');
-    upd('p-nump');
+    showModal({
+        title: '🎛 AI 说话风格',
+        body: editor.root,
+        footer: {
+            confirmText: '保存', pendingText: '保存中…', cancelText: '取消', onConfirm: saveParams,
+        },
+    });
 }
 
 // ===== 存档历史 =====
 
 async function showHistoryEditor() {
     const historyRef = captureSessionRef();
-    const body = document.createElement('div');
-    body.innerHTML = `<div class="param-intro">这里存着之前几次的存档快照（每次"重新生成"前会自动存一份）。点某个版本的「恢复」就回到那一次；点「预览」只读查看快照内容，不会覆盖当前存档。</div>
-        <div id="history-list" class="history-list"><p style="color:var(--text-dim)">加载中…</p></div>`;
+    const modalToken = ++historyModalSerial;
+    const body = domElement('div', 'history-dialog');
+    body.appendChild(domElement(
+        'div',
+        'param-intro',
+        '这里存着之前几次的存档快照（每次“重新生成”前会自动存一份）。点某个版本的「恢复」就回到那一次；点「预览」只读查看快照内容，不会覆盖当前存档。',
+    ));
+    const status = domElement('p', 'history-status', '加载中…');
+    status.id = 'history-status';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    const listEl = domElement('div', 'history-list');
+    listEl.id = 'history-list';
+    listEl.setAttribute('aria-describedby', status.id);
+    body.appendChild(status);
+    body.appendChild(listEl);
     showModal({ title: '🕐 历史存档', body });
 
-    const listEl = body.querySelector('#history-list');
+    const isMounted = () => body.isConnected && modalToken === historyModalSerial;
+    let restorePending = false;
+    const setStatus = (message, error = false) => {
+        if (!isMounted()) return;
+        status.setAttribute('role', error ? 'alert' : 'status');
+        status.setAttribute('aria-live', error ? 'assertive' : 'polite');
+        status.textContent = String(message || '');
+    };
+    const setHistoryControlsDisabled = disabled => {
+        for (const control of listEl.querySelectorAll('button')) control.disabled = Boolean(disabled);
+    };
     try {
         const url = `${API.sessionHistory}?project=${encodeURIComponent(historyRef.project)}&save=${encodeURIComponent(historyRef.save)}`;
         const data = await apiClient.get(url, {
             schema: body => Array.isArray(body && body.snapshots) || '历史快照列表响应无效',
         });
+        if (!isMounted()) return;
         if (!isCurrentSessionRef(historyRef)) {
-            listEl.innerHTML = '<p class="empty">当前存档已切换，请重新打开历史存档。</p>';
+            setStatus('当前存档已切换，请重新打开历史存档。', true);
             return;
         }
         const snaps = data.snapshots || [];
-        if (snaps.length === 0) { listEl.innerHTML = `<p class="empty">还没有历史快照。点一轮对话的「🔄」重新生成，或先聊一会再回来看。</p>`; return; }
-        listEl.innerHTML = snaps.map(s => {
+        listEl.replaceChildren();
+        if (snaps.length === 0) {
+            setStatus('');
+            listEl.appendChild(domElement(
+                'p', 'empty', '还没有历史快照。点一轮对话的「🔄」重新生成，或先聊一会再回来看。',
+            ));
+            return;
+        }
+        setStatus(`共 ${snaps.length} 份历史快照`);
+        snaps.forEach(s => {
             const typeLabel = s.type === 'trim' ? ' 📄 trim'
                 : s.type === 'reset' ? ' 🔄 重置'
                 : '';
             const isTrim = s.type === 'trim';
-            return `<div class="history-item ${isTrim ? 'history-item-trim' : ''}"><span class="history-time">🕐 ${escapeHtml(s.timestamp || s.modified_at || s.filename)}${typeLabel}</span>
-                <div class="history-actions">
-                    <button class="modal-btn history-preview" data-fn="${escapeHtml(s.filename)}">预览</button>
-                    ${isTrim ? '' : `<button class="modal-btn history-restore" data-fn="${escapeHtml(s.filename)}">恢复</button>`}
-                </div></div>`;
-        }).join('');
-        listEl.querySelectorAll('.history-preview').forEach(btn => {
-            btn.addEventListener('click', () => showSnapshotPreview(btn.dataset.fn, historyRef));
+            const item = domElement('div', 'history-item');
+            item.classList.toggle('history-item-trim', isTrim);
+            item.appendChild(domElement(
+                'span', 'history-time', `🕐 ${s.timestamp || s.modified_at || s.filename}${typeLabel}`,
+            ));
+            const actions = domElement('div', 'history-actions');
+            const preview = domElement('button', 'modal-btn history-preview', '预览');
+            preview.type = 'button';
+            preview.dataset.fn = String(s.filename || '');
+            preview.addEventListener('click', () => showSnapshotPreview(preview.dataset.fn, historyRef));
+            actions.appendChild(preview);
+            if (!isTrim) {
+                const restore = domElement('button', 'modal-btn history-restore', '恢复');
+                restore.type = 'button';
+                restore.dataset.fn = String(s.filename || '');
+                restore.addEventListener('click', async () => {
+                    if (restorePending || !isMounted()) return;
+                    const fn = restore.dataset.fn;
+                    if (!confirm('恢复这份快照？当前存档内容会被这份覆盖。')) return;
+                    if (!isCurrentSessionRef(historyRef)) {
+                        setStatus('当前存档已切换，请重新打开历史存档。', true);
+                        restore.focus();
+                        return;
+                    }
+                    restorePending = true;
+                    setHistoryControlsDisabled(true);
+                    restore.setAttribute('aria-busy', 'true');
+                    restore.textContent = '恢复中…';
+                    modalController.setPending(true);
+                    setStatus('正在恢复快照…');
+                    try {
+                        const result = await sessionWrite(API.sessionRestore, 'POST', {
+                            project: historyRef.project,
+                            save: historyRef.save,
+                            filename: fn,
+                        }, '恢复快照', { applyResult: false });
+                        if (!isMounted() || !isCurrentSessionRef(historyRef)) return;
+                        const session = sessionFromResult(result);
+                        if (!sessionBelongsToRef(session, historyRef)) {
+                            throw new ApiError('恢复响应存档与当前存档不一致', {
+                                code: 'stale_session_response', payload: result,
+                            });
+                        }
+                        if (!commitSessionState(session, historyRef)) return;
+                        restorePending = false;
+                        modalController.setPending(false);
+                        hideModal();
+                        showToast('已恢复到该快照');
+                    } catch (error) {
+                        if (isMounted()) {
+                            setStatus(`恢复失败：${errorDetail(error)}`, true);
+                            restore.focus();
+                        }
+                    } finally {
+                        if (isMounted()) {
+                            restorePending = false;
+                            modalController.setPending(false);
+                            setHistoryControlsDisabled(false);
+                            restore.removeAttribute('aria-busy');
+                            restore.textContent = '恢复';
+                        }
+                    }
+                });
+                actions.appendChild(restore);
+            }
+            item.appendChild(actions);
+            listEl.appendChild(item);
         });
-        listEl.querySelectorAll('.history-restore').forEach(btn => {
-            btn.addEventListener('click', async () => {
-                const fn = btn.dataset.fn;
-                if (!confirm('恢复这份快照？当前存档内容会被这份覆盖。')) return;
-                if (!isCurrentSessionRef(historyRef)) {
-                    hideModal();
-                    alert('当前存档已切换，请重新打开历史存档');
-                    return;
-                }
-                let result;
-                try {
-                    result = await sessionWrite(API.sessionRestore, 'POST', {
-                        project: historyRef.project,
-                        save: historyRef.save,
-                        filename: fn,
-                    }, '恢复快照', { applyResult: false });
-                } catch (error) {
-                    alert('恢复失败：' + error.message);
-                    return;
-                }
-                if (!isCurrentSessionRef(historyRef)) return;
-                const session = sessionFromResult(result);
-                if (!sessionBelongsToRef(session, historyRef)) {
-                    alert('恢复失败：响应存档与当前存档不一致');
-                    return;
-                }
-                if (!commitSessionState(session, historyRef)) return;
-                hideModal();
-                alert('已恢复到该快照');
-            });
-        });
-    } catch (e) { listEl.innerHTML = `<p class="empty">读取历史失败：${escapeHtml(e.message)}</p>`; }
+    } catch (error) {
+        if (isMounted()) setStatus(`读取历史失败：${errorDetail(error)}`, true);
+    }
 }
 
 async function showSnapshotPreview(filename, snapshotRef = captureSessionRef()) {
-    const body = document.createElement('div');
-    body.innerHTML = '<div class="snapshot-preview"><p style="color:var(--text-dim)">加载中…</p></div>';
+    const modalToken = ++historyModalSerial;
+    const body = domElement('div');
+    const previewEl = domElement('div', 'snapshot-preview');
+    previewEl.setAttribute('aria-busy', 'true');
+    const status = domElement('p', 'snapshot-status', '加载中…');
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    status.style.color = 'var(--text-dim)';
+    previewEl.appendChild(status);
+    body.appendChild(previewEl);
     showModal({ title: '🔍 快照预览', body });
 
-    const previewEl = body.querySelector('.snapshot-preview');
+    const isMounted = () => body.isConnected && modalToken === historyModalSerial;
+    const showPreviewError = message => {
+        if (!isMounted()) return;
+        previewEl.setAttribute('aria-busy', 'false');
+        status.setAttribute('role', 'alert');
+        status.setAttribute('aria-live', 'assertive');
+        status.textContent = String(message);
+    };
     try {
         const url = `${API.sessionSnapshot(filename)}&project=${encodeURIComponent(snapshotRef.project)}&save=${encodeURIComponent(snapshotRef.save)}`;
         const data = await apiClient.get(url, {
             schema: body => Boolean(body && typeof body.filename === 'string' && Array.isArray(body.messages)) || '快照响应无效',
         });
+        if (!isMounted()) return;
         if (!isCurrentSessionRef(snapshotRef)) {
-            previewEl.innerHTML = '<p class="empty">当前存档已切换，请重新打开快照。</p>';
+            showPreviewError('当前存档已切换，请重新打开快照。');
             return;
         }
         const typeBadge = data.snapshot_type === 'trim' ? '📄 trim（被截消息）'
             : data.snapshot_type === 'reset' ? '🔄 重置归档'
             : '💾 快照';
         const msgs = data.messages || [];
-        previewEl.innerHTML = `
-            <div class="snapshot-meta">
-                <span class="snapshot-badge">${typeBadge}</span>
-                <span class="snapshot-filename">${escapeHtml(data.filename)}</span>
-                <span class="snapshot-time">${escapeHtml(data.modified_at || '')}</span>
-            </div>
-            <div class="snapshot-count">共 ${msgs.length} 条消息</div>
-            <div class="snapshot-list">${msgs.map((m, i) => {
-                const roleLabel = m.role === 'user' ? '你' : 'AI';
-                const roleClass = m.role === 'user' ? 'user' : 'assistant';
-                return `<div class="snapshot-msg ${roleClass}">
-                    <div class="snapshot-msg-idx">#${i + 1}</div>
-                    <div class="snapshot-msg-role">${roleLabel}</div>
-                    <div class="snapshot-msg-content">${escapeHtml(m.content || '')}</div>
-                </div>`;
-            }).join('') || '<p class="empty" style="margin-top:12px">无消息内容</p>'}</div>`;
-    } catch (e) { previewEl.innerHTML = `<p class="empty">读取失败：${escapeHtml(e.message)}</p>`; }
+        previewEl.replaceChildren();
+        previewEl.setAttribute('aria-busy', 'false');
+        const meta = domElement('div', 'snapshot-meta');
+        meta.appendChild(domElement('span', 'snapshot-badge', typeBadge));
+        meta.appendChild(domElement('span', 'snapshot-filename', data.filename));
+        meta.appendChild(domElement('span', 'snapshot-time', data.modified_at || ''));
+        previewEl.appendChild(meta);
+        previewEl.appendChild(domElement('div', 'snapshot-count', `共 ${msgs.length} 条消息`));
+        const list = domElement('div', 'snapshot-list');
+        if (msgs.length === 0) {
+            const empty = domElement('p', 'empty', '无消息内容');
+            empty.style.marginTop = '12px';
+            list.appendChild(empty);
+        } else {
+            msgs.forEach((message, index) => {
+                const isUser = message.role === 'user';
+                const row = domElement('div', `snapshot-msg ${isUser ? 'user' : 'assistant'}`);
+                row.appendChild(domElement('div', 'snapshot-msg-idx', `#${index + 1}`));
+                row.appendChild(domElement('div', 'snapshot-msg-role', isUser ? '你' : 'AI'));
+                row.appendChild(domElement('div', 'snapshot-msg-content', message.content || ''));
+                list.appendChild(row);
+            });
+        }
+        previewEl.appendChild(list);
+    } catch (error) {
+        showPreviewError(`读取失败：${errorDetail(error)}`);
+    }
 }
 
 // ===== 提示词编辑器 =====
@@ -3123,42 +3327,65 @@ function bindUI() {
 
     // 模型切换
     document.getElementById('model-select').addEventListener('change', async (e) => {
-        const model = e.target.value;
+        const control = e.currentTarget;
+        const model = control.value;
         if (!model) return;
+        const token = modelSwitchGate.acquire();
+        if (token === null) return;
+        control.disabled = true;
+        control.setAttribute('aria-busy', 'true');
+        showToast('正在切换模型…');
         try {
             await sessionWrite(API.switchModel, 'POST', {
                 project: state.currentProject,
                 save: state.currentSave,
                 model,
             }, '切换模型');
+            showToast('模型已切换');
         } catch (error) {
-            alert('切换模型失败：' + error.message);
-            if (state.session && state.session.current_model) e.target.value = state.session.current_model;
+            showToast(`切换模型失败：${errorDetail(error)}`, 3500);
+            if (state.session && state.session.current_model) control.value = state.session.current_model;
+        } finally {
+            if (modelSwitchGate.release(token)) {
+                control.disabled = state.navigationBusy || isTurnActiveForRef(committedSessionRef);
+                control.setAttribute('aria-busy', 'false');
+            }
         }
     });
 
     // 重置
-    document.getElementById('reset-btn').addEventListener('click', async () => {
+    document.getElementById('reset-btn').addEventListener('click', async event => {
         if (!confirm('重置当前存档？将清空对话历史和角色状态，但保留存档本身。')) return;
+        const button = event.currentTarget;
+        const token = resetGate.acquire();
+        if (token === null) return;
+        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
+        showToast('正在重置当前存档…');
         const requestRef = captureSessionRef();
-        let result;
         try {
-            result = await sessionWrite(API.reset, 'POST', {
+            const result = await sessionWrite(API.reset, 'POST', {
                 project: requestRef.project,
                 save: requestRef.save,
             }, '重置存档', { applyResult: false });
+            if (!isCurrentSessionRef(requestRef)) return;
+            const session = sessionFromResult(result);
+            if (!sessionBelongsToRef(session, requestRef)) {
+                throw new ApiError('重置响应存档与当前存档不一致', {
+                    code: 'stale_session_response', payload: result,
+                });
+            }
+            if (!commitSessionState(session, requestRef)) return;
+            clearSuggestions();
+            showToast('当前存档已重置');
         } catch (error) {
-            alert('重置失败：' + error.message);
-            return;
+            showToast(`重置失败：${errorDetail(error)}`, 3500);
+        } finally {
+            if (resetGate.release(token)) {
+                button.disabled = state.navigationBusy || isTurnActiveForRef(committedSessionRef);
+                button.setAttribute('aria-busy', 'false');
+            }
         }
-        if (!isCurrentSessionRef(requestRef)) return;
-        const session = sessionFromResult(result);
-        if (!sessionBelongsToRef(session, requestRef)) {
-            alert('重置失败：响应存档与当前存档不一致');
-            return;
-        }
-        if (!commitSessionState(session, requestRef)) return;
-        document.getElementById('suggestions').innerHTML = '';
     });
 
     // 工具按钮（顶栏右侧）
@@ -3186,65 +3413,123 @@ function bindUI() {
 
 // ===== 新顶栏所需的弹窗辅助函数 =====
 
+function labeledModalTextInput(id, labelText, placeholder, value = '') {
+    const body = domElement('div', 'modal-field');
+    const label = domElement('label', 'modal-field-label', labelText);
+    label.htmlFor = id;
+    const input = domElement('input');
+    input.id = id;
+    input.type = 'text';
+    input.placeholder = placeholder;
+    input.value = String(value || '');
+    input.setAttribute('aria-describedby', 'modal-error');
+    body.appendChild(label);
+    body.appendChild(input);
+    return { body, input };
+}
+
 function promptForNewProject() {
-    const input = document.createElement('input');
-    input.type = 'text'; input.placeholder = '新项目名（如：修仙世界）';
-    input.style.cssText = 'width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text)';
-    showModal({ title: '新建项目（世界观）', body: input, footer: { confirmText: '创建', onConfirm: async () => {
-        const name = input.value.trim();
-        if (!name) return false;
-        return Boolean(await createNewProject(name));
-    }}});
-    setTimeout(() => input.focus(), 100);
+    const { body, input } = labeledModalTextInput(
+        'new-project-name', '项目名称', '新项目名（如：修仙世界）',
+    );
+    showModal({
+        title: '新建项目（世界观）',
+        body,
+        footer: {
+            confirmText: '创建', pendingText: '创建中…',
+            onConfirm: async () => {
+                const name = input.value.trim();
+                if (!name) {
+                    input.setAttribute('aria-invalid', 'true');
+                    return false;
+                }
+                input.removeAttribute('aria-invalid');
+                input.disabled = true;
+                try { return Boolean(await createNewProject(name)); }
+                finally { input.disabled = false; }
+            },
+        },
+    });
 }
 
 function promptForNewSave() {
-    const input = document.createElement('input');
-    input.type = 'text'; input.placeholder = '存档名（如：主线剧情 / 支线A）';
-    input.style.cssText = 'width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text)';
-    showModal({ title: '新建存档', body: input, footer: { confirmText: '创建', onConfirm: async () => {
-        const name = input.value.trim() || '新存档';
-        return Boolean(await createNewSave(name));
-    }}});
-    setTimeout(() => input.focus(), 100);
+    const { body, input } = labeledModalTextInput(
+        'new-save-name', '存档名称', '存档名（如：主线剧情 / 支线A）',
+    );
+    showModal({
+        title: '新建存档',
+        body,
+        footer: {
+            confirmText: '创建', pendingText: '创建中…',
+            onConfirm: async () => {
+                input.disabled = true;
+                try { return Boolean(await createNewSave(input.value.trim() || '新存档')); }
+                finally { input.disabled = false; }
+            },
+        },
+    });
 }
 
 function promptForRenameSave() {
     const current = state.saveList.find(s => s.session_id === state.currentSave);
-    const input = document.createElement('input');
-    input.type = 'text'; input.value = current ? current.name : '';
-    input.style.cssText = 'width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text)';
-    showModal({ title: '重命名存档', body: input, footer: { confirmText: '保存', onConfirm: async () => {
-        const name = input.value.trim();
-        if (!name) return false;
-        return Boolean(await renameCurrentSave(name));
-    }}});
+    const { body, input } = labeledModalTextInput(
+        'rename-save-name', '新的存档名称', '输入新的存档名', current ? current.name : '',
+    );
+    showModal({
+        title: '重命名存档',
+        body,
+        footer: {
+            confirmText: '保存', pendingText: '保存中…',
+            onConfirm: async () => {
+                const name = input.value.trim();
+                if (!name) {
+                    input.setAttribute('aria-invalid', 'true');
+                    return false;
+                }
+                input.removeAttribute('aria-invalid');
+                input.disabled = true;
+                try { return Boolean(await renameCurrentSave(name)); }
+                finally { input.disabled = false; }
+            },
+        },
+    });
 }
 
 function promptForImportSave() {
     const body = document.createElement('div');
+    const label = domElement('label', 'modal-field-label', '选择 JSON 存档文件');
     const inp = document.createElement('input');
+    inp.id = 'save-import-file';
     inp.type = 'file'; inp.accept = '.json';
+    label.htmlFor = inp.id;
     inp.setAttribute('aria-describedby', 'save-import-status');
     const status = document.createElement('p');
     status.id = 'save-import-status';
     status.setAttribute('role', 'status');
     status.setAttribute('aria-live', 'polite');
     status.style.cssText = 'min-height:20px;margin-top:8px;color:var(--text-dim)';
+    body.appendChild(label);
     body.appendChild(inp);
     body.appendChild(status);
     inp.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
         inp.disabled = true;
+        modalController.setPending(true);
+        status.setAttribute('role', 'status');
+        status.setAttribute('aria-live', 'polite');
         status.textContent = '正在验证并导入…';
         try {
             await importSave(file);
             status.textContent = '导入成功';
             showToast('存档导入成功');
+            modalController.setPending(false);
             hideModal();
         } catch (error) {
-            status.textContent = '导入失败：' + error.message;
+            status.setAttribute('role', 'alert');
+            status.setAttribute('aria-live', 'assertive');
+            status.textContent = `导入失败：${errorDetail(error)}`;
+            modalController.setPending(false);
             inp.disabled = false;
             inp.value = '';
             inp.focus();

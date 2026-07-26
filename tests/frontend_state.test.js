@@ -7,6 +7,7 @@ const {
     ApiClient,
     ApiError,
     parseSseFrame,
+    payloadDetails,
     readSse,
 } = require('../web/api-client.js');
 const {
@@ -101,6 +102,43 @@ test('ApiClient normalizes JSON and text HTTP errors', async () => {
                 && error.message === message,
         );
     }
+});
+
+test('ApiClient 优先采用规范 error 信封并兼容旧 detail 字段', async () => {
+    const canonical = {
+        error: {
+            code: 'turn_conflict',
+            message: '规范错误',
+            details: { turn_id: 'canonical-turn', retryable: false },
+        },
+        detail: {
+            code: 'legacy_conflict',
+            message: '旧错误',
+            turn_id: 'legacy-turn',
+        },
+    };
+    const canonicalClient = new ApiClient({
+        fetchImpl: async () => jsonResponse(canonical, 409),
+    });
+    await assert.rejects(
+        () => canonicalClient.post('/api/test', {}),
+        error => error instanceof ApiError
+            && error.code === 'turn_conflict'
+            && error.message === '规范错误'
+            && error.details.turn_id === 'canonical-turn'
+            && error.details.retryable === false,
+    );
+    assert.deepEqual(payloadDetails(canonical), canonical.error.details);
+
+    const legacy = { detail: { code: 'legacy_only', message: '旧格式', turn_id: 'legacy-turn' } };
+    const legacyClient = new ApiClient({ fetchImpl: async () => jsonResponse(legacy, 409) });
+    await assert.rejects(
+        () => legacyClient.get('/api/test'),
+        error => error instanceof ApiError
+            && error.code === 'legacy_only'
+            && error.message === '旧格式'
+            && error.details.turn_id === 'legacy-turn',
+    );
 });
 
 test('ApiClient distinguishes invalid JSON, network failure, abort and timeout', async () => {

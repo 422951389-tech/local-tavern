@@ -1,12 +1,32 @@
 """设置路由。"""
 import asyncio
 import json
-from fastapi import APIRouter, Request
+from typing import Annotated
 
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from core.api_errors import validation_error_detail
 from core.config import SETTINGS_PATH
 from core.session_store import atomic_write
+from routes.common import _json_object
 
 router = APIRouter()
+
+Temperature = Annotated[float, Field(ge=0.0, le=2.0)]
+TopP = Annotated[float, Field(ge=0.0, le=1.0)]
+TopK = Annotated[int, Field(ge=0, le=1000)]
+NumPredict = Annotated[int, Field(ge=1, le=32768)]
+
+
+class SettingsValues(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    temperature: Temperature = 0.8
+    top_p: TopP = 0.9
+    top_k: TopK = 40
+    num_predict: NumPredict = 4096
+    think: bool = True
 
 
 @router.get("/api/settings")
@@ -22,10 +42,32 @@ async def api_get_settings():
 
 @router.put("/api/settings")
 async def api_save_settings(req: Request):
-    body = await req.json()
+    body = await _json_object(req)
     data = body.get("data", body)
-    allowed = {"temperature", "top_p", "top_k", "num_predict", "think"}
-    filtered = {k: v for k, v in data.items() if k in allowed}
+    if "data" in body and set(body) != {"data"}:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_request_body",
+                "message": "设置包装对象只允许 data 字段",
+            },
+        )
+    if not isinstance(data, dict):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_request_body",
+                "message": "设置 data 必须是 JSON 对象",
+            },
+        )
+    try:
+        validated = SettingsValues.model_validate(data)
+    except ValidationError as exc:
+        raise HTTPException(
+            422,
+            detail=validation_error_detail(exc.errors()),
+        ) from None
+    filtered = validated.model_dump(include=validated.model_fields_set)
     content = json.dumps(filtered, ensure_ascii=False, indent=2)
     await asyncio.to_thread(atomic_write, SETTINGS_PATH, content)
     return {"saved": True}

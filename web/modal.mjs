@@ -128,7 +128,7 @@ export function createModalController(elements, options = {}) {
             : (documentRef && documentRef.activeElement ? documentRef.activeElement : null);
         title.textContent = String(config.title || '');
         body.replaceChildren();
-        if (typeof config.body === 'string') body.innerHTML = config.body;
+        if (typeof config.body === 'string') body.textContent = config.body;
         else if (config.body) body.appendChild(config.body);
         setError('');
 

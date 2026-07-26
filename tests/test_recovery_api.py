@@ -142,9 +142,9 @@ async def test_checkpoint_restore_rejects_stale_revision_without_mutation(app_cl
     )
 
     assert stale.status_code == 409, stale.text
-    detail = stale.json().get("error") or stale.json().get("detail")
-    assert detail["code"] == "revision_conflict"
-    assert detail["current_revision"] == current["revision"]
+    error = stale.json()["error"]
+    assert error["code"] == "revision_conflict"
+    assert error["details"]["current_revision"] == current["revision"]
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
 
 
@@ -453,8 +453,8 @@ async def test_trash_restore_conflict_and_forged_recovery_id_do_not_write(app_cl
         json={"overwrite": False},
     )
     assert conflict.status_code == 409, conflict.text
-    detail = conflict.json().get("error") or conflict.json().get("detail")
-    assert detail["code"] == "target_exists"
+    error = conflict.json()["error"]
+    assert error["code"] == "target_exists"
     assert hashlib.sha256(save_path.read_bytes()).hexdigest() == before
     assert session_manager.load_session(project, save)["revision"] == replacement["revision"]
 

@@ -278,7 +278,8 @@ async function waitForApplication() {
             const tab = document.getElementById('tab-relations');
             return document.readyState === 'complete'
                 && tab && !tab.disabled
-                && document.querySelectorAll('.msg[data-message-id]').length === 2;
+                && document.querySelectorAll('.msg[data-message-id]').length === 2
+                && document.getElementById('app-status')?.textContent.includes('已进入');
         })()`,
         '应用初始化',
     );

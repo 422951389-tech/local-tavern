@@ -183,6 +183,7 @@ let context = null;
 const processOutput = [];
 const pageErrors = [];
 const consoleErrors = [];
+const auditedViews = [];
 let expectedHttpFailure = false;
 
 function collectProcessOutput(child, label) {
@@ -230,6 +231,147 @@ async function switchProject(page, project) {
     await page.locator('#project-name').filter({ hasText: project }).waitFor();
 }
 
+const AXE_TAGS = Object.freeze(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']);
+
+async function axeSeriousCritical(page, scope = null) {
+    if (skipAxe) return null;
+    let builder = new AxeBuilder({ page }).withTags(AXE_TAGS);
+    if (scope) builder = builder.include(scope);
+    const result = await builder.analyze();
+    return result.violations
+        .filter(item => ['serious', 'critical'].includes(item.impact))
+        .map(item => ({
+            id: item.id,
+            impact: item.impact,
+            nodes: item.nodes.length,
+            help: item.help,
+        }));
+}
+
+async function auditOpenModal(page, name, { statusSelectors = [] } = {}) {
+    await page.setViewportSize({ width: 375, height: 812 });
+    await page.locator('#modal-backdrop').waitFor({ state: 'visible' });
+    const layout = await page.evaluate(({ selectors }) => {
+        const backdrop = document.querySelector('#modal-backdrop');
+        const dialog = document.querySelector('#modal');
+        const body = document.querySelector('#modal-body');
+        const titleId = dialog?.getAttribute('aria-labelledby') || '';
+        const title = titleId ? document.getElementById(titleId) : null;
+        const labels = [...(body?.querySelectorAll('label') || [])];
+        const visible = element => {
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden'
+                && rect.width > 0 && rect.height > 0;
+        };
+        const unlabeledControls = [...(body?.querySelectorAll('input, textarea, select') || [])]
+            .filter(visible)
+            .filter(control => !control.id || !labels.some(label => label.htmlFor === control.id))
+            .map(control => ({ tag: control.tagName, id: control.id, type: control.type || '' }));
+        const requiredStatuses = ['#modal-error', ...selectors].map(selector => ({
+            selector,
+            element: document.querySelector(selector),
+        }));
+        const invalidStatuses = requiredStatuses
+            .filter(({ element }) => (
+                !element
+                || !['status', 'alert'].includes(element.getAttribute('role'))
+                || !['polite', 'assertive'].includes(element.getAttribute('aria-live'))
+            ))
+            .map(({ selector, element }) => ({
+                selector,
+                role: element?.getAttribute('role') || null,
+                ariaLive: element?.getAttribute('aria-live') || null,
+            }));
+        const executableNodes = [...(body?.querySelectorAll('script, img') || [])]
+            .map(element => ({ tag: element.tagName, src: element.getAttribute('src') || '' }));
+        const viewportWidth = document.documentElement.clientWidth;
+        const dialogRect = dialog?.getBoundingClientRect();
+        return {
+            viewportWidth,
+            pageHorizontalOverflow: document.documentElement.scrollWidth - viewportWidth,
+            modalBodyHorizontalOverflow: body ? body.scrollWidth - body.clientWidth : null,
+            dialogBounds: dialogRect ? {
+                left: Math.round(dialogRect.left * 10) / 10,
+                right: Math.round(dialogRect.right * 10) / 10,
+                width: Math.round(dialogRect.width * 10) / 10,
+            } : null,
+            backdropAriaHidden: backdrop?.getAttribute('aria-hidden') || null,
+            dialogRole: dialog?.getAttribute('role') || null,
+            dialogAriaModal: dialog?.getAttribute('aria-modal') || null,
+            titleId,
+            titleText: title?.textContent?.trim() || '',
+            unlabeledControls,
+            invalidStatuses,
+            executableNodes,
+        };
+    }, { selectors: statusSelectors });
+
+    assert.equal(layout.backdropAriaHidden, 'false', `${name}: backdrop 必须暴露给辅助技术`);
+    assert.equal(layout.dialogRole, 'dialog', `${name}: Modal 缺少 dialog 角色`);
+    assert.equal(layout.dialogAriaModal, 'true', `${name}: Modal 缺少 aria-modal`);
+    assert.notEqual(layout.titleId, '', `${name}: Modal 缺少标题关联`);
+    assert.notEqual(layout.titleText, '', `${name}: Modal 标题为空`);
+    assert.deepEqual(layout.unlabeledControls, [], `${name}: 存在没有显式 label/for 的表单控件`);
+    assert.deepEqual(layout.invalidStatuses, [], `${name}: 状态区缺少 role/aria-live`);
+    assert.deepEqual(layout.executableNodes, [], `${name}: Modal 内出现 img/script 节点`);
+    assert.equal(layout.pageHorizontalOverflow <= 0, true, `${name}: 页面在 375px 横向溢出`);
+    assert.equal(layout.modalBodyHorizontalOverflow <= 0, true, `${name}: Modal 内容在 375px 横向溢出`);
+    assert.equal(Boolean(
+        layout.dialogBounds
+        && layout.dialogBounds.left >= -0.1
+        && layout.dialogBounds.right <= layout.viewportWidth + 0.1
+    ), true, `${name}: Modal 边界超出 375px 视口`);
+
+    const severe = await axeSeriousCritical(page, '#modal');
+    if (severe) assert.deepEqual(severe, [], `${name}: axe serious/critical 违规`);
+    auditedViews.push({
+        name,
+        kind: 'modal',
+        viewport: 375,
+        axe_serious_critical: severe === null ? null : severe.length,
+        layout,
+    });
+}
+
+async function closeModalAfterAudit(page) {
+    await page.locator('#modal-close').click();
+    await page.locator('#modal-backdrop').waitFor({ state: 'hidden' });
+}
+
+async function auditReadOnlyModals(page) {
+    await page.locator('#model-params-btn').click();
+    await auditOpenModal(page, 'model_params');
+    await closeModalAfterAudit(page);
+
+    await openSaveDropdown(page);
+    await page.locator('#save-new-inline').click();
+    await auditOpenModal(page, 'new_save');
+    await closeModalAfterAudit(page);
+
+    await openSaveDropdown(page);
+    await page.locator('#save-rename-inline').click();
+    await auditOpenModal(page, 'rename_save');
+    await closeModalAfterAudit(page);
+
+    await openSaveDropdown(page);
+    const chooserPromise = page.waitForEvent('filechooser');
+    await page.locator('#save-import-inline').click();
+    await chooserPromise;
+    await auditOpenModal(page, 'import_save', { statusSelectors: ['#save-import-status'] });
+    await closeModalAfterAudit(page);
+
+    await page.locator('#history-btn').click();
+    await page.waitForFunction(() => document.querySelector('#history-status')?.textContent !== '加载中…');
+    await auditOpenModal(page, 'history', { statusSelectors: ['#history-status'] });
+    await closeModalAfterAudit(page);
+
+    await page.locator('#tab-chars').click();
+    await page.locator('#ce-status').waitFor({ state: 'attached' });
+    await auditOpenModal(page, 'character_cards', { statusSelectors: ['#ce-status'] });
+    await closeModalAfterAudit(page);
+}
+
 async function auditViewports(page) {
     const failures = [];
     const layouts = [];
@@ -241,23 +383,27 @@ async function auditViewports(page) {
         }));
         layouts.push(layout);
         assert.equal(layout.horizontalOverflow <= 0, true, JSON.stringify(layout));
-        if (!skipAxe) {
-            const result = await new AxeBuilder({ page })
-                .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
-                .analyze();
-            const severe = result.violations.filter(item => ['serious', 'critical'].includes(item.impact));
+        const severe = await axeSeriousCritical(page);
+        if (severe) {
             for (const violation of severe) {
                 failures.push({
                     width,
                     id: violation.id,
                     impact: violation.impact,
-                    nodes: violation.nodes.length,
+                    nodes: violation.nodes,
                     help: violation.help,
                 });
             }
         }
     }
     assert.deepEqual(failures, []);
+    auditedViews.push({
+        name: 'main_page',
+        kind: 'page',
+        viewports: layouts.map(layout => layout.width),
+        axe_serious_critical: skipAxe ? null : failures.length,
+        layouts,
+    });
     return { failures, layouts };
 }
 
@@ -333,6 +479,9 @@ try {
         && document.querySelector('#model-select')?.value === 'fake-model:latest'
     ));
 
+    // 动态 Modal 只打开审计后关闭，不执行创建、保存、重命名或导入写入。
+    await auditReadOnlyModals(page);
+
     // 慢流取消：必须由服务端 turn 终态收口。
     setControl(controlFile, 'slow', { hold_ms: 60_000 });
     await page.locator('#user-input').fill('继续验证');
@@ -374,6 +523,13 @@ try {
             : null;
     }, '建议发送终态');
     assert.equal(afterSuggestion.message_history.length, beforeSuggestion + 2);
+    // 服务端已提交不等于前端已完成权威重载；等待写锁真正释放。
+    await page.waitForFunction(() => document.querySelector('#app-status')?.textContent === '生成完成');
+    await page.waitForFunction(() => {
+        const buttons = document.querySelectorAll('.msg.user .msg-action-btn.edit');
+        const button = buttons.item(buttons.length - 1);
+        return Boolean(button && !button.disabled);
+    });
 
     // 消息编辑使用 Ctrl+Enter 提交。
     const lastUser = page.locator('.msg.user').last();
@@ -465,6 +621,7 @@ try {
             'message_edit', 'snapshot_preview_restore', 'malicious_import',
         ],
         axe_serious_critical: skipAxe ? null : viewportAudit.failures.length,
+        audited_views: auditedViews,
         viewport_layouts: viewportAudit.layouts,
         layout,
     }, null, 2));

@@ -63,11 +63,12 @@ async def test_corrupt_session_get_is_structured_pure_and_path_safe(
     error = _error(response)
     assert error["code"] == "data_corrupt"
     assert isinstance(error["message"], str) and error["message"]
-    assert error["entity_type"] == "session"
-    assert error["project"] == project
-    assert error["entity_id"] == save
-    assert error["fingerprint"] == _fingerprint(content)
-    assert error["quarantine_available"] is True
+    details = error["details"]
+    assert details["entity_type"] == "session"
+    assert details["project"] == project
+    assert details["entity_id"] == save
+    assert details["fingerprint"] == _fingerprint(content)
+    assert details["quarantine_available"] is True
     assert str(path.resolve(strict=False)) not in response.text
     assert str(isolated_paths["root"]) not in response.text
     assert file_manifest(isolated_paths["root"]) == before
@@ -162,7 +163,7 @@ async def test_changed_fingerprint_rejects_quarantine_without_recovery_write(app
         params={"project": project, "save": save},
     )
     assert detected.status_code == 422, detected.text
-    old_fingerprint = _error(detected)["fingerprint"]
+    old_fingerprint = _error(detected)["details"]["fingerprint"]
     path.write_bytes(changed)
 
     response = await app_client.post(
@@ -176,7 +177,7 @@ async def test_changed_fingerprint_rejects_quarantine_without_recovery_write(app
     )
 
     assert response.status_code == 409, response.text
-    error = response.json().get("error") or response.json().get("detail")
+    error = response.json()["error"]
     assert error["code"] == "source_changed"
     assert path.read_bytes() == changed
     listed = await app_client.get(
