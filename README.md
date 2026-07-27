@@ -95,9 +95,10 @@ C:\local-tavern\
 ## 验证
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m compileall -q core routes tests server.py
-.\.venv\Scripts\python.exe -m pip check
+.\.venv-dev\Scripts\python.exe tools\quality_gate.py --preflight
+.\.venv-dev\Scripts\python.exe -m pytest -q
+.\.venv-dev\Scripts\python.exe -m compileall -q core routes tests server.py
+.\.venv-dev\Scripts\python.exe -m pip check
 .\.venv-dev\Scripts\python.exe tools\quality_gate.py --release
 ```
 
@@ -106,10 +107,9 @@ C:\local-tavern\
 ## 文档
 
 - 项目内事实与交接文档：`AI_CONTEXT.md`
-- 桌面项目事实文档：`本地酒馆搭建-AI上下文.md`
-- 桌面优化进度文档：`本地酒馆-功能优化规划.md`
+- 桌面唯一权威文档：`本地酒馆-完整项目文档.md`
 
-每个优化包完成后，同步更新上述事实与进度文档。
+项目事实发生变化时，同步更新仓库交接文档与桌面完整项目文档；不要再拆分新的桌面上下文或优化规划文档。
 
 ## 常见问题
 

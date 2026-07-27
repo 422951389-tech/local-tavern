@@ -4,7 +4,7 @@
 > **创建日期**：2026-06-27
 > **最后更新**：2026-07-27（OPS-2 可复现发布门收口）
 > **当前状态**：阶段 A、B、C、D、E 与全部规划工作包 completed；正式 release 质量门 35/35 通过并输出 `release_ready:true`
-> **权威进度**：以桌面《本地酒馆搭建-AI上下文.md》和《本地酒馆-功能优化规划.md》为准
+> **桌面权威文档**：`C:\Users\zcw\Desktop\本地酒馆-完整项目文档.md`；项目目的、功能、实现、使用、维护、安全与验收统一在该文件维护
 
 ---
 
@@ -344,7 +344,7 @@ active: true              # 是否默认出场
 
 ## 10. 待办 / 未实现
 
-完整验收矩阵维护在桌面《本地酒馆-功能优化规划.md》。阶段 A、B、C、D、E 与现有规划工作包均已完成，没有待实施的既定优化项。`verify_regression.py` 的 T7 真实 Ollama smoke 仍是人工显式、会写测试存档的可选检查，不属于发布阻断门。
+完整项目说明和验收矩阵统一维护在桌面《本地酒馆-完整项目文档.md》。阶段 A、B、C、D、E 与现有规划工作包均已完成，没有待实施的既定优化项。`verify_regression.py` 的 T7 真实 Ollama smoke 仍是人工显式、会写测试存档的可选检查，不属于发布阻断门。
 
 ---
 
@@ -402,7 +402,7 @@ active: true              # 是否默认出场
 
 1. **先执行 `git status --short` 与 `git log -4 --oneline`**，确认工作区和最近提交；实现基线为 `c689fbc`
 2. **日常改动先跑 `.venv\Scripts\python.exe tools\quality_gate.py --preflight`**；依赖、浏览器或发布链变更后，再用 `.venv-dev\Scripts\python.exe tools\quality_gate.py --release`
-3. **依赖升级或重新下载制品前取得明确确认**；同步更新语义锁、hash/integrity 锁、环境校验器和两份桌面文档
+3. **依赖升级或重新下载制品前取得明确确认**；同步更新语义锁、hash/integrity 锁、环境校验器和桌面《本地酒馆-完整项目文档.md》
 4. **检查启动链**：首次运行 `setup.bat`，随后使用 `start.bat` 或 `run_hidden.vbs`；不要绕过 launcher 直接调用 uvicorn
 5. **确认 Ollama 在跑**（`ollama ps`）
 6. **如果用户说"X 不工作"**，先 curl 测 API → 看 server 日志 → 看前端 console
