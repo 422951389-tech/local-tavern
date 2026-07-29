@@ -170,6 +170,11 @@ def _validate_result(result: dict, *, pid: int, stage: str) -> None:
         raise DesktopJourneySmokeError("桌面旅程结果版本不匹配")
     if result.get("pid") != pid or result.get("stage") != stage:
         raise DesktopJourneySmokeError("桌面旅程结果与当前进程阶段不匹配")
+    reported_error = result.get("error")
+    if isinstance(reported_error, str) and reported_error:
+        raise DesktopJourneySmokeError(
+            f"桌面旅程报告错误：{reported_error[:120]}"
+        )
     for field in (
         "ready",
         "page_loaded",

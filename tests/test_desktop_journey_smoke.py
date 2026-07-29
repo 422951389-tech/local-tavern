@@ -143,6 +143,12 @@ def test_result_contract_requires_refresh_save_switch_restart_and_no_tcp():
     with pytest.raises(DesktopJourneySmokeError, match="save_switch_verified"):
         _validate_result(failed, pid=4242, stage="seed")
 
+    reported = _valid_result(4242, "seed")
+    reported["ready"] = False
+    reported["error"] = "http_500"
+    with pytest.raises(DesktopJourneySmokeError, match="http_500"):
+        _validate_result(reported, pid=4242, stage="seed")
+
     listener = _valid_result(4242, "seed")
     listener["tcp_listener_started"] = True
     with pytest.raises(DesktopJourneySmokeError, match="TCP"):
@@ -153,7 +159,7 @@ def test_result_contract_requires_refresh_save_switch_restart_and_no_tcp():
 async def test_fake_provider_is_in_process_and_deterministic():
     registry = JourneyProviderRegistry()
     assert await registry.list_models("desktop-journey-fake") == [JOURNEY_MODEL]
-    lease = registry.lease("desktop-journey-fake")
+    lease = await registry.acquire_lease("desktop-journey-fake")
     events = [
         event
         async for event in lease.provider.chat_stream(

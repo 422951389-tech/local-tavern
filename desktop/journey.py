@@ -214,6 +214,14 @@ class JourneyProviderRegistry:
     def lease(self, provider_id: str = "ollama") -> _JourneyProviderLease:
         return _JourneyProviderLease(self.get_config(provider_id), self._provider)
 
+    async def acquire_lease(
+        self,
+        provider_id: str = "ollama",
+    ) -> _JourneyProviderLease:
+        """匹配正式注册表的异步租约接口；内存替身无需线程切换。"""
+
+        return self.lease(provider_id)
+
     async def list_models(self, provider_id: str) -> list[str]:
         self.get_config(provider_id)
         return await self._provider.list_models()
