@@ -3,6 +3,7 @@
 普通局部事务持共享锁；整库备份、恢复、迁移和项目删除持独占锁。
 锁采用写者优先，避免持续聊天写入让灾备操作永久饥饿。
 """
+
 from __future__ import annotations
 
 import threading
@@ -26,13 +27,8 @@ class LibraryRWLock:
         with self._condition:
             reentrant_reader = self._reader_depth.get(thread_id, 0) > 0
             writer_owned = self._writer == thread_id
-            while (
-                self._writer is not None
-                and not writer_owned
-            ) or (
-                self._waiting_writers > 0
-                and not reentrant_reader
-                and not writer_owned
+            while (self._writer is not None and not writer_owned) or (
+                self._waiting_writers > 0 and not reentrant_reader and not writer_owned
             ):
                 self._condition.wait()
                 reentrant_reader = self._reader_depth.get(thread_id, 0) > 0
@@ -90,13 +86,30 @@ class LibraryRWLock:
             self.release_shared()
 
     @contextmanager
+    def shared_write(self) -> Iterator[None]:
+        """共享写锁；锁内复核维护代次，阻断跨恢复边界的旧写入。"""
+
+        self.acquire_shared()
+        try:
+            from core.active_turns import assert_global_write_allowed
+
+            assert_global_write_allowed()
+            yield
+        finally:
+            self.release_shared()
+
+    @contextmanager
     def exclusive(self) -> Iterator[None]:
         self.acquire_exclusive()
         try:
+            from core.active_turns import assert_global_write_allowed
+
+            # 所有整库独占调用均会创建、恢复、迁移或删除持久化数据。
+            # 在真正取得锁后复核维护代次，阻断恢复前已排队的旧请求。
+            assert_global_write_allowed()
             yield
         finally:
             self.release_exclusive()
 
 
 library_lock = LibraryRWLock()
-

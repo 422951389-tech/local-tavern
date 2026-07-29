@@ -2,12 +2,13 @@ import asyncio
 from copy import deepcopy
 from datetime import datetime
 import json
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
 from core import active_turns
 from core.import_validation import validate_import_json
+from core.recovery_store import DataCorruptionError
 from core.session_manager import (
     get_session_store,
     mutate_session,
@@ -121,7 +122,7 @@ def test_generated_summary_validation_never_silently_truncates(raw, code):
 
 
 @pytest.mark.asyncio
-async def test_legacy_summary_ids_are_deterministic_unique_and_pure_read(seed_project):
+async def test_duplicate_existing_summary_ids_are_corrupt_and_pure_read(seed_project):
     project = seed_project("legacy_summary_identity")
     save = "旧摘要"
     store = get_session_store()
@@ -136,15 +137,14 @@ async def test_legacy_summary_ids_are_deterministic_unique_and_pure_read(seed_pr
     atomic_write(path, json.dumps(raw, ensure_ascii=False, indent=2))
     before = path.read_bytes()
 
-    first = store.read_sync(project, save)
-    second = store.read_sync(project, save)
-    first_ids = [item["id"] for item in first["summaries"]]
-    assert first_ids == [item["id"] for item in second["summaries"]]
-    assert len(set(first_ids)) == 3
-    assert all(str(UUID(value)) == value for value in first_ids)
-    assert first_ids[1] == duplicate
-    assert all(item["source_status"] == "unlinked" for item in first["summaries"])
-    assert all(item["status"] == "completed" for item in first["summaries"])
+    with pytest.raises(DataCorruptionError) as first:
+        store.read_sync(project, save)
+    with pytest.raises(DataCorruptionError) as second:
+        store.read_sync(project, save)
+
+    assert first.value.code == "data_corrupt"
+    assert second.value.code == "data_corrupt"
+    assert first.value.fingerprint == second.value.fingerprint
     assert path.read_bytes() == before
 
 
@@ -288,6 +288,129 @@ async def test_regenerate_reads_only_target_snapshot_and_duplicate_request_is_si
 
 
 @pytest.mark.asyncio
+async def test_regenerate_rejects_stale_model_against_provider_model_list(
+    app_client,
+    seed_project,
+    monkeypatch,
+):
+    import routes.messages as message_routes
+
+    project = "summary_provider_model_validation"
+    save, session, _sources = await _seed_summaries(
+        seed_project,
+        project,
+        [("旧摘要", "SOURCE-MODEL")],
+    )
+    summary_id = session["summaries"][0]["id"]
+
+    def select_stale_model(current: dict, context) -> None:
+        del context
+        current["current_provider"] = "cloud-main"
+        current["current_model"] = "retired-model"
+
+    selected = await mutate_session(
+        project,
+        save,
+        session["revision"],
+        select_stale_model,
+    )
+
+    class Registry:
+        def __init__(self):
+            self.lease_calls: list[str] = []
+            self.release_calls = 0
+
+        def lease(self, provider_id: str):
+            assert provider_id == "cloud-main"
+            self.lease_calls.append(provider_id)
+            registry = self
+
+            class Provider:
+                async def list_models(self) -> list[str]:
+                    return ["current-model"]
+
+            class Lease:
+                provider = Provider()
+                config = type("Config", (), {"models": ()})()
+
+                async def release(self) -> None:
+                    registry.release_calls += 1
+
+            return Lease()
+
+        async def acquire_lease(self, provider_id: str):
+            return self.lease(provider_id)
+
+    registry = Registry()
+    monkeypatch.setattr(message_routes, "get_provider_registry", lambda: registry)
+
+    rejected = await app_client.post("/api/session/summary/regenerate", json={
+        "project": project,
+        "save": save,
+        "expected_revision": selected.session["revision"],
+        "summary_id": summary_id,
+    })
+
+    assert rejected.status_code == 400, rejected.text
+    assert _detail_code(rejected) == "provider_model_unavailable"
+    assert rejected.json()["error"]["details"] == {
+        "provider_id": "cloud-main",
+        "models": ["current-model"],
+    }
+    assert registry.lease_calls == ["cloud-main"]
+    assert registry.release_calls == 1
+    current = get_session_store().read_sync(project, save)
+    assert current["revision"] == selected.session["revision"]
+    assert current["summaries"][0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_summary_unknown_exception_is_redacted_from_storage_and_response(
+    app_client,
+    fake_ollama,
+    seed_project,
+    monkeypatch,
+    caplog,
+):
+    project = "summary_unknown_error_redaction"
+    save, session, _sources = await _seed_summaries(
+        seed_project,
+        project,
+        [("旧摘要仍保留", "SOURCE-PRIVATE")],
+    )
+    summary_id = session["summaries"][0]["id"]
+    private_detail = "PRIVATE-UPSTREAM-DETAIL-7841"
+
+    async def explode(*_args, **_kwargs):
+        raise RuntimeError(private_detail)
+
+    monkeypatch.setattr(fake_ollama, "summarize_once", explode)
+    caplog.set_level("ERROR", logger="core.summary_lifecycle")
+    accepted = await app_client.post("/api/session/summary/regenerate", json={
+        "project": project,
+        "save": save,
+        "expected_revision": session["revision"],
+        "summary_id": summary_id,
+    })
+    assert accepted.status_code == 202, accepted.text
+
+    failed = await _wait_summary(project, save, summary_id, "failed")
+    item = failed["summaries"][0]
+    assert item["error"] == "摘要生成失败，请重试"
+    assert item["text"] == "旧摘要仍保留"
+    assert private_detail not in json.dumps(failed, ensure_ascii=False)
+
+    public = await app_client.get(
+        "/api/session",
+        params={"project": project, "save": save},
+    )
+    assert public.status_code == 200
+    assert private_detail not in public.text
+    assert "摘要生成失败，请重试" in public.text
+    assert private_detail in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_missing_unlinked_and_mismatched_sources_never_fallback_or_call_model(
     app_client,
     fake_ollama,
@@ -389,6 +512,9 @@ async def test_empty_output_fails_then_retry_completes_without_losing_identity(
         "summary_id": summary_id,
     })
     assert accepted.status_code == 202
+    accepted_summary = accepted.json()["session"]["summaries"][0]
+    assert accepted_summary["provider"] == accepted.json()["session"]["current_provider"]
+    assert accepted_summary["model"] == accepted.json()["session"]["current_model"]
     failed = await _wait_summary(project, save, summary_id, "failed")
     failed_item = failed["summaries"][0]
     assert failed_item["id"] == summary_id

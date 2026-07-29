@@ -69,8 +69,8 @@ def _configured_bool(env_name: str, default: bool) -> bool:
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
-def _configured_host(env_name: str, default: str, *, allow_remote: bool) -> str:
-    """读取 uvicorn 监听地址；远程监听必须由显式开关授权。"""
+def _configured_host(env_name: str, default: str) -> str:
+    """读取仅限本机回环的开发服务监听地址。"""
     raw = os.environ.get(env_name, default)
     host = raw.strip()
     if not host:
@@ -91,10 +91,8 @@ def _configured_host(env_name: str, default: str, *, allow_remote: bool) -> str:
     else:
         is_loopback = address.is_loopback
 
-    if not is_loopback and not allow_remote:
-        raise ValueError(
-            f"{env_name} 非本机回环地址时必须显式设置 TAVERN_ALLOW_REMOTE=true"
-        )
+    if not is_loopback:
+        raise ValueError(f"{env_name} 仅支持本机回环地址")
     return host
 
 
@@ -159,8 +157,11 @@ BACKUPS_DIR = _configured_path("TAVERN_BACKUP_DIR", BASE_DIR / "backups")
 LOG_DIR = _configured_path("TAVERN_LOG_DIR", BASE_DIR / "logs")
 
 # 服务、进程守卫、健康探测与日志共同使用的运行参数。
-ALLOW_REMOTE = _configured_bool("TAVERN_ALLOW_REMOTE", False)
-HOST = _configured_host("TAVERN_HOST", "127.0.0.1", allow_remote=ALLOW_REMOTE)
+DESKTOP_MODE = _configured_bool("TAVERN_DESKTOP_MODE", False)
+if _configured_bool("TAVERN_ALLOW_REMOTE", False):
+    raise ValueError("本地酒馆不支持远程监听；请使用桌面独立版或本机回环地址")
+ALLOW_REMOTE = False
+HOST = _configured_host("TAVERN_HOST", "127.0.0.1")
 PORT = _configured_int("TAVERN_PORT", 8765, minimum=1, maximum=65535)
 PID_PATH = _configured_path("TAVERN_PID_PATH", BASE_DIR / "tavern.pid")
 STOP_REQUEST_PATH = _configured_path(
@@ -179,6 +180,59 @@ LOG_BACKUP_COUNT = _configured_int(
     5,
     minimum=1,
     maximum=100,
+)
+
+# 单轮生成与持久事件日志的资源边界。输出字节同时统计正文与思考内容，
+# 防止 Provider 忽略 num_predict 或持续发送碎片时无界占用内存和磁盘。
+CHAT_GENERATION_MAX_SECONDS = _configured_int(
+    "TAVERN_CHAT_GENERATION_MAX_SECONDS",
+    10 * 60,
+    minimum=5,
+    maximum=60 * 60,
+)
+CHAT_OUTPUT_MAX_BYTES = _configured_int(
+    "TAVERN_CHAT_OUTPUT_MAX_BYTES",
+    4 * 1024 * 1024,
+    minimum=64 * 1024,
+    maximum=64 * 1024 * 1024,
+)
+TURN_EVENT_MAX_BYTES = _configured_int(
+    "TAVERN_TURN_EVENT_MAX_BYTES",
+    2 * 1024 * 1024,
+    minimum=4 * 1024,
+    maximum=16 * 1024 * 1024,
+)
+TURN_EVENT_LOG_MAX_BYTES = _configured_int(
+    "TAVERN_TURN_EVENT_LOG_MAX_BYTES",
+    16 * 1024 * 1024,
+    minimum=128 * 1024,
+    maximum=256 * 1024 * 1024,
+)
+TURN_TERMINAL_EVENT_RESERVE_BYTES = _configured_int(
+    "TAVERN_TURN_TERMINAL_EVENT_RESERVE_BYTES",
+    64 * 1024,
+    minimum=4 * 1024,
+    maximum=1024 * 1024,
+)
+if TURN_TERMINAL_EVENT_RESERVE_BYTES >= TURN_EVENT_LOG_MAX_BYTES:
+    raise ValueError(
+        "TAVERN_TURN_TERMINAL_EVENT_RESERVE_BYTES 必须小于事件日志总上限"
+    )
+if TURN_EVENT_MAX_BYTES > (
+    TURN_EVENT_LOG_MAX_BYTES - TURN_TERMINAL_EVENT_RESERVE_BYTES
+):
+    raise ValueError("单事件上限必须小于扣除终态保留空间后的日志总上限")
+TURN_RETENTION_DAYS = _configured_int(
+    "TAVERN_TURN_RETENTION_DAYS",
+    14,
+    minimum=1,
+    maximum=365,
+)
+TURN_RETENTION_COUNT = _configured_int(
+    "TAVERN_TURN_RETENTION_COUNT",
+    500,
+    minimum=10,
+    maximum=100_000,
 )
 OLLAMA_HEALTH_TIMEOUT_MS = _configured_int(
     "TAVERN_OLLAMA_HEALTH_TIMEOUT_MS",

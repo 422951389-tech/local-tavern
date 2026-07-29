@@ -203,6 +203,15 @@
                         code: 'request_aborted', method, url, cause,
                     });
                 }
+                if (cause && cause.name === 'DesktopTransportError') {
+                    throw new ApiError(cause.message || '桌面通信失败', {
+                        code: cause.code || 'desktop_transport_error',
+                        status: Number.isInteger(cause.status) ? cause.status : 0,
+                        method,
+                        url,
+                        cause,
+                    });
+                }
                 throw new ApiError('无法连接本地服务', {
                     code: 'network_error', method, url, cause,
                 });
@@ -251,6 +260,16 @@
                 if (options.signal && options.signal.aborted) {
                     throw new ApiError('请求已取消', {
                         ...context, code: 'request_aborted', cause,
+                    });
+                }
+                if (cause && cause.name === 'DesktopTransportError') {
+                    throw new ApiError(cause.message || '桌面响应读取失败', {
+                        ...context,
+                        code: cause.code || 'desktop_transport_error',
+                        status: Number.isInteger(cause.status) && cause.status > 0
+                            ? cause.status
+                            : context.status,
+                        cause,
                     });
                 }
                 throw new ApiError('读取响应失败', {

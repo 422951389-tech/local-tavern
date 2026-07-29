@@ -7,6 +7,7 @@ from urllib.parse import quote
 import httpx
 
 from core import character_loader, session_manager
+from core.config import PORT
 from server import app
 
 
@@ -20,7 +21,10 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
         character_loader.ROOT_DIR = self.test_root
         session_manager.clear_session_stores_for_testing()
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        self.client = httpx.AsyncClient(transport=transport, base_url="http://test")
+        self.client = httpx.AsyncClient(
+            transport=transport,
+            base_url=f"http://127.0.0.1:{PORT}",
+        )
 
     async def asyncTearDown(self):
         await self.client.aclose()
@@ -151,6 +155,7 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
     async def test_message_uuid_is_primary_and_stale_revision_returns_409(self):
         project = "并发测试"
         save = "消息存档"
+        (self.test_root / project).mkdir(parents=True, exist_ok=True)
         initial = session_manager.new_session(project, save)
         message = session_manager.append_history(initial, "user", "原内容")
         created = await session_manager.create_session(project, save, initial)

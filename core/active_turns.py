@@ -3,6 +3,7 @@
 服务固定单 worker 运行。turn 生成期间，只有该 turn 自己可以提交对应存档，
 其余写命令统一失败，避免生成完成时用旧 revision 覆盖用户操作。
 """
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -43,9 +44,26 @@ class TurnMaintenanceConflict(RuntimeError):
 
 _lock = RLock()
 _active: dict[tuple[str, str], str] = {}
+_active_api_reads = 0
 _maintenance: tuple[str, str] | None = None
+_maintenance_generation = 0
+_last_maintenance_operation: str | None = None
+_project_generations: dict[str, int] = {}
+_last_project_operations: dict[str, str] = {}
 _current_turn_id: ContextVar[str | None] = ContextVar(
     "local_tavern_current_turn_id",
+    default=None,
+)
+_current_maintenance_token: ContextVar[str | None] = ContextVar(
+    "local_tavern_current_maintenance_token",
+    default=None,
+)
+_request_maintenance_generation: ContextVar[int | None] = ContextVar(
+    "local_tavern_request_maintenance_generation",
+    default=None,
+)
+_request_project_generations: ContextVar[dict[str, int] | None] = ContextVar(
+    "local_tavern_request_project_generations",
     default=None,
 )
 
@@ -85,8 +103,7 @@ def active_turns_for_project(project: str) -> tuple[str, ...]:
 def all_active_turns() -> tuple[tuple[str, str, str], ...]:
     with _lock:
         return tuple(
-            (project, save, turn_id)
-            for (project, save), turn_id in _active.items()
+            (project, save, turn_id) for (project, save), turn_id in _active.items()
         )
 
 
@@ -103,18 +120,42 @@ def begin_maintenance(operation: str) -> str:
     with _lock:
         if _maintenance is not None:
             raise TurnMaintenanceConflict(_maintenance[1])
+        if _active_api_reads:
+            raise TurnMaintenanceConflict("active_api_reads")
         if _active:
             (project, save), turn_id = next(iter(_active.items()))
             raise ActiveTurnConflict(project, save, turn_id)
         _maintenance = (token, operation)
+        _current_maintenance_token.set(token)
     return token
 
 
+def register_api_read() -> None:
+    """登记业务 API 读取；与维护启动在同一锁内互斥。"""
+
+    global _active_api_reads
+    with _lock:
+        if _maintenance is not None:
+            raise TurnMaintenanceConflict(_maintenance[1])
+        _active_api_reads += 1
+
+
+def unregister_api_read() -> None:
+    global _active_api_reads
+    with _lock:
+        if _active_api_reads > 0:
+            _active_api_reads -= 1
+
+
 def end_maintenance(token: str) -> None:
-    global _maintenance
+    global _maintenance, _maintenance_generation, _last_maintenance_operation
     with _lock:
         if _maintenance is not None and _maintenance[0] == token:
+            _last_maintenance_operation = _maintenance[1]
             _maintenance = None
+            _maintenance_generation += 1
+    if _current_maintenance_token.get() == token:
+        _current_maintenance_token.set(None)
 
 
 def maintenance_operation() -> str | None:
@@ -122,7 +163,75 @@ def maintenance_operation() -> str | None:
         return _maintenance[1] if _maintenance is not None else None
 
 
+def maintenance_generation() -> int:
+    with _lock:
+        return _maintenance_generation
+
+
+def advance_project_write_generation(project: str, operation: str) -> None:
+    """项目整体删除/恢复提交后推进边界，拒绝此前已排队的同项目写入。"""
+
+    if not isinstance(project, str) or not project:
+        raise ValueError("项目 ID 不能为空")
+    if not isinstance(operation, str) or not operation:
+        raise ValueError("项目维护操作不能为空")
+    owner_token = _current_maintenance_token.get()
+    with _lock:
+        if _maintenance is not None and owner_token != _maintenance[0]:
+            raise TurnMaintenanceConflict(_maintenance[1])
+        _project_generations[project] = _project_generations.get(project, 0) + 1
+        _last_project_operations[project] = operation
+
+
+@contextmanager
+def request_maintenance_generation_context() -> Iterator[None]:
+    """冻结请求进入时的维护代次，用于拒绝跨恢复边界的旧写请求。"""
+
+    with _lock:
+        generation = _maintenance_generation
+        project_generations = dict(_project_generations)
+    token = _request_maintenance_generation.set(generation)
+    project_token = _request_project_generations.set(project_generations)
+    try:
+        yield
+    finally:
+        _request_project_generations.reset(project_token)
+        _request_maintenance_generation.reset(token)
+
+
+def assert_global_write_allowed() -> None:
+    """在取得整库共享锁后调用，维护拥有者可执行恢复内部写入。"""
+
+    request_generation = _request_maintenance_generation.get()
+    owner_token = _current_maintenance_token.get()
+    with _lock:
+        maintenance = _maintenance
+        generation = _maintenance_generation
+        last_operation = _last_maintenance_operation
+    if maintenance is not None and owner_token != maintenance[0]:
+        raise TurnMaintenanceConflict(maintenance[1])
+    if (
+        request_generation is not None
+        and request_generation != generation
+        and not (maintenance is not None and owner_token == maintenance[0])
+    ):
+        raise TurnMaintenanceConflict(last_operation or "recent_maintenance")
+
+
+def _assert_project_generation_allowed(project: str) -> None:
+    request_generations = _request_project_generations.get()
+    if request_generations is None:
+        return
+    with _lock:
+        generation = _project_generations.get(project, 0)
+        operation = _last_project_operations.get(project, "recent_project_change")
+    if request_generations.get(project, 0) != generation:
+        raise TurnMaintenanceConflict(operation)
+
+
 def assert_write_allowed(project: str, save: str) -> None:
+    assert_global_write_allowed()
+    _assert_project_generation_allowed(project)
     with _lock:
         turn_id = _active.get((project, save))
     if turn_id and _current_turn_id.get() != turn_id:
@@ -130,6 +239,8 @@ def assert_write_allowed(project: str, save: str) -> None:
 
 
 def assert_project_write_allowed(project: str) -> None:
+    assert_global_write_allowed()
+    _assert_project_generation_allowed(project)
     current = _current_turn_id.get()
     with _lock:
         conflict = next(
@@ -155,7 +266,16 @@ def turn_write_context(turn_id: str | None) -> Iterator[None]:
 
 
 def clear_for_testing() -> None:
-    global _maintenance
+    global _active_api_reads, _maintenance, _maintenance_generation
+    global _last_maintenance_operation
     with _lock:
         _active.clear()
+        _active_api_reads = 0
         _maintenance = None
+        _maintenance_generation = 0
+        _last_maintenance_operation = None
+        _project_generations.clear()
+        _last_project_operations.clear()
+    _current_maintenance_token.set(None)
+    _request_maintenance_generation.set(None)
+    _request_project_generations.set(None)

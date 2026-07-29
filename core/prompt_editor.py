@@ -4,6 +4,7 @@
 - 主文件: PROMPTS_DIR/{name}.md
 - 默认备份: PROMPTS_DIR/.default/{name}.md（首次启动时拷贝）
 """
+
 import threading
 
 from core.config import PROMPTS_DIR
@@ -19,7 +20,7 @@ _PROMPT_WRITE_LOCK = threading.RLock()
 
 def _ensure_defaults():
     """确保默认备份存在（首次启动时把当前 prompt 拷到 .default）"""
-    with _PROMPT_WRITE_LOCK, library_lock.shared():
+    with _PROMPT_WRITE_LOCK, library_lock.shared_write():
         DEFAULT_DIR.mkdir(parents=True, exist_ok=True)
         for name in VALID_NAMES:
             default_path = DEFAULT_DIR / f"{name}.md"
@@ -43,7 +44,7 @@ def write_prompt(name: str, content: str):
     """写入 prompt（原子写）"""
     if name not in VALID_NAMES:
         raise ValueError(f"无效 prompt 名: {name}")
-    with _PROMPT_WRITE_LOCK, library_lock.shared():
+    with _PROMPT_WRITE_LOCK, library_lock.shared_write():
         PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
         _ensure_defaults()
         atomic_write(PROMPTS_DIR / f"{name}.md", content)

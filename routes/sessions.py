@@ -1,4 +1,7 @@
 """存档管理路由。"""
+
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 
 from core.session_manager import (
@@ -32,7 +35,7 @@ router = APIRouter()
 @router.get("/api/sessions")
 async def api_list_sessions(project: str = "默认项目"):
     project = _norm_project(project)
-    return {"sessions": list_sessions(project)}
+    return {"sessions": await asyncio.to_thread(list_sessions, project)}
 
 
 @router.post("/api/sessions")
@@ -88,9 +91,11 @@ async def api_delete_session(req: SaveDeleteRequest):
 async def api_export_session(project: str = "默认项目", save: str = "默认存档"):
     save = _norm_save(save)
     project = _norm_project(project)
-    if not session_exists(project, save):
+    if not await asyncio.to_thread(session_exists, project, save):
         raise HTTPException(404, "存档不存在")
-    return {"json_str": export_session(project, save)}
+    return {
+        "json_str": await asyncio.to_thread(export_session, project, save),
+    }
 
 
 @router.post("/api/sessions/import")

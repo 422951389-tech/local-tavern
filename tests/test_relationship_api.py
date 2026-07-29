@@ -8,6 +8,7 @@ import pytest
 
 from core import active_turns
 from core.character_loader import ensure_project, save_character
+from core.message_commands import RegenerationWouldRewriteHistory
 from core.session_manager import get_session_store
 
 
@@ -307,7 +308,9 @@ async def test_message_delete_and_truncate_reconcile_relationship_evidence(app_c
 
 
 @pytest.mark.asyncio
-async def test_regenerate_accept_reconciles_removed_evidence(isolated_paths):
+async def test_historical_regenerate_rejection_preserves_relationship_evidence(
+    isolated_paths,
+):
     project = "relationship_regenerate"
     path, messages = _seed_session(isolated_paths, project)
     messages[0].update({"role": "user", "content": "重新生成源", "turn_id": "old"})
@@ -318,23 +321,21 @@ async def test_regenerate_accept_reconciles_removed_evidence(isolated_paths):
     payload["relationship_edges"] = [_edge([messages[1]["id"], messages[3]["id"]])]
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    before = path.read_bytes()
     store = get_session_store()
     turn_id = str(uuid4())
     try:
-        result = await store.accept_regenerated_chat_turn(
-            project,
-            "默认存档",
-            0,
-            turn_id=turn_id,
-            target_message_id=messages[1]["id"],
-            expected_user_input="重新生成源",
-            created_at="2026-07-22T12:00:00+08:00",
-        )
-        assert result.session["relationship_edges"][0]["evidence_message_ids"] == [messages[3]["id"]]
-        assert any(
-            message["id"] == messages[0]["id"]
-            for message in result.session["message_history"]
-        )
+        with pytest.raises(RegenerationWouldRewriteHistory):
+            await store.accept_regenerated_chat_turn(
+                project,
+                "默认存档",
+                0,
+                turn_id=turn_id,
+                target_message_id=messages[1]["id"],
+                expected_user_input="重新生成源",
+                created_at="2026-07-22T12:00:00+08:00",
+            )
+        assert path.read_bytes() == before
     finally:
         active_turns.unregister(project, "默认存档", turn_id)
 
@@ -342,6 +343,7 @@ async def test_regenerate_accept_reconciles_removed_evidence(isolated_paths):
 @pytest.mark.asyncio
 async def test_character_delete_cleans_incident_edges_across_saves(isolated_paths):
     project = "relationship_character_delete"
+    ensure_project(project)
     save_character(project, "alpha", {"id": "alpha", "name": "阿尔法", "active": True})
     save_character(project, "beta", {"id": "beta", "name": "贝塔", "active": True})
     first_path, first_messages = _seed_session(isolated_paths, project)

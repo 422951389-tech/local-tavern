@@ -1,0 +1,21 @@
+/* 诊断中心 */
+.diagnostic-checks {
+    display: grid;
+    gap: 10px;
+}
+
+.diagnostic-check {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px 12px;
+    align-items: center;
+    padding: 10px;
+    background: var(--workspace-panel-soft);
+    border: 1px solid var(--workspace-line);
+    border-radius: var(--workspace-radius-sm);
+}
+
+.diagnostic-check small {
+    grid-column: 1 / -1;
+    color: var(--workspace-ink-faint);
+}

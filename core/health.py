@@ -41,6 +41,7 @@ _MAINTENANCE_CODES = {
     "restore_pending",
     "maintenance_unavailable",
 }
+_PROVIDER_CODES = {"provider_config_unavailable"}
 
 
 def _ok() -> dict[str, str]:
@@ -101,6 +102,23 @@ def probe_maintenance() -> dict[str, str]:
     return _ok()
 
 
+def probe_provider_registry() -> dict[str, object]:
+    """只检查 Provider 配置可读性；不向任何云端发请求。"""
+    try:
+        from core.provider_registry import get_provider_registry
+
+        providers = get_provider_registry().list_configs()
+        cloud_configured = any(
+            isinstance(item, dict)
+            and item.get("kind") != "ollama"
+            and item.get("has_credential") is True
+            for item in providers
+        )
+    except Exception:
+        return _error("provider_config_unavailable")
+    return {"status": "ok", "cloud_configured": cloud_configured}
+
+
 def _normalize_ollama_result(value: object) -> dict[str, str]:
     if isinstance(value, dict) and value.get("ok") is True:
         return _ok()
@@ -138,20 +156,28 @@ def _run_sync_probe(
     )
 
 
+def _run_provider_probe(probe: Callable[[], object]) -> object:
+    try:
+        return probe()
+    except Exception:
+        return _error("provider_config_unavailable")
+
+
 async def readiness_report(
     *,
     data_probe: Callable[[], dict[str, str]] = probe_data_directory,
     runtime_probe: Callable[[], dict[str, str]] = probe_runtime,
     maintenance_probe: Callable[[], dict[str, str]] = probe_maintenance,
+    provider_probe: Callable[[], dict[str, object]] = probe_provider_registry,
     ollama_probe: Callable[[], Awaitable[dict[str, Any]]] | None = None,
 ) -> dict[str, object]:
-    """执行四项就绪检查；响应永远不包含异常文本、路径或模型名。"""
+    """检查本地基础设施和至少一个推理入口；不自动请求云端。"""
     if ollama_probe is None:
         from core.ollama_client import get_client
 
         ollama_probe = get_client().probe_health
 
-    data, runtime, maintenance = await asyncio.gather(
+    data, runtime, maintenance, provider_result = await asyncio.gather(
         asyncio.to_thread(
             _run_sync_probe,
             data_probe,
@@ -170,7 +196,27 @@ async def readiness_report(
             allowed_codes=_MAINTENANCE_CODES,
             fallback_code="maintenance_unavailable",
         ),
+        asyncio.to_thread(_run_provider_probe, provider_probe),
     )
+    if (
+        isinstance(provider_result, dict)
+        and provider_result.get("status") == "ok"
+        and isinstance(provider_result.get("cloud_configured"), bool)
+    ):
+        providers = {
+            "status": "ok",
+            "cloud_configured": provider_result["cloud_configured"],
+            "connectivity": "not_probed",
+        }
+    else:
+        code = (
+            provider_result.get("code")
+            if isinstance(provider_result, dict)
+            else None
+        )
+        providers = _error(
+            code if code in _PROVIDER_CODES else "provider_config_unavailable"
+        )
     try:
         ollama = _normalize_ollama_result(await ollama_probe())
     except Exception:
@@ -180,12 +226,37 @@ async def readiness_report(
         "data": data,
         "runtime": runtime,
         "ollama": ollama,
+        "providers": providers,
         "maintenance": maintenance,
     }
-    ready = all(item == _ok() for item in checks.values())
+    essentials_ready = all(
+        checks[name] == _ok()
+        for name in ("data", "runtime", "maintenance")
+    ) and providers.get("status") == "ok"
+    inference_ready = (
+        ollama == _ok()
+        or providers.get("cloud_configured") is True
+    )
+    if ollama == _ok():
+        inference = {
+            "status": "ok",
+            "source": "ollama",
+            "connectivity": "verified",
+        }
+    elif providers.get("cloud_configured") is True:
+        inference = {
+            "status": "ok",
+            "source": "cloud_configuration",
+            "connectivity": "not_probed",
+        }
+    else:
+        inference = _error("inference_unavailable")
+    checks["inference"] = inference
+    ready = essentials_ready and inference_ready
     return {
         "status": "ready" if ready else "not_ready",
         "service": "local-tavern",
-        "contract_version": 1,
+        "contract_version": 2,
+        "readiness_scope": "configuration",
         "checks": checks,
     }

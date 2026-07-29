@@ -6,8 +6,14 @@ from uuid import uuid4
 
 import pytest
 
+import core.chat_turns as chat_turns_module
+import routes.chat as chat_routes
 from core import active_turns
-from core.chat_turns import TurnCoordinator, TurnStore
+from core.chat_turns import (
+    TurnCoordinator,
+    TurnEventLogLimitExceeded,
+    TurnStore,
+)
 from core.session_manager import (
     append_history,
     get_session_store,
@@ -35,6 +41,31 @@ async def _wait_terminal(client, turn_id: str, timeout: float = 3.0) -> dict:
             await asyncio.sleep(0.01)
 
     return await asyncio.wait_for(poll(), timeout=timeout)
+
+
+def _turn_payload(turn_id: str) -> dict:
+    created_at = datetime.now().astimezone().isoformat()
+    return {
+        "schema_version": 2,
+        "turn_id": turn_id,
+        "turn_kind": "chat",
+        "project": "resource-limits",
+        "save": "默认存档",
+        "expected_revision": 0,
+        "user_input": "安全上限测试",
+        "provider": "ollama",
+        "model": "fake-model:latest",
+        "parameters": {},
+        "status": "pending",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "started_at": None,
+        "completed_at": None,
+        "cancel_requested_at": None,
+        "content": "",
+        "thinking": "",
+        "error": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -90,6 +121,19 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
     assert terminal["error"] is None
     assert terminal["session_revision"] == 2
     assert terminal["prompt_diagnostics"] == diagnostics
+    assert terminal["context_diagnostics"] == diagnostics
+    telemetry = terminal["generation_telemetry"]
+    assert telemetry["provider"] == "ollama"
+    assert telemetry["model"] == "fake-model:latest"
+    assert telemetry["status"] == "completed"
+    assert telemetry["error_code"] is None
+    assert telemetry["latency_ms"] >= 0
+    assert telemetry["input_tokens_estimated"] == diagnostics[
+        "estimated_prompt_tokens"
+    ]
+    assert telemetry["output_tokens_estimated"] > 0
+    assert telemetry["output_bytes"] > 0
+    assert telemetry["token_source"] == "local_estimator"
 
     stream = await app_client.get(f"/api/chat/turns/{turn_id}/events")
     assert stream.status_code == 200
@@ -105,6 +149,8 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
         "type",
         "parsed",
         "roleplay_warnings",
+        "context_diagnostics",
+        "generation_telemetry",
         "revision",
         "session_delta",
     }
@@ -114,6 +160,7 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
         "scene_meta",
         "characters_state",
         "roleplay_policy",
+        "current_provider",
         "current_model",
     }
 
@@ -140,6 +187,7 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
         "scene_meta": session["scene_meta"],
         "characters_state": session["characters_state"],
         "roleplay_policy": session["roleplay_policy"],
+        "current_provider": session["current_provider"],
         "current_model": session["current_model"],
     }
     assert "message_history" not in parsed_event["session_delta"]
@@ -155,24 +203,79 @@ async def test_turn_api_accepts_pending_then_completes_and_replays(
         assert message["timestamps"]["created_at"]
         assert message["timestamps"]["completed_at"]
         assert message["pinned"] is False
+    assistant = session["message_history"][-1]
+    assert assistant["context_diagnostics"] == diagnostics
+    assert assistant["generation_telemetry"] == telemetry
+    assert assistant["presentation"]["schema_version"] == 1
+    assert assistant["presentation"]["narration"] == "隔离测试的灯光保持稳定。"
+    assert assistant["presentation"]["characters"][0]["affinity"] == 40
+    assert assistant["presentation"]["characters"][0]["previous_affinity"] == 40
+    assert assistant["presentation"]["characters"][0]["mood"] == "平静"
+    assert assistant["presentation"]["scene_changes"] == [
+        {"key": "location", "value": "隔离测试酒馆"},
+        {"key": "time", "value": "午后"},
+        {"key": "weather", "value": "晴"},
+    ]
+    assert "raw" not in assistant["presentation"]
 
 
-@pytest.mark.parametrize("legacy_scene_meta", ["missing", "null", "string"])
 @pytest.mark.asyncio
-async def test_turn_normalizes_legacy_scene_meta_before_parsed_delta(
+async def test_persisted_presentation_uses_authoritative_clamped_affinity(
     app_client,
     fake_ollama,
     seed_project,
-    legacy_scene_meta,
 ):
-    project = seed_project(f"turn_legacy_scene_{legacy_scene_meta}")
+    project = seed_project("turn_presentation_affinity")
+    fake_ollama.events = [
+        {
+            "type": "content",
+            "content": (
+                "🎭 测试角色 | 💝 100%\n"
+                "💬 对白：\"好感度仍受权威状态约束。\"\n"
+                "📖 场景旁白\n测试。\n💡 行动建议\n- 继续"
+            ),
+        },
+        {"type": "done", "content": ""},
+    ]
+    created = await app_client.post("/api/chat/turns", json={
+        "project": project,
+        "save": "默认存档",
+        "user_input": "验证好感度展示快照",
+        "model": "fake-model:latest",
+        "expected_revision": 0,
+    })
+    assert created.status_code == 202, created.text
+    turn_id = created.json()["turn_id"]
+    assert (await _wait_terminal(app_client, turn_id))["status"] == "completed"
+
+    session = (await app_client.get("/api/session", params={
+        "project": project,
+        "save": "默认存档",
+    })).json()
+    character_state = session["characters_state"]["test_character"]
+    assert character_state["affinity"] == 50
+    assistant = session["message_history"][-1]
+    assert assistant["presentation"]["characters"][0]["affinity"] == 50
+    assert assistant["presentation"]["characters"][0]["previous_affinity"] == 40
+    assert assistant["presentation"]["characters"][0]["mood"] == "平静"
+
+    events = _sse_json_events((await app_client.get(
+        f"/api/chat/turns/{turn_id}/events"
+    )).text)
+    parsed = next(event for event in events if event["type"] == "parsed")
+    assert parsed["parsed"]["characters"][0]["affinity"] == 50
+    assert parsed["parsed"]["roleplay_warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_turn_supplies_missing_legacy_scene_meta_before_parsed_delta(
+    app_client,
+    fake_ollama,
+    seed_project,
+):
+    project = seed_project("turn_legacy_scene_missing")
     legacy = new_session(project, "默认存档")
-    if legacy_scene_meta == "missing":
-        legacy.pop("scene_meta")
-    elif legacy_scene_meta == "null":
-        legacy["scene_meta"] = None
-    else:
-        legacy["scene_meta"] = "旧版无效场景"
+    legacy.pop("scene_meta")
     path = get_session_store().session_path(project, "默认存档")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
@@ -209,6 +312,34 @@ async def test_turn_normalizes_legacy_scene_meta_before_parsed_delta(
     }
     assert events[-1]["type"] == "terminal"
     assert events[-1]["status"] == "completed"
+
+
+@pytest.mark.parametrize("invalid_scene_meta", [None, "旧版无效场景"])
+@pytest.mark.asyncio
+async def test_turn_rejects_existing_invalid_scene_meta_without_writing(
+    app_client,
+    seed_project,
+    invalid_scene_meta,
+):
+    project = seed_project("turn_invalid_scene_meta")
+    legacy = new_session(project, "默认存档")
+    legacy["scene_meta"] = invalid_scene_meta
+    path = get_session_store().session_path(project, "默认存档")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    before = path.read_bytes()
+
+    created = await app_client.post("/api/chat/turns", json={
+        "project": project,
+        "save": "默认存档",
+        "user_input": "错误字段不得静默清空",
+        "model": "fake-model:latest",
+        "expected_revision": 0,
+    })
+
+    assert created.status_code == 422, created.text
+    assert created.json()["error"]["code"] == "data_corrupt"
+    assert path.read_bytes() == before
 
 
 @pytest.mark.asyncio
@@ -410,14 +541,18 @@ async def test_restart_recovery_is_idempotent_and_preserves_partial(
         "type": "content",
         "content": "已生成部分",
     })
-    active_turns.unregister(project, save, turn_id)
+    # 嵌入式运行时重建事件循环时，旧协调器的同一 turn 登记仍可能留在进程内。
+    # 恢复流程必须能认领自己的写入并最终清除此登记。
+    assert active_turns.active_turn_id(project, save) == turn_id
 
     coordinator = TurnCoordinator(turn_store)
     assert await coordinator.ensure_recovered() == 1
     assert await coordinator.ensure_recovered() == 0
+    assert active_turns.active_turn_id(project, save) is None
     turn = await coordinator.get(turn_id)
     assert turn["status"] == "failed"
     assert turn["error"]["code"] == "server_restarted"
+    assert turn["provider"] == "ollama"
     session = get_session_store().read_sync(project, save)
     assert [message["role"] for message in session["message_history"]] == [
         "user",
@@ -608,6 +743,8 @@ async def test_base_turn_commits_before_stateful_summary_finishes(
 
     pending = get_session_store().read_sync(project, "长对话")
     assert pending["summaries"][-1]["status"] == "pending"
+    assert pending["summaries"][-1]["provider"] == "ollama"
+    assert pending["summaries"][-1]["model"] == "fake-model:latest"
     source_snapshot = pending["summaries"][-1]["source_snapshot_id"]
     assert (
         get_session_store().history_dir(project) / source_snapshot
@@ -625,3 +762,145 @@ async def test_base_turn_commits_before_stateful_summary_finishes(
     completed = await asyncio.wait_for(wait_summary(), timeout=2)
     assert completed["summaries"][-1]["status"] == "completed"
     assert "异步总结完成" in completed["summaries"][-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_worker_error_is_redacted_publicly_and_logged_internally(
+    seed_project,
+    tmp_path,
+    caplog,
+):
+    project = seed_project("turn_unknown_error_redaction")
+    initial = get_session_store().read_sync(project, "默认存档")
+    coordinator = TurnCoordinator(TurnStore(tmp_path / "turn-store"))
+    sensitive_detail = "INTERNAL-SENSITIVE-WORKER-DETAIL"
+
+    async def exploding_worker(_runtime):
+        raise RuntimeError(sensitive_detail)
+
+    caplog.set_level("ERROR", logger="core.chat_turns")
+    try:
+        turn = await coordinator.start(
+            project=project,
+            save="默认存档",
+            expected_revision=initial["revision"],
+            user_input="触发未知异常",
+            provider="ollama",
+            model="fake-model:latest",
+            parameters={},
+            initial_session=initial,
+            accepted_callback=lambda _session: None,
+            worker=exploding_worker,
+        )
+
+        for _attempt in range(100):
+            terminal = await coordinator.get(turn["turn_id"])
+            if terminal["status"] == "failed":
+                break
+            await asyncio.sleep(0.01)
+        assert terminal["error"] == {
+            "code": "internal_error",
+            "message": "turn 执行失败，请重试",
+        }
+        assert sensitive_detail not in json.dumps(terminal, ensure_ascii=False)
+        assert sensitive_detail in caplog.text
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_output_byte_limit_stops_provider_with_stable_terminal_error(
+    app_client,
+    fake_ollama,
+    seed_project,
+    monkeypatch,
+):
+    project = seed_project("turn_output_limit")
+    monkeypatch.setattr(chat_routes, "CHAT_OUTPUT_MAX_BYTES", 8)
+    fake_ollama.configure("normal")
+
+    created = await app_client.post("/api/chat/turns", json={
+        "project": project,
+        "save": "默认存档",
+        "user_input": "输出上限",
+        "model": "fake-model:latest",
+        "expected_revision": 0,
+    })
+    assert created.status_code == 202, created.text
+    terminal = await _wait_terminal(app_client, created.json()["turn_id"])
+
+    assert terminal["status"] == "failed"
+    assert terminal["error"] == {
+        "code": "output_limit_exceeded",
+        "message": "模型输出超过本地安全上限，已停止生成",
+        "limit_bytes": 8,
+    }
+
+
+@pytest.mark.asyncio
+async def test_generation_deadline_stops_stalled_provider(
+    app_client,
+    fake_ollama,
+    seed_project,
+    monkeypatch,
+):
+    project = seed_project("turn_generation_timeout")
+    monkeypatch.setattr(chat_routes, "CHAT_GENERATION_MAX_SECONDS", 0.01)
+    fake_ollama.configure("normal", delay=0.05)
+
+    created = await app_client.post("/api/chat/turns", json={
+        "project": project,
+        "save": "默认存档",
+        "user_input": "生成超时",
+        "model": "fake-model:latest",
+        "expected_revision": 0,
+    })
+    assert created.status_code == 202, created.text
+    terminal = await _wait_terminal(app_client, created.json()["turn_id"])
+
+    assert terminal["status"] == "failed"
+    assert terminal["error"]["code"] == "generation_timeout"
+    assert terminal["error"]["limit_seconds"] == 0.01
+
+
+def test_event_log_write_limit_reserves_space_for_terminal(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(chat_turns_module, "TURN_EVENT_LOG_MAX_BYTES", 1024)
+    monkeypatch.setattr(chat_turns_module, "TURN_TERMINAL_EVENT_RESERVE_BYTES", 512)
+    monkeypatch.setattr(chat_turns_module, "TURN_EVENT_MAX_BYTES", 900)
+    store = TurnStore(tmp_path / "turns")
+    turn = store.create(_turn_payload(str(uuid4())))
+    turn, _started = store.append_event(turn, {"type": "started"})
+
+    with pytest.raises(TurnEventLogLimitExceeded):
+        store.append_event(turn, {"type": "content", "content": "x" * 600})
+
+    terminal, _event = store.append_event(turn, {
+        "type": "terminal",
+        "status": "failed",
+        "error": {"code": "turn_log_limit_exceeded", "message": "已停止"},
+    })
+    assert terminal["status"] == "failed"
+    assert store.load(turn["turn_id"])["status"] == "failed"
+
+
+def test_prepare_recovery_prunes_terminal_turns_by_count(tmp_path):
+    store = TurnStore(tmp_path / "turns")
+    for _index in range(4):
+        turn = store.create(_turn_payload(str(uuid4())))
+        store.append_event(turn, {
+            "type": "terminal",
+            "status": "completed",
+            "error": None,
+        })
+
+    recovery_ids, removed = store.prepare_recovery(
+        retention_days=365,
+        retention_count=2,
+    )
+
+    assert recovery_ids == []
+    assert removed == 2
+    assert len(store.list_turn_ids()) == 2

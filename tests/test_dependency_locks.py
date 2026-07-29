@@ -25,10 +25,39 @@ def _write(path: Path, content: str) -> Path:
 def test_repository_semantic_locks_are_exact_sorted_and_compatible():
     runtime = parse_semantic_lock(ROOT / "requirements.lock.txt")
     dev = parse_semantic_lock(ROOT / "requirements-dev.lock.txt")
+    desktop = parse_semantic_lock(ROOT / "requirements-desktop.lock.txt")
     verify_lock_overlap(runtime, dev)
+    verify_lock_overlap(runtime, desktop)
+    verify_lock_overlap(dev, desktop)
     assert len(runtime) == 22
     assert len(dev) == 8
+    assert len(desktop) == 33
     assert {"coverage", "pytest", "pytest-asyncio", "ruff"} <= set(dev)
+    assert set(runtime) <= set(desktop)
+    assert {
+        "pyinstaller",
+        "pyinstaller-hooks-contrib",
+        "pyside6",
+        "pyside6-addons",
+        "pyside6-essentials",
+        "shiboken6",
+    } <= set(desktop)
+    assert all(desktop[name] == version for name, version in runtime.items())
+
+
+def test_repository_desktop_semantic_and_hash_locks_are_identical():
+    semantic = ROOT / "requirements-desktop.lock.txt"
+    hashed = ROOT / "requirements-desktop.hashes.txt"
+    locked = verify_lock_pair(semantic, hashed)
+    assert locked == parse_semantic_lock(semantic)
+
+    input_lines = [
+        line.strip()
+        for line in (ROOT / "requirements-desktop.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert input_lines[0] == "-r requirements.txt"
+    assert input_lines[1:] == ["pyinstaller==6.21.0", "PySide6==6.11.1"]
 
 
 def test_hash_lock_requires_sorted_unique_sha256_and_matches_semantic(tmp_path: Path):

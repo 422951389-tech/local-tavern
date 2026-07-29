@@ -13,6 +13,10 @@ from tests.fakes.fake_ollama import NORMAL_REPLY, SUMMARY_REPLY
 
 
 MODEL_NAME = "fake-model:latest"
+E2E_NORMAL_REPLY = NORMAL_REPLY.replace(
+    "🎭 测试角色 | 💝 ████░░░░░░ 40%",
+    "🎭 测试角色 | 💝 ██████████ 100%",
+)
 DEFAULT_CONTROL = {
     "scenario": "normal",
     "delay_ms": 0,
@@ -68,13 +72,21 @@ def stream_chunks(control: Control) -> Iterator[dict]:
             "done": False,
         }
         yield {
-            "message": {"role": "assistant", "thinking": "", "content": NORMAL_REPLY[:32]},
+            "message": {
+                "role": "assistant",
+                "thinking": "",
+                "content": E2E_NORMAL_REPLY[:32],
+            },
             "done": False,
         }
         return
     if control.scenario == "eof":
         yield {
-            "message": {"role": "assistant", "thinking": "", "content": NORMAL_REPLY[:32]},
+            "message": {
+                "role": "assistant",
+                "thinking": "",
+                "content": E2E_NORMAL_REPLY[:32],
+            },
             "done": False,
         }
         return
@@ -83,7 +95,11 @@ def stream_chunks(control: Control) -> Iterator[dict]:
         "done": False,
     }
     yield {
-        "message": {"role": "assistant", "thinking": "", "content": NORMAL_REPLY},
+        "message": {
+            "role": "assistant",
+            "thinking": "",
+            "content": E2E_NORMAL_REPLY,
+        },
         "done": False,
     }
     yield {"message": {"role": "assistant", "thinking": "", "content": ""}, "done": True}

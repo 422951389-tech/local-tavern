@@ -1,4 +1,5 @@
 """存档领域操作与事务化 SessionStore 适配层。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -102,13 +103,21 @@ def _empty_session(save_id: str = DEFAULT_SAVE, project: str = "默认项目") -
         "revision": 0,
         "created_at": now,
         "updated_at": now,
+        "current_provider": "ollama",
         "current_model": "",
         "scene_meta": {
-            "location": "", "time": "", "weather": "",
-            "main_quest": "", "current_scene": "", "next_goal": "",
+            "location": "",
+            "time": "",
+            "weather": "",
+            "main_quest": "",
+            "current_scene": "",
+            "next_goal": "",
         },
         "user_status": {
-            "name": "", "identity": "", "condition": "", "abilities": [],
+            "name": "",
+            "identity": "",
+            "condition": "",
+            "abilities": [],
         },
         "characters_state": {},
         "roleplay_policy": {"strict_muted_writeback": False},
@@ -157,7 +166,9 @@ async def save_session(
     expected_revision: int | None = None,
 ) -> dict:
     """兼容替换入口；不再做字段猜测合并。"""
-    expected = session.get("revision", 0) if expected_revision is None else expected_revision
+    expected = (
+        session.get("revision", 0) if expected_revision is None else expected_revision
+    )
     replacement = deepcopy(session)
 
     def replace(current: dict, context: MutationContext) -> None:
@@ -212,7 +223,11 @@ def trim_history(
 ) -> list[dict]:
     """纯内存 trim；快照由调用方在同一事务的 MutationContext 中写入。"""
     del project  # 兼容旧调用签名；读取/纯函数路径不再写盘。
-    max_messages = HARD_LIMIT if len(session.get("message_history", [])) > HARD_LIMIT else max_messages
+    max_messages = (
+        HARD_LIMIT
+        if len(session.get("message_history", [])) > HARD_LIMIT
+        else max_messages
+    )
     history = session.get("message_history", [])
     evidence_ids = relationship_evidence_ids(session)
     ordinary = [
@@ -260,13 +275,17 @@ def list_trim_snapshots(project: str, save_id: str = DEFAULT_SAVE) -> list[dict]
     for path in sorted(history_dir.glob(f"{save_id}.trim.*.json"), reverse=True):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            snapshots.append({
-                "filename": path.name,
-                "timestamp": path.stem.split(".trim.", 1)[-1],
-                "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
-                "dropped_count": data.get("dropped_count", 0),
-                "snapshot_at": data.get("_snapshot_at", ""),
-            })
+            snapshots.append(
+                {
+                    "filename": path.name,
+                    "timestamp": path.stem.split(".trim.", 1)[-1],
+                    "modified_at": datetime.fromtimestamp(
+                        path.stat().st_mtime
+                    ).isoformat(),
+                    "dropped_count": data.get("dropped_count", 0),
+                    "snapshot_at": data.get("_snapshot_at", ""),
+                }
+            )
         except (json.JSONDecodeError, OSError):
             continue
     return snapshots
@@ -295,11 +314,15 @@ async def reset_session(
     reset_value = deepcopy(replacement or _empty_session(save_id, project))
 
     def reset(current: dict, context: MutationContext) -> None:
+        current_provider = current.get("current_provider", "ollama")
+        current_model = current.get("current_model", "")
         if context.existed:
             context.checkpoint("reset")
             context.snapshot("reset", current)
         current.clear()
         current.update(deepcopy(reset_value))
+        current["current_provider"] = current_provider
+        current["current_model"] = current_model
 
     mutation = await mutate_session(project, save_id, expected_revision, reset)
     return {
@@ -422,7 +445,7 @@ async def quarantine_yaml_entity(
     def quarantine_sync() -> tuple[dict, bool]:
         from core.character_loader import yaml_write_transaction
 
-        with yaml_write_transaction():
+        with yaml_write_transaction(project):
             return store.quarantine_entity(
                 entity_type=entity_type,
                 project=project,
@@ -448,7 +471,12 @@ async def restore_yaml_quarantine(
     def restore_sync() -> dict:
         from core.character_loader import yaml_write_transaction
 
-        with yaml_write_transaction():
+        verified = store.get_verified(recovery_id)
+        project = validate_file_id(
+            verified.manifest.get("project"),
+            label="项目 ID",
+        )
+        with yaml_write_transaction(project):
             return store.restore_yaml_quarantine(
                 recovery_id,
                 overwrite=overwrite,
@@ -474,11 +502,9 @@ async def restore_recovery_item(
             expected_revision=expected_revision,
             overwrite=overwrite,
         )
-    if (
-        inspected.manifest.get("category") == "quarantine"
-        and inspected.manifest.get("entity_type")
-        in {"character", "user", "worldbook"}
-    ):
+    if inspected.manifest.get("category") == "quarantine" and inspected.manifest.get(
+        "entity_type"
+    ) in {"character", "user", "worldbook"}:
         if expected_revision is not None:
             raise ValueError("YAML 隔离项恢复不接受 expected_revision")
         return await restore_yaml_quarantine(
@@ -565,4 +591,6 @@ def toggle_pinned(
 
 
 def count_pinned(session: dict) -> int:
-    return sum(1 for message in session.get("message_history", []) if message.get("pinned"))
+    return sum(
+        1 for message in session.get("message_history", []) if message.get("pinned")
+    )

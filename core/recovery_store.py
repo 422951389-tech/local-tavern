@@ -1,4 +1,5 @@
 """可验证的恢复点、坏档隔离与软删除仓储。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -186,7 +187,10 @@ def _copy_verified(source: Path, target: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
     try:
-        with source.open("rb") as source_handle, os.fdopen(descriptor, "wb") as target_handle:
+        with (
+            source.open("rb") as source_handle,
+            os.fdopen(descriptor, "wb") as target_handle,
+        ):
             for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
                 size += len(chunk)
                 digest.update(chunk)
@@ -195,7 +199,9 @@ def _copy_verified(source: Path, target: Path) -> tuple[int, str]:
             os.fsync(target_handle.fileno())
         copied = digest.hexdigest()
         if copied != before or sha256_file(source) != before:
-            raise RecoveryConflict("恢复点创建期间源文件发生变化", code="source_changed")
+            raise RecoveryConflict(
+                "恢复点创建期间源文件发生变化", code="source_changed"
+            )
         if sha256_file(temp_path) != copied:
             raise RecoveryIntegrityError("恢复点 payload 复制校验失败")
         os.replace(temp_path, target)
@@ -316,7 +322,9 @@ class RecoveryStore:
         project = cls._validate_owner_id(project, label="project")
         if entity_type not in YAML_ENTITY_TYPES:
             raise ValueError("不支持的 YAML 实体类型")
-        if suffix not in ({".yaml", ".yml"} if entity_type == "worldbook" else {".yaml"}):
+        if suffix not in (
+            {".yaml", ".yml"} if entity_type == "worldbook" else {".yaml"}
+        ):
             raise RecoveryIntegrityError("YAML 恢复项扩展名与实体类型不一致")
         if entity_type == "user":
             if entity_id != "user":
@@ -389,12 +397,14 @@ class RecoveryStore:
                 payload_relpath = PurePosixPath("payload", source_relpath).as_posix()
                 payload_path = staging.joinpath(*PurePosixPath(payload_relpath).parts)
                 size, digest = _copy_verified(source, payload_path)
-                items.append({
-                    "source_relpath": source_relpath,
-                    "payload_relpath": payload_relpath,
-                    "size": size,
-                    "sha256": digest,
-                })
+                items.append(
+                    {
+                        "source_relpath": source_relpath,
+                        "payload_relpath": payload_relpath,
+                        "size": size,
+                        "sha256": digest,
+                    }
+                )
 
             manifest = {
                 "manifest_version": MANIFEST_VERSION,
@@ -503,8 +513,12 @@ class RecoveryStore:
         for item in items:
             if not isinstance(item, dict):
                 raise RecoveryIntegrityError("恢复 manifest item 必须是对象")
-            source_relpath = self._safe_relative(item.get("source_relpath", "")).as_posix()
-            payload_relpath = self._safe_relative(item.get("payload_relpath", "")).as_posix()
+            source_relpath = self._safe_relative(
+                item.get("source_relpath", "")
+            ).as_posix()
+            payload_relpath = self._safe_relative(
+                item.get("payload_relpath", "")
+            ).as_posix()
             expected_payload = PurePosixPath("payload", source_relpath).as_posix()
             if payload_relpath != expected_payload:
                 raise RecoveryIntegrityError("恢复 payload 路径与源路径不一致")
@@ -512,7 +526,9 @@ class RecoveryStore:
                 raise RecoveryIntegrityError("恢复 manifest 路径重复")
             seen_sources.add(source_relpath)
             seen_payloads.add(payload_relpath)
-            if isinstance(item.get("size"), bool) or not isinstance(item.get("size"), int):
+            if isinstance(item.get("size"), bool) or not isinstance(
+                item.get("size"), int
+            ):
                 raise RecoveryIntegrityError("恢复 manifest size 无效")
             digest = item.get("sha256")
             if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -521,7 +537,9 @@ class RecoveryStore:
             primary = PurePosixPath(project, "saves", f"{entity_id}.json").as_posix()
             if manifest.get("source_relpath") != primary:
                 raise RecoveryIntegrityError("session 恢复项主路径与归属不一致")
-            history_prefix = PurePosixPath(project, "saves", ".history").as_posix() + "/"
+            history_prefix = (
+                PurePosixPath(project, "saves", ".history").as_posix() + "/"
+            )
             for item in items[1:]:
                 source_relpath = item["source_relpath"]
                 name = PurePosixPath(source_relpath).name
@@ -633,7 +651,9 @@ class RecoveryStore:
         expected_payloads: set[str] = set()
         for item in manifest["items"]:
             payload_relpath = self._safe_relative(item["payload_relpath"])
-            payload_path = entry_dir.joinpath(*payload_relpath.parts).resolve(strict=False)
+            payload_path = entry_dir.joinpath(*payload_relpath.parts).resolve(
+                strict=False
+            )
             if not payload_path.is_relative_to(entry_dir.resolve(strict=False)):
                 raise RecoveryIntegrityError("恢复 payload 路径越界")
             if not payload_path.is_file():
@@ -675,7 +695,11 @@ class RecoveryStore:
         project: str | None = None,
         entity_type: str | None = None,
     ) -> list[dict]:
-        categories = [self._validate_category(category)] if category else sorted(RECOVERY_CATEGORIES)
+        categories = (
+            [self._validate_category(category)]
+            if category
+            else sorted(RECOVERY_CATEGORIES)
+        )
         entries: list[dict] = []
         for current_category in categories:
             category_dir = self.root / current_category
@@ -689,16 +713,21 @@ class RecoveryStore:
                     verified = self.get_verified(recovery_id)
                     manifest = verified.manifest
                 except (ValueError, RecoveryIntegrityError):
-                    entries.append({
-                        "recovery_id": None,
-                        "category": current_category,
-                        "status": "invalid",
-                        "error": "恢复项完整性校验失败",
-                    })
+                    entries.append(
+                        {
+                            "recovery_id": None,
+                            "category": current_category,
+                            "status": "invalid",
+                            "error": "恢复项完整性校验失败",
+                        }
+                    )
                     continue
                 if project is not None and manifest.get("project") != project:
                     continue
-                if entity_type is not None and manifest.get("entity_type") != entity_type:
+                if (
+                    entity_type is not None
+                    and manifest.get("entity_type") != entity_type
+                ):
                     continue
                 entries.append(deepcopy(manifest))
         entries.sort(key=lambda item: item.get("created_at", ""), reverse=True)
@@ -764,7 +793,7 @@ class RecoveryStore:
             raise ValueError("隔离源路径与实体归属不一致")
 
         expected = str(fingerprint).lower()
-        with library_lock.shared():
+        with library_lock.shared_write():
             existing = self.find_matching_quarantine(
                 entity_type=entity_type,
                 project=project,
@@ -1006,7 +1035,7 @@ class RecoveryStore:
         if overwrite:
             raise ValueError("YAML 隔离项恢复禁止覆盖")
 
-        with library_lock.shared():
+        with library_lock.shared_write():
             verified = self.get_verified(recovery_id)
             manifest = verified.manifest
             entity_type = manifest.get("entity_type")
@@ -1019,9 +1048,7 @@ class RecoveryStore:
                 entity_type=entity_type,
                 project=manifest["project"],
                 entity_id=manifest["entity_id"],
-                suffix=PurePosixPath(
-                    str(manifest.get("source_relpath", ""))
-                ).suffix,
+                suffix=PurePosixPath(str(manifest.get("source_relpath", ""))).suffix,
             )
             if source_relpath != manifest.get("source_relpath"):
                 raise RecoveryIntegrityError("YAML 恢复目标与 manifest 归属不一致")
@@ -1120,12 +1147,14 @@ class RecoveryStore:
                 failed = deepcopy(restoring.manifest)
                 failed["status"] = "complete" if compensated else "restoring"
                 failed_journal = failed.setdefault("restore_journal", {})
-                failed_journal.update({
-                    "failed_at": utc_now().isoformat(),
-                    "phase": "failed",
-                    "error_code": error_code,
-                    "compensated": compensated,
-                })
+                failed_journal.update(
+                    {
+                        "failed_at": utc_now().isoformat(),
+                        "phase": "failed",
+                        "error_code": error_code,
+                        "compensated": compensated,
+                    }
+                )
                 if not compensated:
                     failed.setdefault("metadata", {})["needs_recovery"] = True
                 try:

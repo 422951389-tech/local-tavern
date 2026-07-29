@@ -10,6 +10,7 @@ from uuid import UUID
 import httpx
 
 from core import character_loader, search_service, session_manager
+from core.config import PORT
 from server import app
 
 
@@ -85,7 +86,10 @@ class SearchApiTests(unittest.IsolatedAsyncioTestCase):
         character_loader.ROOT_DIR = self.test_root
         session_manager.clear_session_stores_for_testing()
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        self.client = httpx.AsyncClient(transport=transport, base_url="http://test")
+        self.client = httpx.AsyncClient(
+            transport=transport,
+            base_url=f"http://127.0.0.1:{PORT}",
+        )
 
     async def asyncTearDown(self):
         await self.client.aclose()

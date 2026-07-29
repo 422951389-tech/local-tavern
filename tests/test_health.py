@@ -46,7 +46,8 @@ async def test_ready_status_and_contract_are_fixed(app_client, monkeypatch):
     report = {
         "status": "not_ready",
         "service": "local-tavern",
-        "contract_version": 1,
+        "contract_version": 2,
+        "readiness_scope": "configuration",
         "checks": {
             "data": {"status": "ok"},
             "runtime": {"status": "ok"},
@@ -129,6 +130,7 @@ async def test_readiness_report_sanitizes_all_probe_failures():
         data_probe=lambda: {"status": "ok"},
         runtime_probe=lambda: {"status": "ok"},
         maintenance_probe=lambda: {"status": "ok"},
+        provider_probe=lambda: {"status": "ok", "cloud_configured": False},
         ollama_probe=ollama_failure,
     )
     assert report["status"] == "not_ready"
@@ -154,6 +156,7 @@ async def test_readiness_report_sanitizes_sync_exceptions_and_malformed_results(
             "status": "error",
             "code": "SECRET_RESTORE_ID",
         },
+        provider_probe=lambda: {"status": "ok", "cloud_configured": False},
         ollama_probe=ollama_ok,
     )
 
@@ -161,9 +164,55 @@ async def test_readiness_report_sanitizes_sync_exceptions_and_malformed_results(
         "data": {"status": "error", "code": "data_io"},
         "runtime": {"status": "error", "code": "lock_invalid"},
         "ollama": {"status": "ok"},
+        "providers": {
+            "status": "ok",
+            "cloud_configured": False,
+            "connectivity": "not_probed",
+        },
         "maintenance": {
             "status": "error",
             "code": "maintenance_unavailable",
         },
+        "inference": {
+            "status": "ok",
+            "source": "ollama",
+            "connectivity": "verified",
+        },
     }
     assert "SECRET" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_configured_cloud_provider_is_configuration_ready_but_explicitly_unverified():
+    calls = 0
+
+    def provider_probe():
+        nonlocal calls
+        calls += 1
+        return {"status": "ok", "cloud_configured": True}
+
+    async def ollama_unavailable():
+        return {"ok": False, "code": "unreachable"}
+
+    report = await health.readiness_report(
+        data_probe=lambda: {"status": "ok"},
+        runtime_probe=lambda: {"status": "ok"},
+        maintenance_probe=lambda: {"status": "ok"},
+        provider_probe=provider_probe,
+        ollama_probe=ollama_unavailable,
+    )
+
+    assert calls == 1
+    assert report["status"] == "ready"
+    assert report["contract_version"] == 2
+    assert report["readiness_scope"] == "configuration"
+    assert report["checks"]["providers"] == {
+        "status": "ok",
+        "cloud_configured": True,
+        "connectivity": "not_probed",
+    }
+    assert report["checks"]["inference"] == {
+        "status": "ok",
+        "source": "cloud_configuration",
+        "connectivity": "not_probed",
+    }

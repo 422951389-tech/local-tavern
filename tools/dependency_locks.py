@@ -13,6 +13,8 @@ RUNTIME_LOCK = ROOT / "requirements.lock.txt"
 RUNTIME_HASH_LOCK = ROOT / "requirements.hashes.txt"
 DEV_LOCK = ROOT / "requirements-dev.lock.txt"
 DEV_HASH_LOCK = ROOT / "requirements-dev.hashes.txt"
+DESKTOP_LOCK = ROOT / "requirements-desktop.lock.txt"
+DESKTOP_HASH_LOCK = ROOT / "requirements-desktop.hashes.txt"
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._+!-]*[A-Za-z0-9])?$")
@@ -213,12 +215,14 @@ def verify_environment(
     }
 
 
-def _paths(root: Path) -> tuple[Path, Path, Path, Path]:
+def _paths(root: Path) -> tuple[Path, Path, Path, Path, Path, Path]:
     return (
         root / RUNTIME_LOCK.name,
         root / RUNTIME_HASH_LOCK.name,
         root / DEV_LOCK.name,
         root / DEV_HASH_LOCK.name,
+        root / DESKTOP_LOCK.name,
+        root / DESKTOP_HASH_LOCK.name,
     )
 
 
@@ -226,21 +230,36 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="校验本地酒馆依赖锁与精确环境")
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--semantic-only", action="store_true")
-    parser.add_argument("--environment", choices=("runtime", "dev"))
+    parser.add_argument("--environment", choices=("runtime", "dev", "desktop"))
     args = parser.parse_args(argv)
 
-    runtime_lock, runtime_hash, dev_lock, dev_hash = _paths(args.root.resolve())
+    (
+        runtime_lock,
+        runtime_hash,
+        dev_lock,
+        dev_hash,
+        desktop_lock,
+        desktop_hash,
+    ) = _paths(args.root.resolve())
     try:
         if args.semantic_only:
             runtime = parse_semantic_lock(runtime_lock)
             dev = parse_semantic_lock(dev_lock)
+            desktop = parse_semantic_lock(desktop_lock)
         else:
             runtime = verify_lock_pair(runtime_lock, runtime_hash)
             dev = verify_lock_pair(dev_lock, dev_hash)
+            desktop = verify_lock_pair(desktop_lock, desktop_hash)
         verify_lock_overlap(runtime, dev)
+        verify_lock_overlap(runtime, desktop)
+        verify_lock_overlap(dev, desktop)
         environment = None
         if args.environment:
-            expected = runtime if args.environment == "runtime" else {**runtime, **dev}
+            expected = {
+                "runtime": runtime,
+                "dev": {**runtime, **dev},
+                "desktop": desktop,
+            }[args.environment]
             environment = verify_environment(expected)
     except LockValidationError as exc:
         print(f"[依赖锁失败] {exc}")
@@ -250,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
         "ok": True,
         "runtime_packages": len(runtime),
         "dev_packages": len(dev),
+        "desktop_packages": len(desktop),
         "hashes_checked": not args.semantic_only,
         "environment": environment,
     })

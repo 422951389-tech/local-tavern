@@ -5,6 +5,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
+from core.async_utils import run_sync_critical
 from core.backup_store import BackupManager
 
 
@@ -102,7 +103,7 @@ async def run_backup_scheduler(
         raise ValueError("poll_seconds 必须是正整数")
     while True:
         try:
-            result = await asyncio.to_thread(
+            result = await run_sync_critical(
                 run_backup_maintenance_once,
                 manager,
                 backup_interval=backup_interval,

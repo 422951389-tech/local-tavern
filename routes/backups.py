@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 
+from core.async_utils import await_critical, run_sync_critical
 from core import config
 from core.backup_store import (
     BackupConflict,
@@ -86,6 +87,19 @@ def _raise_bad_request(exc: ValueError) -> None:
     ) from exc
 
 
+async def _run_restore_and_reconcile(callback, *args, **kwargs):
+    """恢复线程与 turn 对账在同一维护窗口内完整收口。"""
+
+    from core.chat_turns import get_turn_coordinator
+
+    async def operation():
+        result = await asyncio.to_thread(callback, *args, **kwargs)
+        await get_turn_coordinator().reconcile_after_restore()
+        return result
+
+    return await await_critical(operation())
+
+
 @router.get("/api/backups")
 async def api_list_backups():
     try:
@@ -124,12 +138,11 @@ async def api_get_restore_journal(restore_id: str):
 @router.post("/api/backups/restores/{restore_id}/recover")
 async def api_recover_restore(restore_id: str):
     from core.active_turns import begin_maintenance, end_maintenance
-    from core.chat_turns import get_turn_coordinator
 
     maintenance_token = begin_maintenance("backup_restore_recovery")
     try:
         try:
-            result = await asyncio.to_thread(
+            result = await _run_restore_and_reconcile(
                 get_backup_manager().recover_restore,
                 restore_id,
             )
@@ -139,7 +152,6 @@ async def api_recover_restore(restore_id: str):
             _raise_not_found(exc)
         except ValueError as exc:
             _raise_bad_request(exc)
-        await get_turn_coordinator().reconcile_after_restore()
         return result
     finally:
         end_maintenance(maintenance_token)
@@ -159,7 +171,7 @@ async def api_plan_backup_retention():
 async def api_apply_backup_retention(req: Request):
     body = await _validated_body(req, RetentionApplyRequest)
     try:
-        return await asyncio.to_thread(
+        return await run_sync_critical(
             get_backup_manager().apply_retention,
             plan_fingerprint=body.plan_fingerprint,
             confirm=body.confirm,
@@ -198,7 +210,7 @@ async def api_get_backup_drill(drill_id: str):
 async def api_create_backup(req: Request):
     body = await _validated_body(req, BackupCreateRequest)
     try:
-        backup = await asyncio.to_thread(
+        backup = await run_sync_critical(
             get_backup_manager().create_backup,
             body.reason,
         )
@@ -227,7 +239,7 @@ async def api_backup_dry_run(backup_id: str):
 @router.post("/api/backups/{backup_id}/drill")
 async def api_run_backup_drill(backup_id: str):
     try:
-        return await asyncio.to_thread(
+        return await run_sync_critical(
             get_backup_manager().drill,
             backup_id,
         )
@@ -242,13 +254,12 @@ async def api_run_backup_drill(backup_id: str):
 @router.post("/api/backups/{backup_id}/restore")
 async def api_restore_backup(backup_id: str, req: Request):
     from core.active_turns import begin_maintenance, end_maintenance
-    from core.chat_turns import get_turn_coordinator
 
     body = await _validated_body(req, BackupRestoreRequest)
     maintenance_token = begin_maintenance("backup_restore")
     try:
         try:
-            result = await asyncio.to_thread(
+            result = await _run_restore_and_reconcile(
                 get_backup_manager().restore,
                 backup_id,
                 expected_current_fingerprint=body.expected_current_fingerprint,
@@ -260,7 +271,6 @@ async def api_restore_backup(backup_id: str, req: Request):
             _raise_not_found(exc)
         except ValueError as exc:
             _raise_bad_request(exc)
-        await get_turn_coordinator().reconcile_after_restore()
         return result
     finally:
         end_maintenance(maintenance_token)

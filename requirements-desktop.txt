@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Windows desktop shell and reproducible freezer.
+pyinstaller==6.21.0
+PySide6==6.11.1

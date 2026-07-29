@@ -1,0 +1,39 @@
+/* 长期记忆 */
+.memory-note-form label:first-of-type textarea {
+    min-height: 96px;
+}
+
+.memory-note-items {
+    display: grid;
+    gap: 10px;
+}
+
+.memory-note-card {
+    display: grid;
+    gap: 9px;
+    padding: 14px;
+    background: var(--workspace-panel-raised);
+    border: 1px solid var(--workspace-line);
+    border-radius: var(--workspace-radius);
+}
+
+.memory-notes-center {
+    grid-template-columns: minmax(260px, 0.8fr) minmax(300px, 1.2fr);
+    align-items: start;
+}
+
+.memory-note-text,
+.memory-note-detail {
+    margin: 0;
+    white-space: pre-wrap;
+}
+
+.memory-note-text {
+    color: var(--workspace-ink);
+}
+
+@media (max-width: 899px) {
+    .memory-notes-center {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}

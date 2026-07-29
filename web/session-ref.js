@@ -79,6 +79,7 @@
             project: ref.project,
             save: ref.save,
             session,
+            currentProvider: session.current_provider || 'ollama',
             currentModel: session.current_model || '',
             messageHistory: Array.isArray(session.message_history) ? session.message_history : [],
             sceneMeta: session.scene_meta && typeof session.scene_meta === 'object' ? session.scene_meta : {},

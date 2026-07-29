@@ -8,7 +8,9 @@ from datetime import datetime
 from typing import Any
 
 from core.active_turns import ActiveTurnConflict
-from core.ollama_client import get_client
+from core.model_provider import ProviderError
+from core.provider_registry import ProviderLease, get_provider_registry
+from core.secret_store import SecretStoreError
 from core.session_manager import RevisionConflict, aload_session, mutate_session
 from core.summary_parser import parse_summary
 
@@ -296,8 +298,10 @@ async def _apply_generation_update(
 
 
 def _public_error(exc: Exception) -> str:
-    message = str(exc).strip() or type(exc).__name__
-    return message[:500]
+    """只公开受控异常文本，未分类异常的原文仅进入内部日志。"""
+    if isinstance(exc, (SummaryValidationError, ProviderError, SecretStoreError)):
+        return exc.message[:500]
+    return "摘要生成失败，请重试"
 
 
 async def _generate_summary(
@@ -307,9 +311,15 @@ async def _generate_summary(
     summary_id: str,
     generation_id: str,
     dropped: list[dict],
+    *,
+    provider: str = "ollama",
+    provider_lease: ProviderLease | None = None,
 ) -> None:
+    lease = provider_lease
     try:
-        raw = await get_client().summarize_once(model, dropped)
+        if lease is None:
+            lease = await get_provider_registry().acquire_lease(provider)
+        raw = await lease.provider.summarize_once(model, dropped)
         parsed = validate_generated_summary(raw)
         replacement = {
             **parsed,
@@ -321,13 +331,22 @@ async def _generate_summary(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.warning("短期总结失败，不影响基础对话: %s", exc)
+        if isinstance(exc, (SummaryValidationError, ProviderError, SecretStoreError)):
+            logger.warning(
+                "短期总结失败，不影响基础对话 code=%s",
+                exc.code,
+            )
+        else:
+            logger.exception("短期总结发生未分类异常，不影响基础对话")
         replacement = {
             "status": "failed",
             "failed": True,
             "completed_at": datetime.now().astimezone().isoformat(),
             "error": _public_error(exc),
         }
+    finally:
+        if lease is not None:
+            await lease.release()
     await _apply_generation_update(
         project,
         save,
@@ -337,30 +356,48 @@ async def _generate_summary(
     )
 
 
-def schedule_summary_generation(
+async def schedule_summary_generation(
     project: str,
     save: str,
     model: str,
     summary_id: str,
     generation_id: str,
     dropped: list[dict],
+    *,
+    provider: str = "ollama",
+    provider_lease: ProviderLease | None = None,
+    retain_provider_lease: bool = False,
 ) -> asyncio.Task:
-    """同一生成版本只启动一个任务。"""
+    """同一生成版本只启动一个任务，并把单一实例租约移交给任务。"""
     key = (project, save, summary_id, generation_id)
     existing = _summary_tasks.get(key)
     if existing is not None and not existing.done():
+        if provider_lease is not None and not retain_provider_lease:
+            await provider_lease.release()
         return existing
-    task = asyncio.create_task(
-        _generate_summary(
-            project,
-            save,
-            model,
-            summary_id,
-            generation_id,
-            deepcopy(dropped),
-        ),
-        name=f"summary-{summary_id}-{generation_id}",
-    )
+    if provider_lease is None:
+        task_lease = await get_provider_registry().acquire_lease(provider)
+    elif retain_provider_lease:
+        task_lease = provider_lease.retain()
+    else:
+        task_lease = provider_lease
+    try:
+        task = asyncio.create_task(
+            _generate_summary(
+                project,
+                save,
+                model,
+                summary_id,
+                generation_id,
+                deepcopy(dropped),
+                provider=provider,
+                provider_lease=task_lease,
+            ),
+            name=f"summary-{summary_id}-{generation_id}",
+        )
+    except BaseException:
+        await task_lease.release()
+        raise
     _summary_tasks[key] = task
 
     def discard(done: asyncio.Task) -> None:

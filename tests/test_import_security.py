@@ -55,12 +55,82 @@ class ImportValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "消息 id 必须是 UUID"):
             validate_import_json(json.dumps(fixture, ensure_ascii=False))
 
+    def test_message_presentation_is_bounded_and_round_trips_without_raw(self):
+        fixture = valid_session()
+        fixture["message_history"][0].update({
+            "role": "assistant",
+            "content": """📍 导入地点 | ⏱️ 午后 / 晴
+🎯 [主线] 任务名称：验证刷新
+📌 当前场景：结构化内容已导入。
+➡️ 下一目标：继续验证
+👤 用户：导入用户
+🎭 角色A | 💝 100%
+📖 场景旁白
+结构化旁白
+💡 行动建议
+- 继续
+""",
+            "presentation": {
+                "schema_version": 1,
+                "scene_meta": {
+                    "location": "导入地点",
+                    "time_weather": "午后 / 晴",
+                    "main_quest": "验证刷新",
+                    "current_scene": "结构化内容已导入。",
+                    "next_goal": "继续验证",
+                    "user_line": "导入用户",
+                },
+                "characters": [{
+                    "name": "角色A",
+                    "affinity": 60,
+                    "previous_affinity": 50,
+                    "mood": "平静",
+                }],
+                "narration": "结构化旁白",
+                "suggestions": ["继续"],
+                "warnings": [],
+                "scene_changes": [{"key": "location", "value": "导入地点"}],
+            },
+        })
+        validated = validate_import_json(json.dumps(fixture, ensure_ascii=False))
+        presentation = validated["message_history"][0]["presentation"]
+        self.assertEqual(presentation["scene_meta"]["main_quest"], "验证刷新")
+        self.assertEqual(presentation["characters"][0]["affinity"], 60)
+        self.assertEqual(presentation["characters"][0]["previous_affinity"], 50)
+        self.assertEqual(presentation["characters"][0]["mood"], "平静")
+        self.assertEqual(presentation["scene_changes"][0]["key"], "location")
+        self.assertNotIn("raw", presentation)
+
+        mismatched = json.loads(json.dumps(fixture, ensure_ascii=False))
+        mismatched["message_history"][0]["presentation"]["scene_meta"][
+            "main_quest"
+        ] = "伪造主线"
+        with self.assertRaisesRegex(ValueError, "与消息原文不一致"):
+            validate_import_json(json.dumps(mismatched, ensure_ascii=False))
+
+        fixture["message_history"][0]["presentation"]["schema_version"] = 2
+        with self.assertRaisesRegex(ValueError, "presentation.schema_version"):
+            validate_import_json(json.dumps(fixture, ensure_ascii=False))
+
+        fixture["message_history"][0]["presentation"]["schema_version"] = 1
+        fixture["message_history"][0]["presentation"]["suggestions"] = [
+            f"建议{index}" for index in range(6)
+        ]
+        with self.assertRaisesRegex(ValueError, "presentation.suggestions"):
+            validate_import_json(json.dumps(fixture, ensure_ascii=False))
+
+        fixture["message_history"][0]["presentation"]["suggestions"] = ["继续"]
+        fixture["message_history"][0]["presentation"]["raw"] = "不得重复导入原文"
+        with self.assertRaisesRegex(ValueError, "presentation.raw"):
+            validate_import_json(json.dumps(fixture, ensure_ascii=False))
+
 
 class IsolatedImportWriteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.old_root = session_manager.ROOT_DIR
         session_manager.ROOT_DIR = Path(self.tempdir.name) / "projects"
+        (session_manager.ROOT_DIR / "测试项目").mkdir(parents=True, exist_ok=True)
         session_manager.clear_session_stores_for_testing()
 
     async def asyncTearDown(self):

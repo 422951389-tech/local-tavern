@@ -1,14 +1,25 @@
 """消息操作、历史快照与总结重生成路由。"""
+
 from __future__ import annotations
 
+import asyncio
 import json
 from copy import deepcopy
 from datetime import datetime
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
-from core.ollama_client import get_client
+from core.message_commands import (
+    MessageCommandError,
+    MessageNotFound,
+    ReplyAlternativeNotFound,
+    select_reply_alternative,
+)
+from core.model_provider import ProviderError
+from core.provider_registry import get_provider_registry
+from core.secret_store import SecretStoreError
 from core.session_manager import (
     RevisionConflict,
     _saves_dir,
@@ -25,6 +36,7 @@ from core.relationship_edges import (
     reconcile_relationship_evidence,
     validate_relationship_edges,
 )
+from core.response_parser import build_response_presentation, parse_response
 from core.summary_lifecycle import (
     SummaryValidationError,
     annotate_summary_task_state,
@@ -41,9 +53,68 @@ from routes.common import (
     _norm_save,
     _raise_revision_conflict,
 )
+from routes.providers import raise_provider_error
 
 
 router = APIRouter()
+
+
+def _history_entries_sync(history_dir, save: str) -> list[dict]:
+    if not history_dir.exists():
+        return []
+    snapshots = []
+    for path in sorted(history_dir.glob(f"{save}.*.json"), reverse=True):
+        try:
+            if ".trim." in path.name:
+                snapshot_type = "trim"
+                timestamp = path.name.split(".trim.", 1)[1].removesuffix(".json")
+            elif ".reset." in path.name:
+                snapshot_type = "reset"
+                timestamp = path.name.split(".reset.", 1)[1].removesuffix(".json")
+            else:
+                snapshot_type = "snapshot"
+                timestamp = path.name[len(save) + 1 :].removesuffix(".json")
+            snapshots.append(
+                {
+                    "filename": path.name,
+                    "timestamp": timestamp,
+                    "type": snapshot_type,
+                    "modified_at": datetime.fromtimestamp(
+                        path.stat().st_mtime
+                    ).isoformat(),
+                }
+            )
+        except (OSError, ValueError):
+            continue
+    return snapshots
+
+
+def _read_snapshot_sync(path) -> tuple[dict, str]:
+    if not path.is_file():
+        raise FileNotFoundError("快照不存在")
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError("snapshot_read_failed") from exc
+    return snapshot, datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+
+
+class ReplyAlternativeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project: StrictStr = "默认项目"
+    save: StrictStr = "默认存档"
+    expected_revision: StrictInt = Field(ge=0)
+    message_id: StrictStr
+    alternative_id: StrictStr
+
+    @field_validator("message_id", "alternative_id")
+    @classmethod
+    def validate_uuid(cls, value: str) -> str:
+        try:
+            return str(UUID(value))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("必须是 UUID") from exc
 
 
 def _required_summary_id(body: dict) -> str:
@@ -70,11 +141,7 @@ def _required_summary_id(body: dict) -> str:
 
 def _find_summary(session: dict, summary_id: str) -> dict:
     target = next(
-        (
-            item
-            for item in session.get("summaries", [])
-            if item.get("id") == summary_id
-        ),
+        (item for item in session.get("summaries", []) if item.get("id") == summary_id),
         None,
     )
     if target is None:
@@ -109,9 +176,7 @@ def _validate_snapshot_owner(
 def _precheck_revision(session: dict, expected_revision: int) -> None:
     current = session.get("revision", 0)
     if current != expected_revision:
-        _raise_revision_conflict(
-            RevisionConflict(expected_revision, current, session)
-        )
+        _raise_revision_conflict(RevisionConflict(expected_revision, current, session))
 
 
 @router.get("/api/session")
@@ -192,6 +257,12 @@ async def api_patch_session(
             if req.content is None:
                 raise HTTPException(400, "缺少 content")
             message["content"] = req.content
+            if message.get("role") == "assistant":
+                message["presentation"] = build_response_presentation(
+                    parse_response(req.content)
+                )
+            else:
+                message.pop("presentation", None)
         elif req.action == "toggle_in_prompt":
             if req.in_prompt is None:
                 raise HTTPException(400, "缺少 in_prompt")
@@ -200,11 +271,7 @@ async def api_patch_session(
             context.snapshot("snapshot", session)
             session["message_history"] = [
                 *history[:position],
-                *(
-                    item
-                    for item in history[position:]
-                    if item.get("pinned")
-                ),
+                *(item for item in history[position:] if item.get("pinned")),
             ]
             reconcile_relationship_evidence(session)
         elif req.action == "toggle_pinned":
@@ -234,37 +301,66 @@ async def api_patch_session(
     return mutation.session
 
 
+@router.patch("/api/session/reply-alternative")
+async def api_select_reply_alternative(req: ReplyAlternativeRequest):
+    project = _norm_project(req.project)
+    save = _norm_save(req.save)
+
+    def apply_selection(session: dict, context) -> dict:
+        del context
+        result = select_reply_alternative(
+            session,
+            message_id=req.message_id,
+            alternative_id=req.alternative_id,
+        )
+        reconcile_relationship_evidence(session)
+        return result
+
+    try:
+        mutation = await mutate_session(
+            project,
+            save,
+            req.expected_revision,
+            apply_selection,
+        )
+    except RevisionConflict as exc:
+        _raise_revision_conflict(exc)
+    except (MessageNotFound, ReplyAlternativeNotFound) as exc:
+        raise HTTPException(
+            404,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except MessageCommandError as exc:
+        raise HTTPException(
+            422,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    return {**mutation.value, "session": mutation.session}
+
+
 @router.get("/api/session/history")
 async def api_list_history(
     project: str = Query("默认项目"),
     save: str = Query("默认存档"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=200),
 ):
     save = _norm_save(save)
     project = _norm_project(project)
     history_dir = _saves_dir(project) / ".history"
-    if not history_dir.exists():
-        return {"snapshots": []}
-    snapshots = []
-    for path in sorted(history_dir.glob(f"{save}.*.json"), reverse=True):
-        try:
-            if ".trim." in path.name:
-                snapshot_type = "trim"
-                timestamp = path.name.split(".trim.", 1)[1].removesuffix(".json")
-            elif ".reset." in path.name:
-                snapshot_type = "reset"
-                timestamp = path.name.split(".reset.", 1)[1].removesuffix(".json")
-            else:
-                snapshot_type = "snapshot"
-                timestamp = path.name[len(save) + 1:].removesuffix(".json")
-            snapshots.append({
-                "filename": path.name,
-                "timestamp": timestamp,
-                "type": snapshot_type,
-                "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
-            })
-        except (OSError, ValueError):
-            continue
-    return {"snapshots": snapshots}
+    all_snapshots = await asyncio.to_thread(
+        _history_entries_sync,
+        history_dir,
+        save,
+    )
+    snapshots = all_snapshots[offset : offset + limit]
+    return {
+        "snapshots": snapshots,
+        "total": len(all_snapshots),
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(snapshots) < len(all_snapshots),
+    }
 
 
 @router.get("/api/session/snapshot")
@@ -281,11 +377,14 @@ async def api_get_snapshot(
         path, snapshot_type = resolve_snapshot_path(project, save, filename)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    if not path.exists():
-        raise HTTPException(404, "快照不存在")
     try:
-        snapshot = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        snapshot, modified_at = await asyncio.to_thread(
+            _read_snapshot_sync,
+            path,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "快照不存在") from exc
+    except ValueError as exc:
         raise HTTPException(
             400,
             detail={
@@ -303,7 +402,7 @@ async def api_get_snapshot(
         "filename": filename,
         "snapshot_type": snapshot_type,
         "session_id": snapshot.get("session_id", save),
-        "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+        "modified_at": modified_at,
         "messages": messages,
     }
 
@@ -326,11 +425,14 @@ async def api_restore_snapshot(req: Request):
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    if not path.exists():
-        raise HTTPException(404, "快照不存在")
     try:
-        snapshot = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        snapshot, _modified_at = await asyncio.to_thread(
+            _read_snapshot_sync,
+            path,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "快照不存在") from exc
+    except ValueError as exc:
         raise HTTPException(
             400,
             detail={
@@ -361,9 +463,7 @@ async def api_restore_snapshot(req: Request):
         return {
             "session": mutation.session,
             "recovery_id": (
-                mutation.recovery_ids[-1]
-                if mutation.recovery_ids
-                else None
+                mutation.recovery_ids[-1] if mutation.recovery_ids else None
             ),
         }
     except RevisionConflict as exc:
@@ -410,11 +510,14 @@ async def api_regenerate_summary(req: Request):
                 "summary_id": summary_id,
             },
         )
-    if sum(
-        1
-        for item in session.get("summaries", [])
-        if item.get("source_snapshot_id") == source_snapshot_id
-    ) != 1:
+    if (
+        sum(
+            1
+            for item in session.get("summaries", [])
+            if item.get("source_snapshot_id") == source_snapshot_id
+        )
+        != 1
+    ):
         raise HTTPException(
             409,
             detail={
@@ -439,7 +542,12 @@ async def api_regenerate_summary(req: Request):
                 "summary_id": summary_id,
             },
         ) from exc
-    if not snapshot_path.is_file():
+    try:
+        snapshot, _modified_at = await asyncio.to_thread(
+            _read_snapshot_sync,
+            snapshot_path,
+        )
+    except FileNotFoundError as exc:
         raise HTTPException(
             409,
             detail={
@@ -448,10 +556,8 @@ async def api_regenerate_summary(req: Request):
                 "summary_id": summary_id,
                 "source_snapshot_id": source_snapshot_id,
             },
-        )
-    try:
-        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        ) from exc
+    except ValueError as exc:
         raise HTTPException(
             422,
             detail={
@@ -495,62 +601,95 @@ async def api_regenerate_summary(req: Request):
             },
         )
 
-    model = session.get("current_model", "")
-    if not model:
-        available = await get_client().list_models()
-        model = available[0] if available else ""
-    if not model:
-        raise HTTPException(400, "存档未指定模型，无法重生成总结")
-
-    generation_id = str(uuid4())
-    requested_at = datetime.now().astimezone().isoformat()
-
-    def mark_pending(current: dict, context) -> dict:
-        del context
-        item = _find_summary(current, summary_id)
-        attempt = item.get("generation_attempt", 0)
-        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
-            attempt = 0
-        item.update({
-            "status": "pending",
-            "generation_id": generation_id,
-            "generation_attempt": attempt + 1,
-            "requested_at": requested_at,
-            "source_status": "available",
-            "error": None,
-        })
-        item.pop("failed", None)
-        recompute_summary_error(current)
-        return deepcopy(item)
-
+    provider_lease = None
     try:
-        mutation = await mutate_session(
+        provider_id = session.get("current_provider", "ollama")
+        if not isinstance(provider_id, str):
+            raise HTTPException(400, "存档 Provider 无效，无法重生成总结")
+        provider_lease = await get_provider_registry().acquire_lease(provider_id)
+        available = (
+            sorted(set(provider_lease.config.models))
+            if provider_lease.config.models
+            else await provider_lease.provider.list_models()
+        )
+
+        model = session.get("current_model", "")
+        if not model:
+            model = available[0] if available else ""
+        if not model:
+            raise HTTPException(400, "存档未指定模型，无法重生成总结")
+        if model not in available:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "provider_model_unavailable",
+                    "message": "存档模型在当前 Provider 中不可用",
+                    "provider_id": provider_id,
+                    "models": available,
+                },
+            )
+
+        generation_id = str(uuid4())
+        requested_at = datetime.now().astimezone().isoformat()
+
+        def mark_pending(current: dict, context) -> dict:
+            del context
+            item = _find_summary(current, summary_id)
+            attempt = item.get("generation_attempt", 0)
+            if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+                attempt = 0
+            item.update(
+                {
+                    "status": "pending",
+                    "generation_id": generation_id,
+                    "generation_attempt": attempt + 1,
+                    "provider": provider_id,
+                    "model": model,
+                    "requested_at": requested_at,
+                    "source_status": "available",
+                    "error": None,
+                }
+            )
+            item.pop("failed", None)
+            recompute_summary_error(current)
+            return deepcopy(item)
+
+        try:
+            mutation = await mutate_session(
+                project,
+                save,
+                expected_revision,
+                mark_pending,
+            )
+        except RevisionConflict as exc:
+            _raise_revision_conflict(exc)
+        await schedule_summary_generation(
             project,
             save,
-            expected_revision,
-            mark_pending,
+            model,
+            summary_id,
+            generation_id,
+            dropped,
+            provider=provider_id,
+            provider_lease=provider_lease,
         )
-    except RevisionConflict as exc:
-        _raise_revision_conflict(exc)
-    schedule_summary_generation(
-        project,
-        save,
-        model,
-        summary_id,
-        generation_id,
-        dropped,
-    )
-    public_session = annotate_summary_task_state(
-        mutation.session,
-        project,
-        save,
-    )
-    return {
-        "accepted": True,
-        "summary_id": summary_id,
-        "generation_id": generation_id,
-        "session": public_session,
-    }
+        provider_lease = None  # 所有权已移交给摘要任务。
+        public_session = annotate_summary_task_state(
+            mutation.session,
+            project,
+            save,
+        )
+        return {
+            "accepted": True,
+            "summary_id": summary_id,
+            "generation_id": generation_id,
+            "session": public_session,
+        }
+    except (ProviderError, SecretStoreError) as exc:
+        raise_provider_error(exc)
+    finally:
+        if provider_lease is not None:
+            await provider_lease.release()
 
 
 @router.patch("/api/session/summary")

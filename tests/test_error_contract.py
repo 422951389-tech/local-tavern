@@ -8,6 +8,7 @@ import pytest
 
 from core.active_turns import begin_maintenance, end_maintenance
 from core.api_errors import SECURITY_HEADERS
+from core.config import PORT
 from server import app
 from tests.data_guard import file_manifest
 
@@ -27,7 +28,11 @@ EXPECTED_WRITE_ROUTES = frozenset({
     ("POST", "/api/chat/turns/{turn_id}/cancel"),
     ("POST", "/api/chat"),
     ("POST", "/api/model/switch"),
+    ("POST", "/api/memory-notes"),
+    ("PATCH", "/api/memory-notes/{note_id}"),
+    ("DELETE", "/api/memory-notes/{note_id}"),
     ("PATCH", "/api/session"),
+    ("PATCH", "/api/session/reply-alternative"),
     ("POST", "/api/session/restore"),
     ("POST", "/api/session/summary/regenerate"),
     ("PATCH", "/api/session/summary"),
@@ -38,6 +43,11 @@ EXPECTED_WRITE_ROUTES = frozenset({
     ("DELETE", "/api/projects"),
     ("PUT", "/api/prompts/{name}"),
     ("POST", "/api/prompts/{name}/reset"),
+    ("PUT", "/api/providers/{provider_id}"),
+    ("DELETE", "/api/providers/{provider_id}"),
+    ("PUT", "/api/providers/{provider_id}/credential"),
+    ("DELETE", "/api/providers/{provider_id}/credential"),
+    ("POST", "/api/providers/{provider_id}/test"),
     ("POST", "/api/recovery/quarantine"),
     ("POST", "/api/recovery/{recovery_id}/restore"),
     ("PUT", "/api/session/relationships"),
@@ -194,7 +204,10 @@ async def test_unexpected_exception_is_safe_and_keeps_security_headers(monkeypat
 
     monkeypatch.setattr(settings_routes, "atomic_write", fail_write)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url=f"http://127.0.0.1:{PORT}",
+    ) as client:
         response = await client.put(
             "/api/settings",
             json={"data": {"temperature": 0.5}},
@@ -234,3 +247,13 @@ async def test_settings_reject_invalid_types_ranges_and_unknown_fields_without_w
         code="request_validation_failed",
     )
     assert file_manifest(isolated_paths["root"]) == before
+@pytest.mark.asyncio
+async def test_untrusted_host_is_rejected_before_provider_origin(app_client):
+    response = await app_client.put(
+        "/api/providers/rebinding",
+        json={"preset": "openai"},
+        headers={"Host": "evil.example", "Origin": "http://evil.example"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "host_not_allowed"
+    assert response.headers["content-security-policy"]

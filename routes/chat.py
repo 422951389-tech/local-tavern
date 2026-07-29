@@ -9,21 +9,40 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from core.chat_turns import TurnNotFound, TurnRuntime, get_turn_coordinator
-from core.ollama_client import get_client
+from core.active_turns import assert_write_allowed
+from core.chat_turns import (
+    TurnEventLogLimitExceeded,
+    TurnNotFound,
+    TurnRuntime,
+    get_turn_coordinator,
+)
+from core.model_provider import ProviderError
+from core.provider_registry import get_provider_registry
+from core.secret_store import SecretStoreError
 from core.character_loader import load_character, load_user_profile, load_worldbook
-from core.config import MAX_MESSAGES_IN_SAVE
+from core.config import (
+    CHAT_GENERATION_MAX_SECONDS,
+    CHAT_OUTPUT_MAX_BYTES,
+    MAX_MESSAGES_IN_SAVE,
+)
 from core.message_commands import (
     MessageCommandError,
     MessageNotFound,
+    RegenerationWouldRewriteHistory,
+    attach_original_reply_as_alternative,
     plan_message_regeneration,
+    restore_regeneration_original,
 )
 from core.prompt_assembler import (
     PromptAssembler,
     PromptBudgetExceeded,
     PromptTemplateInvalid,
 )
-from core.response_parser import parse_response, check_voice_confusion
+from core.response_parser import (
+    build_response_presentation,
+    check_voice_confusion,
+    parse_response,
+)
 from core.roleplay_policy import (
     ACTION_UNRESOLVED_SKIPPED,
     ACTION_WRITEBACK_APPLIED,
@@ -60,14 +79,70 @@ from routes.common import (
     _raise_revision_conflict,
     apply_character_state,
 )
+from routes.providers import raise_provider_error
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+class _OutputLimitExceeded(RuntimeError):
+    pass
 _prompt_assembler = PromptAssembler()
+
+
+def _assemble_generation_prompt_sync(
+    *,
+    project: str,
+    session: dict,
+    user_text: str,
+    history_override: list[dict] | None,
+    context_info: dict,
+    num_predict: int,
+):
+    """在线程内读取角色资料并完成完整提示词预算计算。"""
+
+    characters = [
+        load_character(project, character_id)
+        for character_id in session.get("characters_state", {})
+    ]
+    characters = [character for character in characters if character]
+    roleplay_context = build_roleplay_context(
+        characters,
+        session.get("characters_state", {}),
+        session.get("roleplay_policy"),
+    )
+    user_profile = load_user_profile(project)
+    worldbook_entries = load_worldbook(project)
+    history = (
+        deepcopy(history_override)
+        if history_override is not None
+        else deepcopy(session.get("message_history", []))
+    )
+    assembly = _prompt_assembler.assemble(
+        user_input=user_text,
+        characters=characters,
+        characters_state=session.get("characters_state", {}),
+        scene_meta=session.get("scene_meta", {}),
+        user_profile=user_profile,
+        worldbook_entries=worldbook_entries,
+        history=history,
+        summaries=session.get("summaries", []),
+        context_limit=context_info["context_limit"],
+        context_limit_source=context_info["source"],
+        num_predict=num_predict,
+        manual_worldbook_ids=session.get("manual_worldbook_ids", []),
+        roleplay_context=roleplay_context,
+    )
+    return assembly, characters, roleplay_context
+
+
+async def _assemble_generation_prompt(**kwargs):
+    return await asyncio.to_thread(_assemble_generation_prompt_sync, **kwargs)
 _PARSED_SESSION_DELTA_FIELDS = (
     "scene_meta",
     "characters_state",
     "roleplay_policy",
+    "current_provider",
     "current_model",
 )
 
@@ -167,76 +242,90 @@ async def _prepare_turn(
         )
 
     if not session.get("characters_state") and not session.get("message_history"):
-        await _initialize_session_from_profiles(session, project)
+        await _initialize_session_from_profiles(
+            session,
+            project,
+            requested_provider=req.provider,
+            requested_model=req.model,
+        )
 
-    model = req.model or session.get("current_model")
+    session_provider = session.get("current_provider") or "ollama"
+    provider_id = req.provider or session_provider
+    if not isinstance(provider_id, str):
+        raise HTTPException(400, "Provider 必须是字符串")
+    model = req.model
+    if not model and provider_id == session_provider:
+        model = session.get("current_model")
     if not model:
         raise HTTPException(400, "未指定模型")
 
-    ollama = get_client()
-    available = await ollama.list_models()
-    if model not in available:
-        raise HTTPException(400, f"模型 {model} 不可用。可用：{available}")
-
-    params = _validated_parameters(req)
-
-    characters = [load_character(project, cid) for cid in session.get("characters_state", {}).keys()]
-    characters = [c for c in characters if c]
-
-    roleplay_context = build_roleplay_context(
-        characters,
-        session.get("characters_state", {}),
-        session.get("roleplay_policy"),
-    )
-
-    user_profile = load_user_profile(project)
-    wb_entries = load_worldbook(project)
-    history = (
-        deepcopy(history_override)
-        if history_override is not None
-        else session.get("message_history", [])
-    )
-
-    context_info = await ollama.get_context_limit(model)
     try:
-        assembly = _prompt_assembler.assemble(
-            user_input=user_text,
-            characters=characters,
-            characters_state=session.get("characters_state", {}),
-            scene_meta=session.get("scene_meta", {}),
-            user_profile=user_profile,
-            worldbook_entries=wb_entries,
-            history=history,
-            summaries=session.get("summaries", []),
-            context_limit=context_info["context_limit"],
-            context_limit_source=context_info["source"],
-            num_predict=params["num_predict"],
-            manual_worldbook_ids=session.get("manual_worldbook_ids", []),
-            roleplay_context=roleplay_context,
-        )
-    except (
-        PromptBudgetExceeded,
-        PromptTemplateInvalid,
-        WorldbookValidationError,
-    ) as exc:
-        raise HTTPException(422, detail=exc.as_detail()) from exc
-    # 与预算计算共用同一有效窗口，禁止 Ollama 按更小默认 num_ctx 静默截断。
-    params["num_ctx"] = assembly.diagnostics["context_limit"]
+        provider_lease = await get_provider_registry().acquire_lease(provider_id)
+    except (ProviderError, SecretStoreError) as exc:
+        raise_provider_error(exc)
 
-    return {
-        "project": project,
-        "save": save,
-        "user_text": user_text,
-        "expected_revision": req.expected_revision,
-        "model": model,
-        "params": params,
-        "session": deepcopy(session),
-        "characters": characters,
-        "roleplay_context": deepcopy(roleplay_context),
-        "turn_kind": turn_kind,
-        "messages": assembly.messages,
-        "prompt_diagnostics": assembly.diagnostics,
-    }
+    try:
+        provider = provider_lease.provider
+        available = (
+            sorted(set(provider_lease.config.models))
+            if provider_lease.config.models
+            else await provider.list_models()
+        )
+        if model not in available:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "provider_model_unavailable",
+                    "message": "所选模型在当前 Provider 中不可用",
+                    "provider_id": provider_id,
+                    "models": available,
+                },
+            )
+
+        params = _validated_parameters(req)
+
+        context_info = await provider.get_context_limit(model)
+        try:
+            assembly, characters, roleplay_context = await _assemble_generation_prompt(
+                project=project,
+                session=session,
+                user_text=user_text,
+                history_override=history_override,
+                context_info=context_info,
+                num_predict=params["num_predict"],
+            )
+        except (
+            PromptBudgetExceeded,
+            PromptTemplateInvalid,
+            WorldbookValidationError,
+        ) as exc:
+            raise HTTPException(422, detail=exc.as_detail()) from exc
+        # 与预算计算共用同一有效窗口，禁止 Ollama 按更小默认 num_ctx 静默截断。
+        params["num_ctx"] = assembly.diagnostics["context_limit"]
+
+        return {
+            "project": project,
+            "save": save,
+            "user_text": user_text,
+            "expected_revision": req.expected_revision,
+            "provider": provider_id,
+            "provider_client": provider,
+            "provider_lease": provider_lease,
+            "model": model,
+            "params": params,
+            "session": deepcopy(session),
+            "characters": characters,
+            "roleplay_context": deepcopy(roleplay_context),
+            "turn_kind": turn_kind,
+            "messages": assembly.messages,
+            "prompt_diagnostics": assembly.diagnostics,
+        }
+    except (ProviderError, SecretStoreError) as exc:
+        await provider_lease.release()
+        raise_provider_error(exc)
+    except BaseException:
+        await provider_lease.release()
+        raise
 
 
 def _message_metadata(
@@ -248,6 +337,8 @@ def _message_metadata(
     created_at: str,
     turn_kind: str,
     roleplay_warnings: list[dict] | None = None,
+    context_diagnostics: dict | None = None,
+    generation_telemetry: dict | None = None,
 ) -> dict:
     metadata = {
         "turn_id": turn_id,
@@ -262,7 +353,49 @@ def _message_metadata(
     }
     if roleplay_warnings is not None:
         metadata["roleplay_warnings"] = deepcopy(roleplay_warnings)
+    if context_diagnostics is not None:
+        metadata["context_diagnostics"] = deepcopy(context_diagnostics)
+    if generation_telemetry is not None:
+        metadata["generation_telemetry"] = deepcopy(generation_telemetry)
     return metadata
+
+
+def _generation_telemetry(
+    prepared: dict,
+    content: str,
+    thinking: str,
+    status: str,
+    error: dict | None,
+) -> dict:
+    started = prepared.get("_generation_started_monotonic")
+    now = asyncio.get_running_loop().time()
+    latency_ms = (
+        max(0, round((now - started) * 1000))
+        if isinstance(started, (int, float)) and not isinstance(started, bool)
+        else None
+    )
+    diagnostics = prepared.get("prompt_diagnostics", {})
+    input_tokens = (
+        diagnostics.get("estimated_prompt_tokens")
+        if isinstance(diagnostics, dict)
+        else None
+    )
+    output_text = f"{thinking}{content}"
+    return {
+        "schema_version": 1,
+        "provider": prepared.get("provider"),
+        "model": prepared.get("model"),
+        "status": status,
+        "error_code": error.get("code") if isinstance(error, dict) else None,
+        "latency_ms": latency_ms,
+        "input_tokens_estimated": input_tokens,
+        "output_tokens_estimated": _prompt_assembler.estimator.estimate_text(
+            output_text
+        ),
+        "output_bytes": len(output_text.encode("utf-8")),
+        "token_source": "local_estimator",
+        "finished_at": datetime.now().astimezone().isoformat(),
+    }
 
 
 def _finalize_turn_messages(
@@ -276,6 +409,8 @@ def _finalize_turn_messages(
     *,
     trim: bool = True,
     roleplay_warnings: list[dict] | None = None,
+    presentation: dict | None = None,
+    generation_telemetry: dict | None = None,
 ) -> tuple[dict, dict | None, list[dict]]:
     user_message = next(
         (
@@ -287,6 +422,9 @@ def _finalize_turn_messages(
     )
     if user_message is None:
         raise RuntimeError("accepted turn 缺少 pending user message")
+    if prepared.get("turn_kind") == "regenerate" and status != "completed":
+        restored = restore_regeneration_original(session, user_message)
+        return user_message, restored, []
     created_at = (
         user_message.get("timestamps", {}).get("created_at")
         or datetime.now().astimezone().isoformat()
@@ -314,8 +452,18 @@ def _finalize_turn_messages(
                 created_at=created_at,
                 turn_kind=prepared.get("turn_kind", "chat"),
                 roleplay_warnings=roleplay_warnings,
+                context_diagnostics=prepared.get("prompt_diagnostics"),
+                generation_telemetry=generation_telemetry,
             ),
         )
+        if presentation is not None:
+            assistant_message["presentation"] = deepcopy(presentation)
+        if prepared.get("turn_kind") == "regenerate":
+            attach_original_reply_as_alternative(
+                session,
+                user_message,
+                assistant_message,
+            )
     dropped = (
         trim_history(session, max_messages=MAX_MESSAGES_IN_SAVE)
         if trim
@@ -388,11 +536,56 @@ def _apply_parsed_state(
                 "character_id": character_id,
             })
             if strict:
+                character["affinity"] = state.get("affinity", 0)
                 continue
         apply_character_state(state, character)
+        character["affinity"] = state.get("affinity", character.get("affinity", 0))
 
     parsed["roleplay_warnings"] = deepcopy(roleplay_warnings)
     return roleplay_warnings
+
+
+def _capture_presentation_baseline(
+    session: dict,
+    parsed: dict,
+    roleplay_context: dict,
+) -> dict:
+    """冻结写回前的可展示状态，用于刷新后还原本轮变化。"""
+    previous_affinities: list[object] = []
+    character_moods: list[object] = []
+    states = session.get("characters_state", {})
+    states = states if isinstance(states, dict) else {}
+    for character in parsed.get("characters", []):
+        previous = None
+        mood = None
+        if isinstance(character, dict):
+            resolved = resolve_character_id(character.get("name"), roleplay_context)
+            character_id = resolved.get("character_id")
+            state = states.get(character_id) if isinstance(character_id, str) else None
+            if resolved.get("status") == "matched" and isinstance(state, dict):
+                previous = state.get("affinity")
+                mood = state.get("mood")
+        previous_affinities.append(previous)
+        character_moods.append(mood)
+    return {
+        "previous_affinities": previous_affinities,
+        "character_moods": character_moods,
+        "scene_meta": deepcopy(session.get("scene_meta", {})),
+    }
+
+
+def _presentation_scene_changes(before: object, after: object) -> list[dict]:
+    previous = before if isinstance(before, dict) else {}
+    current = after if isinstance(after, dict) else {}
+    changes = []
+    for key in ("location", "time", "weather"):
+        old_value = previous.get(key)
+        new_value = current.get(key)
+        old_text = old_value.strip() if isinstance(old_value, str) else ""
+        new_text = new_value.strip() if isinstance(new_value, str) else ""
+        if new_text and old_text != new_text:
+            changes.append({"key": key, "value": new_text})
+    return changes
 
 
 async def _commit_partial(
@@ -402,6 +595,7 @@ async def _commit_partial(
     thinking: str,
     status: str,
     error: dict,
+    generation_telemetry: dict,
 ) -> dict | None:
     session = deepcopy(prepared["session"])
     _user, _assistant, _dropped = _finalize_turn_messages(
@@ -413,6 +607,7 @@ async def _commit_partial(
         status,
         error,
         trim=False,
+        generation_telemetry=generation_telemetry,
     )
 
     def commit_partial(current: dict, context) -> None:
@@ -435,6 +630,7 @@ async def _reconcile_failed_turn_on_current(
     content: str,
     thinking: str,
     error: dict,
+    generation_telemetry: dict,
 ) -> dict | None:
     """CAS 冲突后只收口本 turn 消息，不覆盖并发命令留下的其他字段。"""
     for _attempt in range(3):
@@ -458,6 +654,9 @@ async def _reconcile_failed_turn_on_current(
                 None,
             )
             if user_message is None:
+                return
+            if prepared.get("turn_kind") == "regenerate":
+                restore_regeneration_original(current, user_message)
                 return
             created_at = (
                 user_message.get("timestamps", {}).get("created_at")
@@ -488,6 +687,8 @@ async def _reconcile_failed_turn_on_current(
                     in_prompt=False,
                     created_at=created_at,
                     turn_kind=prepared.get("turn_kind", "chat"),
+                    context_diagnostics=prepared.get("prompt_diagnostics"),
+                    generation_telemetry=generation_telemetry,
                 )
                 if assistant is None:
                     append_history(
@@ -520,6 +721,13 @@ async def _commit_completed(
     thinking: str,
 ) -> None:
     session = deepcopy(prepared["session"])
+    generation_telemetry = _generation_telemetry(
+        prepared,
+        content,
+        thinking,
+        "completed",
+        None,
+    )
     parsed = parse_response(content)
     try:
         warnings = check_voice_confusion(parsed, prepared["characters"])
@@ -528,6 +736,11 @@ async def _commit_completed(
     except Exception:
         logger.exception("角色声线校验失败，不阻断 turn 提交")
 
+    presentation_baseline = _capture_presentation_baseline(
+        session,
+        parsed,
+        prepared["roleplay_context"],
+    )
     roleplay_warnings = _apply_parsed_state(
         session,
         parsed,
@@ -542,8 +755,19 @@ async def _commit_completed(
         "completed",
         None,
         roleplay_warnings=roleplay_warnings,
+        presentation=build_response_presentation(
+            parsed,
+            previous_affinities=presentation_baseline["previous_affinities"],
+            character_moods=presentation_baseline["character_moods"],
+            scene_changes=_presentation_scene_changes(
+                presentation_baseline["scene_meta"],
+                session.get("scene_meta"),
+            ),
+        ),
+        generation_telemetry=generation_telemetry,
     )
 
+    session["current_provider"] = prepared["provider"]
     session["current_model"] = prepared["model"]
     summary_id = str(uuid4()) if dropped else None
     summary_generation_id = str(uuid4()) if dropped else None
@@ -568,6 +792,8 @@ async def _commit_completed(
                 "content_status": "empty",
                 "generation_id": summary_generation_id,
                 "generation_attempt": 1,
+                "provider": prepared["provider"],
+                "model": prepared["model"],
                 "text": "",
                 "time": "",
                 "facts": [],
@@ -591,6 +817,8 @@ async def _commit_completed(
         "type": "parsed",
         "parsed": parsed,
         "roleplay_warnings": deepcopy(roleplay_warnings),
+        "context_diagnostics": deepcopy(prepared["prompt_diagnostics"]),
+        "generation_telemetry": deepcopy(generation_telemetry),
         "revision": revision,
         "session_delta": {
             field: deepcopy(mutation.session[field])
@@ -601,15 +829,20 @@ async def _commit_completed(
     await runtime.terminal(
         "completed",
         session_revision=revision,
+        context_diagnostics=deepcopy(prepared["prompt_diagnostics"]),
+        generation_telemetry=deepcopy(generation_telemetry),
     )
     if dropped and summary_id and summary_generation_id:
-        schedule_summary_generation(
+        await schedule_summary_generation(
             prepared["project"],
             prepared["save"],
             prepared["model"],
             summary_id,
             summary_generation_id,
             dropped,
+            provider=prepared["provider"],
+            provider_lease=prepared["provider_lease"],
+            retain_provider_lease=True,
         )
 
 
@@ -631,6 +864,13 @@ async def _fail_turn(
     status: str,
     error: dict,
 ) -> None:
+    generation_telemetry = _generation_telemetry(
+        prepared,
+        content,
+        thinking,
+        status,
+        error,
+    )
     committed = None
     try:
         committed = await _commit_partial(
@@ -640,6 +880,7 @@ async def _fail_turn(
             thinking,
             status,
             error,
+            generation_telemetry,
         )
     except RevisionConflict as conflict:
         status = "failed"
@@ -650,21 +891,28 @@ async def _fail_turn(
             content,
             thinking,
             error,
+            generation_telemetry,
         )
     updates = {}
     if committed is not None:
         updates["session_revision"] = committed["revision"]
+    updates["context_diagnostics"] = deepcopy(prepared["prompt_diagnostics"])
+    updates["generation_telemetry"] = deepcopy(generation_telemetry)
     await runtime.terminal(status, error=error, **updates)
 
 
 def _turn_worker(prepared: dict):
-    async def run(runtime: TurnRuntime) -> None:
+    async def run_with_provider(runtime: TurnRuntime) -> None:
+        prepared["_generation_started_monotonic"] = (
+            asyncio.get_running_loop().time()
+        )
         full_content = ""
         full_thinking = ""
         pending_type = ""
         pending_text = ""
         last_flush = asyncio.get_running_loop().time()
         emitted_stream_event = False
+        generated_bytes = 0
 
         async def flush_stream(*, force: bool = False) -> None:
             nonlocal pending_type, pending_text, last_flush, emitted_stream_event
@@ -702,9 +950,22 @@ def _turn_worker(prepared: dict):
             pending_text += text
             await flush_stream()
 
-        await runtime.emit({"type": "started"})
-        try:
-            async for chunk in get_client().chat_stream(
+        async def append_stream_text(event_type: str, text: str) -> None:
+            nonlocal generated_bytes, full_content, full_thinking
+            if not isinstance(text, str):
+                raise TypeError("Provider 流内容必须是字符串")
+            next_bytes = generated_bytes + len(text.encode("utf-8"))
+            if next_bytes > CHAT_OUTPUT_MAX_BYTES:
+                raise _OutputLimitExceeded
+            generated_bytes = next_bytes
+            if event_type == "thinking":
+                full_thinking += text
+            else:
+                full_content += text
+            await buffer_stream(event_type, text)
+
+        async def time_limited_provider_stream():
+            iterator = prepared["provider_client"].chat_stream(
                 model=prepared["model"],
                 messages=prepared["messages"],
                 think=prepared["params"]["think"],
@@ -713,13 +974,39 @@ def _turn_worker(prepared: dict):
                 temperature=prepared["params"]["temperature"],
                 top_p=prepared["params"]["top_p"],
                 top_k=prepared["params"]["top_k"],
-            ):
+            ).__aiter__()
+            deadline = (
+                asyncio.get_running_loop().time()
+                + CHAT_GENERATION_MAX_SECONDS
+            )
+            try:
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    try:
+                        chunk = await asyncio.wait_for(
+                            anext(iterator),
+                            timeout=remaining,
+                        )
+                    except StopAsyncIteration:
+                        return
+                    yield chunk
+            finally:
+                close = getattr(iterator, "aclose", None)
+                if close is not None:
+                    try:
+                        await close()
+                    except RuntimeError:
+                        pass
+
+        try:
+            await runtime.emit({"type": "started"})
+            async for chunk in time_limited_provider_stream():
                 if chunk["type"] == "thinking":
-                    full_thinking += chunk["content"]
-                    await buffer_stream("thinking", chunk["content"])
+                    await append_stream_text("thinking", chunk["content"])
                 elif chunk["type"] == "content":
-                    full_content += chunk["content"]
-                    await buffer_stream("content", chunk["content"])
+                    await append_stream_text("content", chunk["content"])
                 elif chunk["type"] == "error":
                     await flush_stream(force=True)
                     await _fail_turn(
@@ -776,6 +1063,47 @@ def _turn_worker(prepared: dict):
                     "message": "上游连接结束但未发送完成标记",
                 },
             )
+        except _OutputLimitExceeded:
+            await flush_stream(force=True)
+            await _fail_turn(
+                runtime,
+                prepared,
+                full_content,
+                full_thinking,
+                status="failed",
+                error={
+                    "code": "output_limit_exceeded",
+                    "message": "模型输出超过本地安全上限，已停止生成",
+                    "limit_bytes": CHAT_OUTPUT_MAX_BYTES,
+                },
+            )
+        except TimeoutError:
+            await flush_stream(force=True)
+            await _fail_turn(
+                runtime,
+                prepared,
+                full_content,
+                full_thinking,
+                status="failed",
+                error={
+                    "code": "generation_timeout",
+                    "message": "模型生成超过时间上限，已停止生成",
+                    "limit_seconds": CHAT_GENERATION_MAX_SECONDS,
+                },
+            )
+        except TurnEventLogLimitExceeded:
+            logger.warning("turn %s 事件日志达到安全上限", runtime.turn_id)
+            await _fail_turn(
+                runtime,
+                prepared,
+                full_content,
+                full_thinking,
+                status="failed",
+                error={
+                    "code": "turn_log_limit_exceeded",
+                    "message": "本轮事件日志达到安全上限，已停止生成",
+                },
+            )
         except asyncio.CancelledError:
             await asyncio.shield(flush_stream(force=True))
             await asyncio.shield(_fail_turn(
@@ -788,6 +1116,25 @@ def _turn_worker(prepared: dict):
             ))
         except RevisionConflict as conflict:
             await runtime.terminal("failed", error=_revision_error(conflict))
+        except (ProviderError, SecretStoreError) as exc:
+            # Provider 会在异步生成器首次迭代时再次执行 DNS/初始化校验。
+            # 这类已分类故障必须保持公开稳定错误码，不能降级成 internal_error。
+            logger.warning(
+                "turn Provider 初始化失败 provider=%s code=%s",
+                prepared["provider"],
+                exc.code,
+            )
+            error = {"code": exc.code, "message": exc.message}
+            if isinstance(exc, ProviderError) and exc.http_status is not None:
+                error["http_status"] = exc.http_status
+            await _fail_turn(
+                runtime,
+                prepared,
+                full_content,
+                full_thinking,
+                status="failed",
+                error=error,
+            )
         except Exception:
             # Session completed commit 是权威终态；完成后的 parsed/terminal
             # 日志故障交由 coordinator 以 completed 收口，禁止走失败写回。
@@ -803,23 +1150,31 @@ def _turn_worker(prepared: dict):
                 error={"code": "internal_error", "message": "生成失败，请重试"},
             )
 
+    async def run(runtime: TurnRuntime) -> None:
+        try:
+            await run_with_provider(runtime)
+        finally:
+            await prepared["provider_lease"].release()
+
     return run
 
 
 async def _start_turn(req: ChatRequest) -> dict:
     prepared = await _prepare_turn(req, turn_kind="chat")
     coordinator = get_turn_coordinator()
+    handed_off = False
 
     def accepted(session: dict) -> None:
         prepared["session"] = session
         prepared["expected_revision"] = session["revision"]
 
     try:
-        return await coordinator.start(
+        result = await coordinator.start(
             project=prepared["project"],
             save=prepared["save"],
             expected_revision=prepared["expected_revision"],
             user_input=prepared["user_text"],
+            provider=prepared["provider"],
             model=prepared["model"],
             parameters=prepared["params"],
             initial_session=prepared["session"],
@@ -828,12 +1183,22 @@ async def _start_turn(req: ChatRequest) -> dict:
             prompt_diagnostics=prepared["prompt_diagnostics"],
             turn_kind="chat",
         )
+        handed_off = True
+        return result
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
+    finally:
+        if not handed_off:
+            await prepared["provider_lease"].release()
 
 
 def _raise_message_command_error(exc: MessageCommandError) -> None:
-    status_code = 404 if isinstance(exc, MessageNotFound) else 422
+    if isinstance(exc, MessageNotFound):
+        status_code = 404
+    elif isinstance(exc, RegenerationWouldRewriteHistory):
+        status_code = 409
+    else:
+        status_code = 422
     raise HTTPException(
         status_code,
         detail={"code": exc.code, "message": str(exc)},
@@ -863,6 +1228,7 @@ async def _start_regenerated_turn(req: RegenerateRequest) -> dict:
     )
     coordinator = get_turn_coordinator()
     store = get_session_store()
+    handed_off = False
 
     async def accept_command(turn_id: str, created_at: str):
         return await store.accept_regenerated_chat_turn(
@@ -880,11 +1246,12 @@ async def _start_regenerated_turn(req: RegenerateRequest) -> dict:
         prepared["expected_revision"] = accepted_session["revision"]
 
     try:
-        return await coordinator.start(
+        result = await coordinator.start(
             project=prepared["project"],
             save=prepared["save"],
             expected_revision=prepared["expected_revision"],
             user_input=prepared["user_text"],
+            provider=prepared["provider"],
             model=prepared["model"],
             parameters=prepared["params"],
             initial_session=prepared["session"],
@@ -894,12 +1261,17 @@ async def _start_regenerated_turn(req: RegenerateRequest) -> dict:
             prompt_diagnostics=prepared["prompt_diagnostics"],
             turn_kind="regenerate",
         )
+        handed_off = True
+        return result
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
     except MessageCommandError as exc:
         _raise_message_command_error(exc)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
+    finally:
+        if not handed_off:
+            await prepared["provider_lease"].release()
 
 
 @router.post("/api/chat/turns", status_code=202)
@@ -1041,17 +1413,49 @@ async def api_switch_model(req: Request):
     project = _norm_project(body.get("project", "默认项目"))
     save = _norm_save(body.get("save", "默认存档"))
     model = body.get("model", "")
-    if not isinstance(model, str):
+    if not isinstance(model, str) or not model:
         raise HTTPException(
             400,
             detail={
                 "code": "invalid_request_body",
-                "message": "model 必须是字符串",
+                "message": "model 必须是非空字符串",
             },
         )
     expected_revision = _expected_revision(body)
 
+    assert_write_allowed(project, save)
+    session = await aload_session(project, save)
+    if session.get("revision", 0) != expected_revision:
+        _raise_revision_conflict(
+            RevisionConflict(expected_revision, session.get("revision", 0), session)
+        )
+    provider_id = body.get("provider", session.get("current_provider", "ollama"))
+    if not isinstance(provider_id, str):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_request_body",
+                "message": "provider 必须是字符串",
+            },
+        )
+    try:
+        registry = get_provider_registry()
+        available = await registry.list_models(provider_id)
+    except (ProviderError, SecretStoreError) as exc:
+        raise_provider_error(exc)
+    if model not in available:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "provider_model_unavailable",
+                "message": "所选模型在当前 Provider 中不可用",
+                "provider_id": provider_id,
+                "models": available,
+            },
+        )
+
     def switch_model(session: dict, context) -> None:
+        session["current_provider"] = provider_id
         session["current_model"] = model
 
     try:
@@ -1063,4 +1467,8 @@ async def api_switch_model(req: Request):
         )
     except RevisionConflict as exc:
         _raise_revision_conflict(exc)
-    return {"current_model": model, "session": mutation.session}
+    return {
+        "current_provider": provider_id,
+        "current_model": model,
+        "session": mutation.session,
+    }

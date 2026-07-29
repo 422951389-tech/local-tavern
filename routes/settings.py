@@ -1,4 +1,5 @@
 """设置路由。"""
+
 import asyncio
 import json
 from typing import Annotated
@@ -29,15 +30,32 @@ class SettingsValues(BaseModel):
     think: bool = True
 
 
+def _read_settings() -> dict:
+    if not SETTINGS_PATH.exists():
+        return {
+            "temperature": 0.8,
+            "top_p": 0.9,
+            "top_k": 40,
+            "num_predict": 4096,
+            "think": True,
+        }
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {
+            "temperature": 0.8,
+            "top_p": 0.9,
+            "top_k": 40,
+            "num_predict": 4096,
+            "think": True,
+        }
+
+
 @router.get("/api/settings")
 async def api_get_settings():
-    if not SETTINGS_PATH.exists():
-        return {"temperature": 0.8, "top_p": 0.9, "top_k": 40, "num_predict": 4096, "think": True}
-    try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"temperature": 0.8, "top_p": 0.9, "top_k": 40, "num_predict": 4096, "think": True}
+    return await asyncio.to_thread(_read_settings)
 
 
 @router.put("/api/settings")

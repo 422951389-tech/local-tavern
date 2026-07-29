@@ -33,6 +33,7 @@ from core.relationship_edges import (
     relationship_key,
     validate_updated_at,
 )
+from core.response_parser import build_response_presentation, parse_response
 from core.worldbook_policy import MAX_MANUAL_WORLDBOOK_IDS
 
 
@@ -62,6 +63,67 @@ class ImportModel(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ImportedMessagePresentationScene(ImportModel):
+    model_config = ConfigDict(extra="forbid")
+
+    location: ShortText = ""
+    time_weather: ShortText = ""
+    main_quest: MessageText = ""
+    current_scene: MessageText = ""
+    next_goal: MessageText = ""
+    user_line: MessageText = ""
+
+
+class ImportedMessagePresentationCharacter(ImportModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: ShortText = ""
+    affinity: Affinity = 0
+    previous_affinity: Affinity | None = None
+    mood: MessageText = ""
+    inner_thought: MessageText = ""
+    outfit: MessageText = ""
+    posture: MessageText = ""
+    dialogue: MessageText = ""
+    expected_effect: MessageText = ""
+
+
+class ImportedMessagePresentationSceneChange(ImportModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: Literal["location", "time", "weather"]
+    value: ShortText
+
+
+class ImportedMessagePresentation(ImportModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    scene_meta: ImportedMessagePresentationScene | None = None
+    characters: list[ImportedMessagePresentationCharacter] = Field(
+        default_factory=list,
+        max_length=MAX_CHARACTERS,
+    )
+    narration: MessageText = ""
+    suggestions: list[MessageText] = Field(default_factory=list, max_length=5)
+    warnings: list[MessageText] = Field(default_factory=list, max_length=50)
+    scene_changes: list[ImportedMessagePresentationSceneChange] = Field(
+        default_factory=list,
+        max_length=3,
+    )
+
+    @field_validator("scene_changes")
+    @classmethod
+    def validate_scene_changes(
+        cls,
+        values: list[ImportedMessagePresentationSceneChange],
+    ) -> list[ImportedMessagePresentationSceneChange]:
+        keys = [value.key for value in values]
+        if len(keys) != len(set(keys)):
+            raise ValueError("展示快照的场景变化字段不能重复")
+        return values
+
+
 class ImportedMessage(ImportModel):
     id: StrictStr = ""
     role: Literal["user", "assistant"]
@@ -69,6 +131,7 @@ class ImportedMessage(ImportModel):
     thinking: MessageText = ""
     pinned: StrictBool = False
     in_prompt: StrictBool = True
+    presentation: ImportedMessagePresentation | None = None
 
     @field_validator("id")
     @classmethod
@@ -79,6 +142,59 @@ class ImportedMessage(ImportModel):
             return str(UUID(value))
         except ValueError as exc:
             raise ValueError("消息 id 必须是 UUID") from exc
+
+
+_PRESENTATION_SCENE_FIELDS = (
+    "location",
+    "time_weather",
+    "main_quest",
+    "current_scene",
+    "next_goal",
+    "user_line",
+)
+_PRESENTATION_CHARACTER_FIELDS = (
+    "name",
+    "inner_thought",
+    "outfit",
+    "posture",
+    "dialogue",
+    "expected_effect",
+)
+
+
+def _presentation_core(value: dict) -> dict:
+    scene = value.get("scene_meta")
+    scene = scene if isinstance(scene, dict) else {}
+    characters = value.get("characters")
+    characters = characters if isinstance(characters, list) else []
+    return {
+        "scene_meta": {
+            field: scene.get(field, "")
+            for field in _PRESENTATION_SCENE_FIELDS
+        },
+        "characters": [
+            {
+                field: character.get(field, "")
+                for field in _PRESENTATION_CHARACTER_FIELDS
+            }
+            for character in characters
+            if isinstance(character, dict)
+        ],
+        "narration": value.get("narration", ""),
+        "suggestions": value.get("suggestions", []),
+    }
+
+
+def _presentation_is_visible(value: dict) -> bool:
+    core = _presentation_core(value)
+    scene = core["scene_meta"]
+    return bool(
+        core["characters"]
+        or core["narration"]
+        or scene["main_quest"]
+        or scene["current_scene"]
+        or scene["next_goal"]
+    )
 
 
 class ImportedSceneMeta(ImportModel):
@@ -198,6 +314,7 @@ class ImportedSession(ImportModel):
     revision: Revision = 0
     created_at: ShortText = ""
     updated_at: ShortText = ""
+    current_provider: ShortText = "ollama"
     current_model: ShortText = ""
     scene_meta: ImportedSceneMeta = Field(default_factory=ImportedSceneMeta)
     user_status: ImportedUserStatus = Field(default_factory=ImportedUserStatus)
@@ -262,6 +379,26 @@ class ImportedSession(ImportModel):
             seen.add(validated)
             normalized.append(validated)
         return sorted(normalized)
+
+    @model_validator(mode="after")
+    def validate_message_presentations(self) -> "ImportedSession":
+        for index, message in enumerate(self.message_history):
+            presentation = message.presentation
+            if presentation is None:
+                continue
+            if message.role != "assistant":
+                raise ValueError(
+                    f"message_history.{index}.presentation 只允许用于 assistant 消息"
+                )
+            stored = presentation.model_dump(mode="python")
+            if not _presentation_is_visible(stored):
+                continue
+            derived = build_response_presentation(parse_response(message.content))
+            if _presentation_core(stored) != _presentation_core(derived):
+                raise ValueError(
+                    f"message_history.{index}.presentation 与消息原文不一致"
+                )
+        return self
 
     @model_validator(mode="after")
     def validate_summary_identity(self) -> "ImportedSession":

@@ -1,6 +1,10 @@
 """角色卡与 schema 路由。"""
+
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Request, Query
 
+from core.async_utils import run_sync_critical
 from core.character_loader import (
     list_characters,
     save_character,
@@ -9,7 +13,7 @@ from core.character_loader import (
 
 from core.destructive_service import DestructiveOperationError
 from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
-from core.session_manager import RevisionConflict, delete_character_data
+from core.session_manager import RevisionConflict, delete_character_data, get_session_store
 from routes.common import (
     _json_object,
     _norm_save,
@@ -25,7 +29,7 @@ router = APIRouter()
 @router.get("/api/characters")
 async def api_list_characters(project: str = Query("默认项目")):
     project = _norm_project(project)
-    chars = list_characters(project)
+    chars = await asyncio.to_thread(list_characters, project)
     return {"characters": chars}
 
 
@@ -36,7 +40,9 @@ async def api_character_schema():
 
 
 @router.put("/api/characters/{char_id}")
-async def api_save_character(char_id: str, req: Request, project: str = Query("默认项目")):
+async def api_save_character(
+    char_id: str, req: Request, project: str = Query("默认项目")
+):
     project = _norm_project(project)
     body = await _json_object(req)
     data = body.get("data", {})
@@ -49,10 +55,14 @@ async def api_save_character(char_id: str, req: Request, project: str = Query("�
             },
         )
     try:
-        save_character(project, char_id, data)
+        project_lock = await get_session_store().project_lock(project)
+        async with project_lock:
+            await run_sync_critical(save_character, project, char_id, data)
         return {"saved": True, "id": char_id}
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
 
 
 @router.delete("/api/characters/{char_id}")

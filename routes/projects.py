@@ -1,4 +1,5 @@
 """项目路由。"""
+
 import asyncio
 
 from fastapi import APIRouter, HTTPException
@@ -62,16 +63,22 @@ def _load_project_stats(project: str) -> dict:
 
 @router.get("/api/projects")
 async def api_list_projects():
-    return {"projects": list_projects()}
+    return {"projects": await asyncio.to_thread(list_projects)}
 
 
 @router.get("/api/projects/stats")
 async def api_project_stats():
-    projects = list_projects()
-    stats = await asyncio.gather(*(
-        asyncio.to_thread(_load_project_stats, project)
-        for project in projects
-    ))
+    projects = await asyncio.to_thread(list_projects)
+
+    semaphore = asyncio.Semaphore(8)
+
+    async def load_stats(project: str) -> dict:
+        async with semaphore:
+            return await asyncio.to_thread(_load_project_stats, project)
+
+    stats = await asyncio.gather(
+        *(load_stats(project) for project in projects)
+    )
     return {"stats": stats}
 
 
@@ -80,16 +87,18 @@ async def api_create_project(req: ProjectRequest):
     if not req.name or not req.name.strip():
         raise HTTPException(400, "项目名不能为空")
     name = _id_from_display_name(req.name, label="项目显示名")
-    if name in list_projects():
-        raise HTTPException(409, f"项目 ID {name} 已存在；请使用不会产生规范化碰撞的名称")
-    d = ensure_project(name)
+    if name in await asyncio.to_thread(list_projects):
+        raise HTTPException(
+            409, f"项目 ID {name} 已存在；请使用不会产生规范化碰撞的名称"
+        )
+    d = await asyncio.to_thread(ensure_project, name)
     return {"name": name, "path": str(d)}
 
 
 @router.delete("/api/projects")
 async def api_delete_project(req: ProjectRequest):
     name = _norm_project(req.name)
-    projects = list_projects()
+    projects = await asyncio.to_thread(list_projects)
     if name not in projects:
         raise HTTPException(404, "项目不存在")
     if len(projects) <= 1:

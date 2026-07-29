@@ -1,3 +1,6 @@
+import { createAffinityIndicator } from './conversation-view.mjs';
+import { presentationForMessage } from './response-presentation.mjs';
+
 const WARNING_CODES = new Set([
     'muted_character_output',
     'ambiguous_character_identity',
@@ -48,8 +51,10 @@ export function normalizeRoleplaySession(session, { strict = false } = {}) {
         throw new RoleplayValidationError('严格禁言写回必须是布尔值', 'strict_muted_writeback');
     }
     const states = isRecord(source.characters_state) ? source.characters_state : {};
+    const relationshipContexts = characterRelationshipContexts(source);
     const characters = Object.entries(states).map(([id, raw]) => {
         const value = isRecord(raw) ? raw : {};
+        const relationship = relationshipContexts.get(id) || EMPTY_RELATIONSHIP_CONTEXT;
         return Object.freeze({
             id,
             name: typeof value.name === 'string' && value.name.trim() ? value.name.trim() : id,
@@ -57,6 +62,9 @@ export function normalizeRoleplaySession(session, { strict = false } = {}) {
             affinity: Number.isFinite(Number(value.affinity))
                 ? Math.min(100, Math.max(0, Number(value.affinity)))
                 : 0,
+            previousAffinity: relationship.previousAffinity,
+            relationship: relationship.relationship,
+            recentEvidence: relationship.recentEvidence,
             remainingSilentTurns: normalizeRemainingSilentTurns(
                 value.remaining_silent_turns,
                 { strict },
@@ -67,6 +75,109 @@ export function normalizeRoleplaySession(session, { strict = false } = {}) {
         strictMutedWriteback: policy.strict_muted_writeback === true,
         characters: Object.freeze(characters),
     });
+}
+
+const EMPTY_RELATIONSHIP_CONTEXT = Object.freeze({
+    previousAffinity: null,
+    relationship: null,
+    recentEvidence: '',
+});
+
+function cleanEvidenceText(value, maximum = 160) {
+    if (typeof value !== 'string') return '';
+    const normalized = value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (normalized.length <= maximum) return normalized;
+    return `${normalized.slice(0, maximum - 1)}…`;
+}
+
+function messagePresentationEvidence(message, characterName) {
+    const presentation = presentationForMessage(message);
+    const character = presentation && Array.isArray(presentation.characters)
+        ? presentation.characters.find(item => item && item.name === characterName)
+        : null;
+    if (character) {
+        const dialogue = cleanEvidenceText(character.dialogue, 110);
+        const effect = cleanEvidenceText(character.expected_effect, 80);
+        if (dialogue && effect) return `“${dialogue}” · 影响：${effect}`;
+        if (dialogue) return `“${dialogue}”`;
+        if (effect) return `预期影响：${effect}`;
+    }
+    return cleanEvidenceText(message && message.content, 150);
+}
+
+export function characterRelationshipContexts(session) {
+    const source = isRecord(session) ? session : {};
+    const states = isRecord(source.characters_state) ? source.characters_state : {};
+    const characters = Object.entries(states).flatMap(([id, raw]) => {
+        if (!isRecord(raw)) return [];
+        const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : id;
+        return [{ id, name }];
+    });
+    const nameCounts = new Map();
+    for (const character of characters) nameCounts.set(character.name, (nameCounts.get(character.name) || 0) + 1);
+    const messages = Array.isArray(source.message_history) ? source.message_history.filter(isRecord) : [];
+    const messagesById = new Map(messages.flatMap(message => (
+        typeof message.id === 'string' && message.id ? [[message.id, message]] : []
+    )));
+    const contexts = new Map(characters.map(character => [character.id, {
+        previousAffinity: null,
+        relationship: null,
+        recentEvidence: '',
+    }]));
+
+    for (const message of [...messages].reverse()) {
+        if (message.role !== 'assistant') continue;
+        const presentation = presentationForMessage(message);
+        if (!presentation || !Array.isArray(presentation.characters)) continue;
+        for (const character of characters) {
+            const context = contexts.get(character.id);
+            if (context.previousAffinity !== null || nameCounts.get(character.name) !== 1) continue;
+            const presented = presentation.characters.find(item => item && item.name === character.name);
+            if (!presented) continue;
+            if (Number.isFinite(Number(presented.previous_affinity))) {
+                context.previousAffinity = Math.min(100, Math.max(0, Number(presented.previous_affinity)));
+            }
+            if (!context.recentEvidence) {
+                context.recentEvidence = messagePresentationEvidence(message, character.name);
+            }
+        }
+    }
+
+    const edges = Array.isArray(source.relationship_edges) ? source.relationship_edges.filter(isRecord) : [];
+    const sortedEdges = [...edges].sort((left, right) => (
+        String(right.updated_at || '').localeCompare(String(left.updated_at || ''))
+    ));
+    for (const character of characters) {
+        const context = contexts.get(character.id);
+        const edge = sortedEdges.find(item => (
+            item.source_character_id === character.id || item.target_character_id === character.id
+        ));
+        if (!edge) continue;
+        const counterpartId = edge.source_character_id === character.id
+            ? edge.target_character_id
+            : edge.source_character_id;
+        const counterpart = characters.find(item => item.id === counterpartId);
+        const relationType = cleanEvidenceText(edge.relation_type, 80);
+        const strength = Number.isSafeInteger(edge.strength)
+            ? Math.min(100, Math.max(0, edge.strength))
+            : null;
+        if (relationType && counterpart) {
+            context.relationship = Object.freeze({
+                counterpartId,
+                counterpartName: counterpart.name,
+                relationType,
+                strength,
+            });
+        }
+        const evidenceIds = Array.isArray(edge.evidence_message_ids) ? [...edge.evidence_message_ids].reverse() : [];
+        const evidenceMessage = evidenceIds.map(id => messagesById.get(id)).find(Boolean);
+        if (evidenceMessage) {
+            context.recentEvidence = messagePresentationEvidence(evidenceMessage, character.name)
+                || context.recentEvidence;
+        }
+    }
+
+    return new Map([...contexts].map(([id, context]) => [id, Object.freeze(context)]));
 }
 
 function cleanId(value) {
@@ -190,10 +301,8 @@ function element(documentRef, tag, className = '', text = '') {
     return node;
 }
 
-function affinityText(value) {
-    const percent = Math.round(Math.min(100, Math.max(0, Number(value) || 0)));
-    const filled = Math.round(percent / 10);
-    return `${'█'.repeat(filled)}${'░'.repeat(10 - filled)} ${percent}%`;
+function normalizeAffinity(value) {
+    return Math.round(Math.min(100, Math.max(0, Number(value) || 0)));
 }
 
 function errorMessage(error) {
@@ -324,9 +433,33 @@ export function createRoleplayPanel({
         const card = element(documentRef, 'section', 'panel-char roleplay-character');
         card.dataset.characterId = character.id;
         const name = element(documentRef, 'div', 'name', character.name);
-        const affinity = element(documentRef, 'div', 'affinity-bar', affinityText(character.affinity));
+        const affinity = createAffinityIndicator(documentRef, {
+            value: character.affinity,
+            previousValue: character.previousAffinity,
+            normalize: normalizeAffinity,
+        }).element;
+        affinity.classList.add('roleplay-affinity');
         card.appendChild(name);
         card.appendChild(affinity);
+        if (character.previousAffinity === null) {
+            card.appendChild(element(documentRef, 'p', 'roleplay-affinity-note', '最近变化：暂无可追溯记录'));
+        }
+        const relationship = character.relationship;
+        card.appendChild(element(
+            documentRef,
+            'div',
+            'roleplay-relationship-summary',
+            relationship
+                ? `角色关系：对 ${relationship.counterpartName} · ${relationship.relationType}`
+                    + (relationship.strength === null ? '' : ` · 强度 ${relationship.strength}/100`)
+                : '角色关系：暂无人工记录',
+        ));
+        card.appendChild(element(
+            documentRef,
+            'p',
+            'roleplay-evidence',
+            `最近证据：${character.recentEvidence || '暂无可追溯记录'}`,
+        ));
         if (character.mood) card.appendChild(element(documentRef, 'div', 'roleplay-mood', `心情：${character.mood}`));
         const current = element(
             documentRef,

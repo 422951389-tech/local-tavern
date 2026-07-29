@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from core.async_utils import run_sync_critical
 from core import config
 from core.active_turns import begin_maintenance, end_maintenance
 from core.backup_store import BackupManager
@@ -102,7 +103,7 @@ async def api_apply_legacy_migration(plan_id: str, req: Request):
     maintenance_token = begin_maintenance("legacy_migration_apply")
     try:
         try:
-            migration = await asyncio.to_thread(
+            migration = await run_sync_critical(
                 get_migration_service(body.target_project).apply,
                 plan_id,
                 expected_source_fingerprint=body.expected_source_fingerprint,
@@ -153,7 +154,7 @@ async def api_recover_migration(migration_id: str, req: Request):
     maintenance_token = begin_maintenance("legacy_migration_recovery")
     try:
         try:
-            migration = await asyncio.to_thread(
+            migration = await run_sync_critical(
                 get_migration_service(body.target_project).recover,
                 migration_id,
                 action=body.action,

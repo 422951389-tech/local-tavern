@@ -10,6 +10,7 @@
     ├── worldbook/     世界设定
     └── user.yaml      用户档案
 """
+
 import io
 import json
 import logging
@@ -69,11 +70,30 @@ CHARACTER_SCHEMA = {
             "label": "基础信息",
             "builtin": True,
             "fields": [
-                {"key": "id", "label": "唯一 ID（文件名）", "type": "text", "required": True, "placeholder": "用英文/数字，如 elara", "fixed": True},
+                {
+                    "key": "id",
+                    "label": "唯一 ID（文件名）",
+                    "type": "text",
+                    "required": True,
+                    "placeholder": "用英文/数字，如 elara",
+                    "fixed": True,
+                },
                 {"key": "name", "label": "角色名", "type": "text"},
-                {"key": "aliases", "label": "角色别名（每行一个）", "type": "textarea", "rows": 3, "array": True},
+                {
+                    "key": "aliases",
+                    "label": "角色别名（每行一个）",
+                    "type": "textarea",
+                    "rows": 3,
+                    "array": True,
+                },
                 {"key": "tagline", "label": "一句话定位", "type": "text"},
-                {"key": "persona", "label": "详细人设", "type": "textarea", "rows": 6, "placeholder": "性格、背景、动机、说话方式..."},
+                {
+                    "key": "persona",
+                    "label": "详细人设",
+                    "type": "textarea",
+                    "rows": 6,
+                    "placeholder": "性格、背景、动机、说话方式...",
+                },
             ],
         },
         {
@@ -92,8 +112,19 @@ CHARACTER_SCHEMA = {
             "label": "风格与台词",
             "builtin": True,
             "fields": [
-                {"key": "voice_tone", "label": "整体语调", "type": "text", "placeholder": "轻声细语 / 大大咧咧"},
-                {"key": "speaking_style", "label": "说话方式", "type": "textarea", "rows": 4, "placeholder": '句末带"呢"，爱用省略号...'},
+                {
+                    "key": "voice_tone",
+                    "label": "整体语调",
+                    "type": "text",
+                    "placeholder": "轻声细语 / 大大咧咧",
+                },
+                {
+                    "key": "speaking_style",
+                    "label": "说话方式",
+                    "type": "textarea",
+                    "rows": 4,
+                    "placeholder": '句末带"呢"，爱用省略号...',
+                },
                 {
                     "key": "chattiness",
                     "label": "发言倾向 (0-100)",
@@ -103,8 +134,20 @@ CHARACTER_SCHEMA = {
                     "default": DEFAULT_CHATTINESS,
                     "hint": "仅作为群聊提示权重，不强制角色每轮发言",
                 },
-                {"key": "catchphrases", "label": "示范台词（每行一句）", "type": "textarea", "rows": 3, "array": True},
-                {"key": "abilities", "label": "能力（每行一个）", "type": "textarea", "rows": 2, "array": True},
+                {
+                    "key": "catchphrases",
+                    "label": "示范台词（每行一句）",
+                    "type": "textarea",
+                    "rows": 3,
+                    "array": True,
+                },
+                {
+                    "key": "abilities",
+                    "label": "能力（每行一个）",
+                    "type": "textarea",
+                    "rows": 2,
+                    "array": True,
+                },
             ],
         },
         {
@@ -112,10 +155,21 @@ CHARACTER_SCHEMA = {
             "label": "初始状态",
             "builtin": True,
             "fields": [
-                {"key": "initial_stats.affinity", "label": "好感度 (0-100)", "type": "number", "min": MIN_AFFINITY, "max": MAX_AFFINITY},
+                {
+                    "key": "initial_stats.affinity",
+                    "label": "好感度 (0-100)",
+                    "type": "number",
+                    "min": MIN_AFFINITY,
+                    "max": MAX_AFFINITY,
+                },
                 {"key": "initial_stats.mood", "label": "初始心情", "type": "text"},
                 {"key": "initial_stats.posture", "label": "初始姿势", "type": "text"},
-                {"key": "active", "label": "默认出场", "type": "checkbox", "checkboxLabel": "当前角色参与场景"},
+                {
+                    "key": "active",
+                    "label": "默认出场",
+                    "type": "checkbox",
+                    "checkboxLabel": "当前角色参与场景",
+                },
             ],
         },
     ],
@@ -198,20 +252,23 @@ WORLD_BOOK_SCHEMA = {
 def _atomic_dump(path: Path, data: dict):
     """YAML 原子写：先 dump 到内存串，再走 tmp→rename，避免断电损坏设定层文件。"""
     from core.session_manager import atomic_write
+
     buf = io.StringIO()
     yaml.safe_dump(data, buf, allow_unicode=True, sort_keys=False)
     atomic_write(path, buf.getvalue())
 
 
 @contextmanager
-def yaml_write_transaction() -> Iterator[None]:
+def yaml_write_transaction(project: str) -> Iterator[None]:
     """YAML 变更串行化，并纳入整库共享锁。"""
-    with library_lock.shared():
+    with library_lock.shared_write():
+        assert_project_write_allowed(project)
         with _YAML_WRITE_LOCK:
             yield
 
 
 # ========== 项目 ==========
+
 
 def list_projects() -> list[str]:
     """列出所有项目目录"""
@@ -262,15 +319,28 @@ def ensure_project(name: str) -> Path:
     - 切项目后 loadProjectContext 不再因空目录创建幽灵存档
     """
     from core.session_manager import _empty_session, atomic_write, DEFAULT_SAVE
-    d = get_project_dir(name)
-    resolve_under(d, "characters").mkdir(parents=True, exist_ok=True)
-    resolve_under(d, "worldbook").mkdir(parents=True, exist_ok=True)
-    saves_dir = resolve_under(d, "saves")
-    saves_dir.mkdir(parents=True, exist_ok=True)
-    default_save_path = resolve_under(saves_dir, f"{DEFAULT_SAVE}.json")
-    if not default_save_path.exists():
-        atomic_write(default_save_path, json.dumps(_empty_session(DEFAULT_SAVE, name), ensure_ascii=False, indent=2))
-    return d
+
+    # 目录创建本身也是持久化写入，必须和默认存档写入处在同一个维护代次内。
+    # shared_write 在取得共享锁后再次校验代次，可阻断已排队但跨过整库恢复
+    # 边界的旧请求。
+    with library_lock.shared_write():
+        assert_project_write_allowed(name)
+        d = get_project_dir(name)
+        resolve_under(d, "characters").mkdir(parents=True, exist_ok=True)
+        resolve_under(d, "worldbook").mkdir(parents=True, exist_ok=True)
+        saves_dir = resolve_under(d, "saves")
+        saves_dir.mkdir(parents=True, exist_ok=True)
+        default_save_path = resolve_under(saves_dir, f"{DEFAULT_SAVE}.json")
+        if not default_save_path.exists():
+            atomic_write(
+                default_save_path,
+                json.dumps(
+                    _empty_session(DEFAULT_SAVE, name),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        return d
 
 
 # ========== YAML 工具 ==========
@@ -314,6 +384,7 @@ def _validate_yaml_tree(value: object) -> None:
         raise ValueError("YAML 包含不支持的数据类型")
 
     visit(value, 0, set())
+
 
 def load_yaml(
     path: Path,
@@ -388,6 +459,7 @@ def _safe_id(char_id: str) -> str:
 
 # ========== 角色卡 ==========
 
+
 def _is_finite_number(value: object) -> bool:
     return (
         isinstance(value, (int, float))
@@ -424,6 +496,7 @@ def _normalize_character_card(data: dict) -> dict:
     )
     normalized["initial_stats"] = initial_stats
     return normalized
+
 
 def load_character(project: str, char_id: str) -> dict:
     char_id = _safe_id(char_id)
@@ -463,20 +536,20 @@ def save_character(project: str, char_id: str, data: dict) -> Path:
     if data.get("id") and data["id"] != char_id:
         raise ValueError(f"文件 id({char_id}) 与内容 id({data['id']}) 不一致")
     data["id"] = char_id
-    data["chattiness"] = validate_chattiness(
-        data.get("chattiness", DEFAULT_CHATTINESS)
-    )
+    data["chattiness"] = validate_chattiness(data.get("chattiness", DEFAULT_CHATTINESS))
     if "initial_stats" in data:
         if not isinstance(data["initial_stats"], dict):
             raise ValueError("initial_stats 必须是对象")
         initial_stats = dict(data["initial_stats"])
         if "affinity" in initial_stats:
-            initial_stats["affinity"] = validate_affinity(
-                initial_stats["affinity"]
-            )
+            initial_stats["affinity"] = validate_affinity(initial_stats["affinity"])
         data["initial_stats"] = initial_stats
-    with yaml_write_transaction():
-        d = resolve_under(ensure_project(project), "characters")
+    with yaml_write_transaction(project):
+        project_dir = get_project_dir(project)
+        if not project_dir.is_dir():
+            raise FileNotFoundError(f"项目 {project} 不存在")
+        d = resolve_under(project_dir, "characters")
+        d.mkdir(parents=True, exist_ok=True)
         path = resolve_under(d, f"{char_id}.yaml")
         _atomic_dump(path, data)
     return path
@@ -489,6 +562,7 @@ def delete_character(project: str, char_id: str, session: dict = None) -> bool:
 
 
 # ========== 世界书 ==========
+
 
 def load_worldbook(project: str) -> list[dict]:
     project_dir = get_project_dir(project)
@@ -549,8 +623,11 @@ def save_worldbook(project: str, entry_id: str, data: dict) -> Path:
     if len(serialized.encode("utf-8")) > _MAX_YAML_BYTES:
         raise WorldbookValidationError(["entry:serialized_too_large"])
     assert_project_write_allowed(project)
-    with yaml_write_transaction():
+    with yaml_write_transaction(project):
         assert_project_write_allowed(project)
+        project_dir = get_project_dir(project)
+        if not project_dir.is_dir():
+            raise FileNotFoundError(f"项目 {project} 不存在")
         path = get_worldbook_path(project, entry_id)
         _atomic_dump(path, normalized)
     return path
@@ -564,6 +641,7 @@ def delete_worldbook_entry(project: str, entry_id: str) -> bool:
 
 # ========== 用户档案 ==========
 
+
 def load_user_profile(project: str) -> dict:
     return load_yaml(
         get_user_profile_path(project),
@@ -576,9 +654,11 @@ def load_user_profile(project: str) -> dict:
 def save_user_profile(project: str, data: dict) -> Path:
     if not isinstance(data, dict):
         raise ValueError("用户档案数据顶层必须是对象")
-    with yaml_write_transaction():
-        d = ensure_project(project)
-        path = resolve_under(d, "user.yaml")
+    with yaml_write_transaction(project):
+        project_dir = get_project_dir(project)
+        if not project_dir.is_dir():
+            raise FileNotFoundError(f"项目 {project} 不存在")
+        path = resolve_under(project_dir, "user.yaml")
         _atomic_dump(path, dict(data))
     return path
 
@@ -590,6 +670,7 @@ def delete_user_profile(project: str, session: dict = None) -> bool:
 
 
 # ========== 辅助 ==========
+
 
 def get_active_character_ids(project: str) -> list[str]:
     return [c["id"] for c in list_characters(project) if c.get("active", True)]

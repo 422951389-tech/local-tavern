@@ -17,7 +17,7 @@ from core.destructive_service import (
     DestructiveService,
 )
 from core.recovery_store import RecoveryStore
-from core.session_store import SessionStore
+from core.session_store import RevisionConflict, SessionStore
 from tests.data_guard import file_manifest
 
 
@@ -509,3 +509,51 @@ async def test_project_delete_blocks_late_mutation_from_recreating_half_project(
     assert not blocker.is_alive()
     assert deleted["deleted"] is True
     assert not seeded["project_dir"].exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_delete_keeps_project_lock_until_worker_finishes(
+    tmp_path,
+    monkeypatch,
+):
+    seeded = await _seed_service(tmp_path, monkeypatch, keeper=True)
+    started = threading.Event()
+    release = threading.Event()
+    original_delete = seeded["service"]._delete_profile_sync
+
+    def delayed_delete(*args, **kwargs):
+        if kwargs.get("entity_type") == "character":
+            started.set()
+            assert release.wait(5)
+        return original_delete(*args, **kwargs)
+
+    monkeypatch.setattr(seeded["service"], "_delete_profile_sync", delayed_delete)
+    first = asyncio.create_task(
+        seeded["service"].delete_character(
+            seeded["project"],
+            CHARACTER_ID,
+            SAVE_IDS[0],
+            seeded["created"][SAVE_IDS[0]]["revision"],
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    first.cancel()
+    await asyncio.sleep(0)
+    first.cancel()
+
+    second = asyncio.create_task(
+        seeded["service"].delete_user(
+            seeded["project"],
+            SAVE_IDS[0],
+            seeded["created"][SAVE_IDS[0]]["revision"],
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert not first.done()
+    assert not second.done(), "删除线程结束前不能释放项目锁"
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    with pytest.raises(RevisionConflict):
+        await second

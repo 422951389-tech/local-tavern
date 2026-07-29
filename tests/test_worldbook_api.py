@@ -10,6 +10,7 @@ import yaml
 from core import active_turns
 from core.character_loader import ensure_project, get_worldbook_path
 from core.import_validation import validate_import_json
+from core.recovery_store import DataCorruptionError
 from core.session_manager import load_session
 from core.worldbook_policy import MAX_MANUAL_WORLDBOOK_IDS
 
@@ -538,7 +539,9 @@ async def test_manual_selection_cannot_cross_projects_or_create_missing_save(
     assert not (project_b_dir / "saves" / "不存在存档.json").exists()
 
 
-def test_legacy_session_manual_ids_normalize_in_memory_without_write(isolated_paths):
+def test_invalid_legacy_manual_ids_are_reported_as_corruption_without_write(
+    isolated_paths,
+):
     project = "worldbook_legacy_session"
     project_dir = _project_dir(isolated_paths, project)
     path = project_dir / "saves" / "默认存档.json"
@@ -547,8 +550,8 @@ def test_legacy_session_manual_ids_normalize_in_memory_without_write(isolated_pa
     path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
     before = path.read_bytes()
 
-    session = load_session(project, "默认存档")
-    assert session["manual_worldbook_ids"] == ["a_entry", "z_entry"]
+    with pytest.raises(DataCorruptionError):
+        load_session(project, "默认存档")
     assert path.read_bytes() == before
 
 

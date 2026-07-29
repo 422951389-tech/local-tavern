@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-import json
 from uuid import uuid4
 
 import pytest
 
 from core import active_turns
-from core.chat_turns import get_turn_coordinator
+from core.chat_turns import TurnCoordinator, TurnStore, get_turn_coordinator
 from core.session_manager import (
     append_history,
     get_session_store,
@@ -149,6 +148,13 @@ async def test_regenerate_maps_first_middle_last_user_and_assistant_to_source_us
         expected_revision=created["revision"],
     )
 
+    if turn_index < 2:
+        assert response.status_code == 409, response.text
+        assert _error_code(response) == "regeneration_would_rewrite_history"
+        assert get_session_store().read_sync(project, SAVE) == created
+        assert fake_ollama.chat_calls == []
+        return
+
     assert response.status_code == 202, response.text
     turn = response.json()
     assert turn["status"] == "pending"
@@ -173,7 +179,7 @@ async def test_regenerate_maps_first_middle_last_user_and_assistant_to_source_us
 
 
 @pytest.mark.asyncio
-async def test_regenerate_prefers_same_turn_id_over_nearest_user(
+async def test_regenerate_rejects_crossed_turn_mapping_without_rewriting_history(
     app_client,
     fake_ollama,
     seed_project,
@@ -195,10 +201,10 @@ async def test_regenerate_prefers_same_turn_id_over_nearest_user(
         expected_revision=created["revision"],
     )
 
-    assert response.status_code == 202, response.text
-    assert response.json()["user_message_id"] == messages[0]["id"]
-    await asyncio.wait_for(fake_ollama.entered.wait(), timeout=1)
-    await app_client.post(f"/api/chat/turns/{response.json()['turn_id']}/cancel")
+    assert response.status_code == 409, response.text
+    assert _error_code(response) == "regeneration_would_rewrite_history"
+    assert get_session_store().read_sync(project, SAVE) == created
+    assert fake_ollama.chat_calls == []
 
 
 @pytest.mark.asyncio
@@ -272,12 +278,205 @@ async def test_regenerate_completed_turn_commits_new_assistant_and_preserves_sou
     assert session["message_history"][0]["id"] == messages[0]["id"]
     assert session["message_history"][0]["pinned"] is True
     assert session["message_history"][0]["status"] == "completed"
-    assert session["message_history"][1]["turn_id"] == terminal["turn_id"]
-    assert "隔离测试响应" in session["message_history"][1]["content"]
+    reply = session["message_history"][1]
+    assert reply["id"] == messages[1]["id"]
+    assert reply["turn_id"] == terminal["turn_id"]
+    assert "隔离测试响应" in reply["content"]
+    assert reply["reply_variant_id"]
+    assert reply["reply_variant_state"]["scene_meta"]["location"] == "隔离测试酒馆"
+    assert len(reply["reply_alternatives"]) == 1
+    assert reply["reply_alternatives"][0]["content"] == "完成路径旧回复"
+    assert reply["reply_alternatives"][0]["state_snapshot"]["scene_meta"][
+        "location"
+    ] == ""
 
 
 @pytest.mark.asyncio
-async def test_regenerate_is_one_snapshot_reuses_uuid_and_keeps_only_pinned_suffix(
+async def test_reply_alternative_selection_swaps_content_and_branch_state(
+    app_client,
+    fake_ollama,
+    seed_project,
+):
+    project = "regen_select_alternative"
+    old_turn = str(uuid4())
+    created, messages = await _seed_history(seed_project, project, [
+        {"role": "user", "content": "选择分支", "turn_id": old_turn},
+        {"role": "assistant", "content": "保留的原回复", "turn_id": old_turn},
+    ])
+    fake_ollama.configure("normal")
+    response = await _regenerate(
+        app_client,
+        project=project,
+        message_id=messages[1]["id"],
+        expected_revision=created["revision"],
+    )
+    assert response.status_code == 202, response.text
+    terminal = await _wait_terminal(app_client, response.json()["turn_id"])
+    assert terminal["status"] == "completed"
+    regenerated = get_session_store().read_sync(project, SAVE)
+    reply = regenerated["message_history"][1]
+    generated_content = reply["content"]
+    original_variant_id = reply["reply_alternatives"][0]["id"]
+    assert regenerated["scene_meta"]["location"] == "隔离测试酒馆"
+
+    selected = await app_client.patch(
+        "/api/session/reply-alternative",
+        json={
+            "project": project,
+            "save": SAVE,
+            "expected_revision": regenerated["revision"],
+            "message_id": messages[1]["id"],
+            "alternative_id": original_variant_id,
+        },
+    )
+
+    assert selected.status_code == 200, selected.text
+    switched = selected.json()["session"]
+    switched_reply = switched["message_history"][1]
+    assert switched_reply["id"] == messages[1]["id"]
+    assert switched_reply["reply_variant_id"] == original_variant_id
+    assert switched_reply["content"] == "保留的原回复"
+    assert switched["scene_meta"]["location"] == ""
+    assert [item["content"] for item in switched_reply["reply_alternatives"]] == [
+        generated_content
+    ]
+
+    generated_variant_id = switched_reply["reply_alternatives"][0]["id"]
+
+    def add_later_history(session: dict, context) -> list[str]:
+        del context
+        session["scene_meta"]["location"] = "后续剧情地点"
+        later_user = append_history(session, "user", "后续用户")
+        later_assistant = append_history(session, "assistant", "后续回复")
+        return [later_user["id"], later_assistant["id"]]
+
+    continued = await mutate_session(
+        project,
+        SAVE,
+        switched["revision"],
+        add_later_history,
+    )
+    selected_again = await app_client.patch(
+        "/api/session/reply-alternative",
+        json={
+            "project": project,
+            "save": SAVE,
+            "expected_revision": continued.session["revision"],
+            "message_id": messages[1]["id"],
+            "alternative_id": generated_variant_id,
+        },
+    )
+    assert selected_again.status_code == 200, selected_again.text
+    assert selected_again.json()["state_applied"] is False
+    continued_after_switch = selected_again.json()["session"]
+    assert continued_after_switch["scene_meta"]["location"] == "后续剧情地点"
+    assert [item["id"] for item in continued_after_switch["message_history"][-2:]] == (
+        continued.value
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_regeneration_restores_original_reply_without_partial_branch(
+    app_client,
+    fake_ollama,
+    seed_project,
+):
+    project = "regen_failure_restore"
+    old_turn = str(uuid4())
+    created, messages = await _seed_history(seed_project, project, [
+        {"role": "user", "content": "失败也要保留", "turn_id": old_turn},
+        {"role": "assistant", "content": "不可丢失的回复", "turn_id": old_turn},
+    ])
+    fake_ollama.configure("error")
+
+    response = await _regenerate(
+        app_client,
+        project=project,
+        message_id=messages[1]["id"],
+        expected_revision=created["revision"],
+    )
+
+    assert response.status_code == 202, response.text
+    terminal = await _wait_terminal(app_client, response.json()["turn_id"])
+    assert terminal["status"] == "failed"
+    session = get_session_store().read_sync(project, SAVE)
+    assert [item["id"] for item in session["message_history"]] == [
+        messages[0]["id"],
+        messages[1]["id"],
+    ]
+    assert session["message_history"][1]["content"] == "不可丢失的回复"
+    assert not any(
+        key.startswith("regeneration_")
+        for item in session["message_history"]
+        for key in item
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_recovery_restores_original_regeneration_reply(
+    seed_project,
+    isolated_paths,
+):
+    project = "regen_restart_restore"
+    old_turn = str(uuid4())
+    created, messages = await _seed_history(seed_project, project, [
+        {"role": "user", "content": "重启来源", "turn_id": old_turn},
+        {"role": "assistant", "content": "重启前原回复", "turn_id": old_turn},
+    ])
+    turn_id = str(uuid4())
+    created_at = "2026-07-29T00:00:00+08:00"
+    turn_store = TurnStore(isolated_paths["data"] / ".regen-restart-turns")
+    record = turn_store.create({
+        "schema_version": 1,
+        "turn_id": turn_id,
+        "turn_kind": "regenerate",
+        "project": project,
+        "save": SAVE,
+        "expected_revision": created["revision"],
+        "user_input": "重启来源",
+        "model": MODEL,
+        "parameters": {},
+        "status": "pending",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "started_at": None,
+        "completed_at": None,
+        "cancel_requested_at": None,
+        "content": "",
+        "thinking": "",
+        "error": None,
+    })
+    acceptance = await get_session_store().accept_regenerated_chat_turn(
+        project,
+        SAVE,
+        created["revision"],
+        turn_id=turn_id,
+        target_message_id=messages[1]["id"],
+        expected_user_input="重启来源",
+        created_at=created_at,
+    )
+    record["accepted_revision"] = acceptance.session["revision"]
+    record["user_message_id"] = acceptance.value
+    record = turn_store.update(record)
+    record, _ = turn_store.append_event(record, {"type": "started"})
+    turn_store.append_event(record, {"type": "content", "content": "不应保留"})
+    active_turns.unregister(project, SAVE, turn_id)
+
+    coordinator = TurnCoordinator(turn_store)
+    assert await coordinator.ensure_recovered() == 1
+    session = get_session_store().read_sync(project, SAVE)
+    assert [item["id"] for item in session["message_history"]] == [
+        messages[0]["id"],
+        messages[1]["id"],
+    ]
+    assert session["message_history"][1]["content"] == "重启前原回复"
+    assert all("regeneration_source_snapshot" not in item for item in session[
+        "message_history"
+    ])
+
+
+@pytest.mark.asyncio
+async def test_regenerate_rejects_non_pinned_suffix_without_rewriting_history(
     app_client,
     fake_ollama,
     seed_project,
@@ -315,54 +514,11 @@ async def test_regenerate_is_one_snapshot_reuses_uuid_and_keeps_only_pinned_suff
         expected_revision=created["revision"],
     )
 
-    assert response.status_code == 202, response.text
-    turn = response.json()
-    await asyncio.wait_for(fake_ollama.entered.wait(), timeout=1)
-    prompt_messages = fake_ollama.chat_calls[-1]["messages"]
-    assert sum(
-        item["content"].count("重生成来源")
-        for item in prompt_messages
-    ) == 1
-    assert sum(
-        item["content"].count("目标旧回复")
-        for item in prompt_messages
-    ) == 1
-    after_snapshots = _snapshot_paths(project)
-    assert len(after_snapshots) == len(before_snapshots) + 1
-    snapshot = json.loads(after_snapshots[-1].read_text(encoding="utf-8"))
-    assert [item["id"] for item in snapshot["message_history"]] == [
-        item["id"] for item in original["message_history"]
-    ]
-
-    accepted = get_session_store().read_sync(project, SAVE)
-    assert [item["id"] for item in accepted["message_history"]] == [
-        messages[0]["id"],
-        messages[1]["id"],
-        messages[3]["id"],
-        messages[5]["id"],
-        messages[7]["id"],
-        messages[2]["id"],
-    ]
-    assert turn["user_message_id"] == messages[2]["id"]
-    source = next(
-        item for item in accepted["message_history"] if item["id"] == messages[2]["id"]
-    )
-    assert source["turn_id"] == turn["turn_id"]
-    assert source["status"] == "pending"
-    assert [
-        item["content"]
-        for item in accepted["message_history"]
-        if item.get("pinned")
-    ] == ["目标旧回复", "保留 pinned-1", "保留 pinned-2", "重生成来源"]
-
-    cancelled = await app_client.post(f"/api/chat/turns/{turn['turn_id']}/cancel")
-    assert cancelled.status_code == 200, cancelled.text
-    finalized = get_session_store().read_sync(project, SAVE)
-    finalized_by_id = {
-        item["id"]: item for item in finalized["message_history"]
-    }
-    assert finalized_by_id[messages[2]["id"]]["pinned"] is True
-    assert finalized_by_id[messages[3]["id"]]["pinned"] is True
+    assert response.status_code == 409, response.text
+    assert _error_code(response) == "regeneration_would_rewrite_history"
+    assert get_session_store().read_sync(project, SAVE) == original
+    assert _snapshot_paths(project) == before_snapshots
+    assert fake_ollama.chat_calls == []
 
 
 @pytest.mark.asyncio
@@ -518,7 +674,7 @@ async def test_regenerate_active_turn_conflict_has_no_partial_mutation(
     response = await _regenerate(
         app_client,
         project=project,
-        message_id=messages[1]["id"],
+        message_id=before["message_history"][-1]["id"],
         expected_revision=before["revision"],
     )
 

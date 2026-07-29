@@ -15,7 +15,23 @@ import { renderSummaryPanelView } from './summary-panel.mjs';
 import { createPromptService, promptTabTargetIndex } from './prompt-editor.mjs';
 import { clampAnchoredLeft, createListboxController } from './listbox.mjs';
 import { createFrameRenderer } from './frame-renderer.mjs';
-import { affinityBar, createMessageElement, mountMessageHistory } from './render.mjs';
+import {
+    createAffinityIndicator,
+    createMessageElement,
+    mountMessageHistory,
+    updateMessageThinking,
+} from './conversation-view.mjs?v=workspace-20260728-h2';
+import {
+    captureResponsePresentationBaseline,
+    presentationForMessage,
+} from './response-presentation.mjs?v=workspace-20260728-h2';
+import { createIcon, hydrateIcons } from './icons.mjs';
+import {
+    activeProviderEntryChanged,
+    createProviderService,
+    createProviderSettingsView,
+    describeProviderSelection,
+} from './provider-settings.mjs';
 import {
     DEFAULT_MODEL_PARAMS,
     createModelParamsEditor,
@@ -46,16 +62,30 @@ import {
     navigateToSearchResult,
     renderSearchResults,
 } from './search.mjs';
+import {
+    createBackupService,
+    createDiagnosticsService,
+    createMemoryNotesService,
+    createReplyAlternativeService,
+    normalizeMessageGenerationDetails,
+    normalizeReplyVariants,
+} from './product-tools.mjs';
+import { createBackupController } from './backup-controller.mjs';
+import { createDiagnosticsController } from './diagnostics-controller.mjs';
+import { createMemoryController } from './memory-controller.mjs';
+import { createOnboardingController } from './onboarding-controller.mjs';
 
 // 本地酒馆 — 前端逻辑 v2（项目+存档双层架构）
 // 流式对话、角色卡渲染、行动建议、会话管理、提示词编辑
 
 if (!globalThis.TavernSecurity) throw new Error('安全渲染模块未加载');
+if (!globalThis.TavernDesktopTransport) throw new Error('桌面传输模块未加载');
 if (!globalThis.TavernApi) throw new Error('ApiClient 模块未加载');
 if (!globalThis.TavernSessionRef) throw new Error('SessionRef 模块未加载');
 if (!globalThis.TavernTurn) throw new Error('TurnClient 模块未加载');
 
 const TavernSecurity = globalThis.TavernSecurity;
+const desktopTransport = globalThis.TavernDesktopTransport;
 
 const { ApiClient, ApiError, payloadMessage } = globalThis.TavernApi;
 const {
@@ -72,11 +102,13 @@ const {
     canPerformAction,
     turnLocksSession,
 } = globalThis.TavernTurn;
-const apiClient = new ApiClient({ timeoutMs: 15000 });
+const apiClient = new ApiClient({
+    timeoutMs: 15000,
+    fetchImpl: desktopTransport.fetch,
+});
 const turnClient = new TurnClient(apiClient);
 
 const API = {
-    models: '/api/models',
     characters: '/api/characters',
     user: '/api/user',
     worldbook: '/api/worldbook',
@@ -136,6 +168,12 @@ const state = {
     roleplayPanel: null,
     relationshipEditor: null,
     modelParams: { ...DEFAULT_MODEL_PARAMS },
+    activeProvider: 'ollama',
+    providerSnapshot: Object.freeze({ providers: Object.freeze([]) }),
+    providerPresets: Object.freeze({ presets: Object.freeze([]) }),
+    modelsProvider: null,
+    modelStatus: 'loading',
+    modelStatusDetail: '',
 };
 
 const projectService = createProjectService(apiClient, API);
@@ -146,13 +184,21 @@ const worldbookService = createWorldbookService(apiClient, sessionWrite, API);
 const roleplayService = createRoleplayService(sessionWrite, API);
 const relationshipService = createRelationshipService(sessionWrite, API);
 const searchService = createSearchService(apiClient, { endpoint: API.search });
+const providerService = createProviderService(apiClient);
+const backupService = createBackupService(apiClient);
+const diagnosticsService = createDiagnosticsService(apiClient);
+const memoryNotesService = createMemoryNotesService(apiClient);
+const replyAlternativeService = createReplyAlternativeService(apiClient);
 const turnPersistence = createTurnPersistence(sessionStorage);
 const modalController = createModalController(
     modalElementsFromDocument(document),
     { documentRef: document },
 );
 modalController.bind();
-const showModal = config => modalController.show(config);
+const showModal = config => {
+    dismissToast();
+    return modalController.show(config);
+};
 const hideModal = options => modalController.hide(options);
 
 const sessionRefs = new SessionRefTracker(state.currentProject, state.currentSave);
@@ -172,8 +218,180 @@ let historyModalSerial = 0;
 let activeFrameRenderer = null;
 let projectListboxController = null;
 let saveListboxController = null;
-const latestRequest = { projects: 0, projectStats: 0, saves: 0 };
+const latestRequest = { projects: 0, projectStats: 0, saves: 0, models: 0 };
+let activeModelLoad = null;
 const summaryWatchers = new Map();
+const COMPOSER_DRAFT_PREFIX = 'local-tavern.composer-draft.v1';
+const composerDraftFallback = new Map();
+const CHAT_BOTTOM_THRESHOLD = 96;
+const ONBOARDING_STORAGE_KEY = 'local-tavern.onboarding.v1';
+let unreadChatUpdates = 0;
+let inspectorRestoreFocus = null;
+let uiBound = false;
+let initializationInFlight = false;
+
+const backupController = createBackupController({
+    documentRef: document,
+    service: backupService,
+    showModal,
+    showToast,
+    errorDetail,
+    reloadWorkspace: () => window.location.reload(),
+});
+const diagnosticsController = createDiagnosticsController({
+    documentRef: document,
+    service: diagnosticsService,
+    showModal,
+    errorDetail,
+});
+const memoryController = createMemoryController({
+    documentRef: document,
+    service: memoryNotesService,
+    showModal,
+    showToast,
+    captureSessionRef,
+    sessionBelongsToRef,
+    getSession: () => state.session,
+    getCharacters: () => state.characters,
+    isCurrentSessionRef,
+    applySessionResult,
+    currentRevision,
+    reloadCurrentSession,
+    errorDetail,
+    confirmAction: message => confirm(message),
+});
+const onboardingController = createOnboardingController({
+    documentRef: document,
+    getStorage: () => localStorage,
+    storageKey: ONBOARDING_STORAGE_KEY,
+    showModal,
+    hideModal,
+    showToast,
+    showProviderSettings,
+});
+
+function sessionIdentity(ref) {
+    if (!ref || typeof ref.project !== 'string' || typeof ref.save !== 'string' || !ref.save) return '';
+    return `${ref.project}\u0000${ref.save}`;
+}
+
+function composerDraftKey(ref) {
+    const identity = sessionIdentity(ref);
+    return identity ? `${COMPOSER_DRAFT_PREFIX}:${encodeURIComponent(identity)}` : '';
+}
+
+function readComposerDraft(ref = committedSessionRef) {
+    const key = composerDraftKey(ref);
+    if (!key) return '';
+    try {
+        const stored = sessionStorage.getItem(key);
+        if (stored !== null) return stored;
+    } catch (_error) {}
+    return composerDraftFallback.get(key) || '';
+}
+
+function writeComposerDraft(ref, value) {
+    const key = composerDraftKey(ref);
+    if (!key) return false;
+    const draft = String(value || '');
+    if (draft) composerDraftFallback.set(key, draft);
+    else composerDraftFallback.delete(key);
+    try {
+        if (draft) sessionStorage.setItem(key, draft);
+        else sessionStorage.removeItem(key);
+    } catch (_error) {}
+    return true;
+}
+
+function persistComposerDraft(ref = committedSessionRef, value = null) {
+    const input = document.getElementById('user-input');
+    const draft = value === null ? (input ? input.value : '') : value;
+    return writeComposerDraft(ref, draft);
+}
+
+function restoreComposerDraft(ref = committedSessionRef) {
+    const input = document.getElementById('user-input');
+    if (!input) return '';
+    const draft = readComposerDraft(ref);
+    input.value = draft;
+    return draft;
+}
+
+function moveComposerDraft(fromRef, toRef) {
+    const draft = readComposerDraft(fromRef);
+    writeComposerDraft(fromRef, '');
+    writeComposerDraft(toRef, draft);
+}
+
+function chatIsNearBottom(stream, threshold = CHAT_BOTTOM_THRESHOLD) {
+    if (!stream) return true;
+    return stream.scrollHeight - stream.clientHeight - stream.scrollTop <= threshold;
+}
+
+function chatShouldFollowLatest(stream) {
+    if (chatIsNearBottom(stream)) return true;
+    const messages = stream ? stream.querySelectorAll('.msg') : [];
+    const latest = messages[messages.length - 1];
+    if (!latest) return true;
+    const streamBounds = stream.getBoundingClientRect();
+    const latestBounds = latest.getBoundingClientRect();
+    return latestBounds.top >= streamBounds.top - 1 && latestBounds.top < streamBounds.bottom;
+}
+
+function captureChatScroll(stream) {
+    if (!stream) return null;
+    const streamBounds = stream.getBoundingClientRect();
+    const messages = [...stream.querySelectorAll('.msg[data-message-id]')];
+    const anchor = messages.find(message => message.getBoundingClientRect().bottom > streamBounds.top + 1) || null;
+    return Object.freeze({
+        sessionKey: stream.dataset.sessionKey || '',
+        nearBottom: chatShouldFollowLatest(stream),
+        scrollTop: stream.scrollTop,
+        messageCount: messages.length,
+        anchorId: anchor ? anchor.dataset.messageId || '' : '',
+        anchorOffset: anchor ? anchor.getBoundingClientRect().top - streamBounds.top : 0,
+    });
+}
+
+function restoreChatScroll(stream, snapshot) {
+    if (!stream || !snapshot) return;
+    const anchor = snapshot.anchorId
+        ? [...stream.querySelectorAll('.msg[data-message-id]')]
+            .find(message => message.dataset.messageId === snapshot.anchorId)
+        : null;
+    if (anchor) {
+        const streamTop = stream.getBoundingClientRect().top;
+        stream.scrollTop += anchor.getBoundingClientRect().top - streamTop - snapshot.anchorOffset;
+        return;
+    }
+    const maximum = Math.max(0, stream.scrollHeight - stream.clientHeight);
+    stream.scrollTop = Math.max(0, Math.min(snapshot.scrollTop, maximum));
+}
+
+function hideLatestIndicator() {
+    unreadChatUpdates = 0;
+    const button = document.getElementById('chat-latest-btn');
+    if (!button) return;
+    button.classList.add('hidden');
+    button.textContent = '回到最新';
+}
+
+function showLatestIndicator(increment = 0) {
+    unreadChatUpdates += Math.max(0, Number.isSafeInteger(increment) ? increment : 0);
+    const button = document.getElementById('chat-latest-btn');
+    if (!button) return;
+    button.textContent = unreadChatUpdates > 0
+        ? `${unreadChatUpdates} 条新内容 · 回到最新`
+        : '生成中有新内容 · 回到最新';
+    button.classList.remove('hidden');
+}
+
+function followChatMutation(wasNearBottom, increment = 1) {
+    requestAnimationFrame(() => {
+        if (wasNearBottom) scrollToBottom({ behavior: 'auto' });
+        else showLatestIndicator(increment);
+    });
+}
 
 function currentRevision(ref = captureSessionRef()) {
     if (!isCurrentSessionRef(ref) || !sessionBelongsToRef(state.session, ref)) return 0;
@@ -253,18 +471,24 @@ async function loadLatestWorldbookDiagnostics(ref) {
 function setNavigationUiState(active) {
     state.navigationBusy = active;
     const blocked = active || Boolean(state.activeTurn && !state.activeTurn.terminal);
-    for (const id of ['project-btn', 'tab-world', 'tab-relations', 'tab-saves', 'model-select', 'reset-btn', 'search-btn']) {
+    for (const id of [
+        'project-btn', 'tab-world', 'tab-relations', 'tab-saves', 'model-select',
+        'provider-settings-btn', 'reset-btn', 'search-btn', 'memory-notes-btn',
+        'backup-center-btn', 'diagnostics-center-btn',
+    ]) {
         const element = document.getElementById(id);
         if (!element) continue;
         if ('disabled' in element) element.disabled = blocked;
         element.setAttribute('aria-disabled', String(blocked));
         element.setAttribute('aria-busy', String(active));
     }
+    syncModelSelectAvailability();
     if (state.roleplayPanel) state.roleplayPanel.setDisabled(blocked);
     if (state.relationshipEditor) state.relationshipEditor.setDisabled(blocked);
 }
 
 function beginSessionTransition(project, save = null) {
+    persistComposerDraft(committedSessionRef);
     cancelActiveTurnFrame({ flush: true });
     cancelSummaryWatchers();
     state.selectedSummaryId = null;
@@ -285,6 +509,7 @@ function rollbackSessionTransition(candidateRef) {
         if (sessionBelongsToRef(state.session, restoredRef)) {
             watchPendingSummaries(restoredRef, state.session);
         }
+        restoreComposerDraft(restoredRef);
     }
 }
 
@@ -324,12 +549,22 @@ function commitSessionState(session, ref) {
     if (!commit.accepted) return false;
     if (!commitSessionIdentity(ref)) return false;
     state.session = commit.session;
+    state.activeProvider = typeof commit.session.current_provider === 'string'
+        ? commit.session.current_provider.trim()
+        : '';
     state.saveList = commit.saveList;
+    renderProviderName();
     renderSession(commit.session);
     renderHistory(commit.messageHistory);
     const modelSelect = document.getElementById('model-select');
-    if (modelSelect && commit.currentModel) modelSelect.value = commit.currentModel;
+    if (modelSelect && commit.currentModel && Array.from(modelSelect.options || []).some(
+        option => option.value === commit.currentModel,
+    )) {
+        modelSelect.value = commit.currentModel;
+    }
+    void syncModelsFromSession(commit.session);
     renderSaveListControls();
+    restoreComposerDraft(ref);
     watchPendingSummaries(ref, commit.session);
     if (isTurnActiveForRef(ref)) setTurnUiState(true, Boolean(state.activeTurn && state.activeTurn.cancelling));
     return true;
@@ -446,13 +681,13 @@ async function renderProjectDropdown(requestRef = captureSessionRef()) {
         const item = domElement('div', 'dropdown-item');
         item.classList.toggle('active', p === state.currentProject);
         item.dataset.project = String(p);
-        item.appendChild(domElement('span', 'item-name', `📁 ${p}`));
+        item.appendChild(domElement('span', 'item-name', p));
         item.appendChild(domElement(
             'span',
             'project-item-stats',
-            `👥${projectStatValue(st, 'characters', 'characters_unavailable')} `
-                + `📖${projectStatValue(st, 'worldbook', 'worldbook_unavailable')} `
-                + `💾${projectStatValue(st, 'saves', 'sessions_unavailable')}`,
+            `角色 ${projectStatValue(st, 'characters', 'characters_unavailable')} · `
+                + `世界书 ${projectStatValue(st, 'worldbook', 'worldbook_unavailable')} · `
+                + `存档 ${projectStatValue(st, 'saves', 'sessions_unavailable')}`,
         ));
         listEl.appendChild(item);
     });
@@ -469,17 +704,34 @@ function updateProjectButton(statsMap) {
     if (statsEl && statsMap) {
         const st = statsMap[state.currentProject] || { characters:0, worldbook:0, saves:0 };
         statsEl.replaceChildren(
-            domElement('span', 'stat', `👥${projectStatValue(st, 'characters', 'characters_unavailable')}`),
-            domElement('span', 'stat', `📖${projectStatValue(st, 'worldbook', 'worldbook_unavailable')}`),
-            domElement('span', 'stat', `💾${projectStatValue(st, 'saves', 'sessions_unavailable')}`),
+            domElement('span', 'stat', `角色 ${projectStatValue(st, 'characters', 'characters_unavailable')}`),
+            domElement('span', 'stat', `世界书 ${projectStatValue(st, 'worldbook', 'worldbook_unavailable')}`),
+            domElement('span', 'stat', `存档 ${projectStatValue(st, 'saves', 'sessions_unavailable')}`),
         );
     }
 }
 
 // ===== Toast 提示 =====
+function modalIsOpen() {
+    const backdrop = document.getElementById('modal-backdrop');
+    return Boolean(backdrop && !backdrop.classList.contains('hidden'));
+}
+
+function dismissToast() {
+    const toast = document.getElementById('toast-msg');
+    if (!toast) return;
+    clearTimeout(toast._t);
+    toast._t = null;
+    toast.classList.remove('show');
+}
+
 function showToast(msg, duration = 1800) {
     const status = document.getElementById('app-status');
     if (status) status.textContent = String(msg || '');
+    if (modalIsOpen()) {
+        dismissToast();
+        return;
+    }
     let el = document.getElementById('toast-msg');
     if (!el) {
         el = document.createElement('div');
@@ -508,10 +760,51 @@ function positionDropdown(panel, anchor) {
     panel.style.left = clampAnchoredLeft(r.left, panelWidth, viewportWidth) + 'px';
 }
 
+function hideInitializationError() {
+    const failure = document.getElementById('init-error');
+    const shell = document.getElementById('workspace-shell');
+    if (failure) {
+        failure.classList.add('hidden');
+        failure.setAttribute('aria-hidden', 'true');
+    }
+    if (shell && 'inert' in shell) shell.inert = false;
+}
+
+function showInitializationError(error) {
+    const failure = document.getElementById('init-error');
+    const message = document.getElementById('init-error-message');
+    const hint = document.getElementById('init-error-hint');
+    const retry = document.getElementById('init-retry-btn');
+    const provider = document.getElementById('init-provider-btn');
+    const shell = document.getElementById('workspace-shell');
+    if (!failure || !message || !hint || !retry || !provider) return;
+    message.textContent = `初始化失败：${errorDetail(error)}`;
+    hint.textContent = desktopTransport.isDesktop
+        ? '请确认本机数据目录可读取，然后重试；模型连接问题可直接打开模型来源检查。'
+        : '请确认本地开发服务正在运行，然后重试；模型连接问题可直接打开模型来源检查。';
+    failure.classList.remove('hidden');
+    failure.setAttribute('aria-hidden', 'false');
+    if (shell && 'inert' in shell) shell.inert = true;
+    retry.disabled = false;
+    retry.setAttribute('aria-busy', 'false');
+    retry.onclick = () => { void init(); };
+    provider.onclick = () => { void showProviderSettings(); };
+    requestAnimationFrame(() => retry.focus());
+}
+
 // ===== 初始化 =====
 async function init() {
+    if (initializationInFlight) return;
+    initializationInFlight = true;
+    const retry = document.getElementById('init-retry-btn');
+    if (retry) {
+        retry.disabled = true;
+        retry.setAttribute('aria-busy', 'true');
+    }
+    hideInitializationError();
     try {
-        await Promise.all([loadModels(), loadProjects(), loadSettings()]);
+        await desktopTransport.ready();
+        await Promise.all([loadProviderCatalog(), loadProjects(), loadSettings()]);
         // 优先用 URL hash 指定的项目；其次用「默认项目」字面量；最后才 fallback 到 projectList[0]
         const hash = window.location.hash.replace('#', '');
         const persistedTurn = readPersistedTurnPointer();
@@ -525,11 +818,31 @@ async function init() {
         await loadProjectContext(initialProject, preferredSave);
         await renderProjectDropdown(captureSessionRef());
         bindUI();
-        showToast(`已进入「${state.currentProject}」`, 1500);
+        initializeInspector();
+        const onboardingOpened = onboardingController.show();
+        if (onboardingOpened) {
+            // 首次使用引导占据当前反馈位，避免模型状态 toast 遮挡隐私说明。
+        } else if (state.modelStatus === 'missing_provider') {
+            showToast('当前存档的模型来源已缺失，请点击顶部“模型来源”完成恢复', 6000);
+        } else if (state.modelStatus === 'missing_model') {
+            showToast(`当前模型「${state.modelStatusDetail}」已不可用，请重新选择`, 6000);
+        } else if (state.modelStatus === 'load_error') {
+            showToast('模型列表读取失败，请打开模型来源设置检查连接', 6000);
+        } else if (state.modelStatus === 'no_models') {
+            showToast('当前来源没有可用模型，请打开模型来源设置检查配置', 6000);
+        } else {
+            showToast(`已进入「${state.currentProject}」`, 1500);
+        }
         resumePersistedTurn(persistedTurn).catch(error => console.warn('恢复 turn 失败', error));
     } catch (e) {
         console.error('初始化失败', e);
-        alert('初始化失败：' + e.message + '\n请确认 server.py 已启动');
+        showInitializationError(e);
+    } finally {
+        initializationInFlight = false;
+        if (retry) {
+            retry.disabled = false;
+            retry.setAttribute('aria-busy', 'false');
+        }
     }
 }
 
@@ -548,18 +861,216 @@ async function saveSettings(params = state.modelParams) {
     return normalized;
 }
 
-async function loadModels() {
-    const data = await apiClient.get(API.models, {
-        schema: body => Array.isArray(body && body.models) || '模型列表响应无效',
-    });
+function providerFromSnapshot(providerId = state.activeProvider) {
+    return state.providerSnapshot.providers.find(provider => provider.id === providerId) || null;
+}
+
+const MODEL_BLOCKING_STATUSES = new Set(['loading', 'missing_provider', 'no_models', 'load_error']);
+
+function syncModelSelectAvailability() {
     const select = document.getElementById('model-select');
+    if (!select) return;
+    const activityBlocked = state.navigationBusy || Boolean(state.activeTurn && !state.activeTurn.terminal);
+    const blocked = activityBlocked || MODEL_BLOCKING_STATUSES.has(state.modelStatus);
+    select.disabled = blocked;
+    select.setAttribute('aria-disabled', String(blocked));
+}
+
+function setModelStatus(status, detail = '') {
+    state.modelStatus = status;
+    state.modelStatusDetail = String(detail || '');
+    const select = document.getElementById('model-select');
+    if (select) {
+        select.dataset.status = status.replaceAll('_', '-');
+        const invalid = ['missing_provider', 'missing_model', 'no_models', 'load_error'].includes(status);
+        select.setAttribute('aria-invalid', String(invalid));
+        const titles = {
+            loading: '正在读取当前来源的模型列表',
+            missing_provider: '当前存档引用的模型来源已缺失，请打开模型来源设置恢复',
+            missing_model: '当前模型已不可用，请从列表中重新选择',
+            no_models: '当前来源没有可用模型，请打开模型来源设置检查配置',
+            load_error: '模型列表读取失败，请打开模型来源设置检查连接',
+            ready: '切换模型',
+        };
+        select.title = titles[status] || '切换模型';
+    }
+    syncModelSelectAvailability();
+    renderProviderName();
+}
+
+function renderProviderName(providerId = state.activeProvider) {
+    const target = document.getElementById('provider-name');
+    if (!target) return;
+    const provider = providerFromSnapshot(providerId);
+    const button = document.getElementById('provider-settings-btn');
+    const missingProvider = !provider;
+    const recovery = missingProvider
+        || ['missing_model', 'no_models', 'load_error'].includes(state.modelStatus);
+    target.textContent = provider ? provider.name : (providerId ? '来源已缺失' : '来源未记录');
+    target.setAttribute('aria-live', 'polite');
+    if (!button) return;
+    button.dataset.status = missingProvider
+        ? 'missing-provider'
+        : (recovery ? state.modelStatus.replaceAll('_', '-') : 'ready');
+    button.classList.toggle('provider-recovery', recovery);
+    let guidance = `打开「${provider?.name || providerId || '模型来源'}」设置`;
+    if (missingProvider) {
+        guidance = `存档引用的模型来源「${providerId || '未记录'}」已缺失。打开模型来源设置进行恢复`;
+    } else if (state.modelStatus === 'missing_model') {
+        guidance = `当前模型「${state.modelStatusDetail}」已不可用。打开模型来源设置或从模型列表重新选择`;
+    } else if (state.modelStatus === 'no_models') {
+        guidance = '当前来源没有可用模型。打开模型来源设置检查配置';
+    } else if (state.modelStatus === 'load_error') {
+        guidance = '模型列表读取失败。打开模型来源设置检查连接';
+    }
+    button.title = guidance;
+    button.setAttribute('aria-label', guidance);
+}
+
+function renderModelOptions(models, currentModel = '', { loadError = null, forceStatus = null } = {}) {
+    const select = document.getElementById('model-select');
+    if (!select) return;
     select.replaceChildren();
-    data.models.forEach(m => {
+    const unique = [...new Set((models || []).filter(model => typeof model === 'string' && model.trim()))];
+    const selection = describeProviderSelection(
+        state.providerSnapshot,
+        state.activeProvider,
+        currentModel,
+        unique,
+    );
+    const status = forceStatus || (loadError && !unique.length ? 'load_error' : selection.status);
+    if (status === 'missing_model') {
+        const invalid = document.createElement('option');
+        invalid.value = '';
+        invalid.textContent = `当前模型已不可用：${currentModel}`;
+        invalid.disabled = true;
+        invalid.selected = true;
+        select.appendChild(invalid);
+    }
+    unique.forEach(m => {
         const opt = document.createElement('option');
         opt.value = m;
         opt.textContent = m;
         select.appendChild(opt);
     });
+    if (!select.options.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        if (status === 'missing_provider') option.textContent = '来源配置已缺失，请打开模型来源设置';
+        else if (status === 'load_error') option.textContent = '模型列表读取失败，请检查连接';
+        else option.textContent = '暂无可用模型，请检查来源配置';
+        select.appendChild(option);
+    }
+    select.value = status === 'ready' ? selection.selectedModel : '';
+    setModelStatus(status, status === 'missing_model' ? currentModel : (loadError?.message || ''));
+}
+
+async function loadProviderCatalog() {
+    const [providers, presets] = await Promise.all([
+        providerService.list(),
+        providerService.presets(),
+    ]);
+    state.providerSnapshot = providers;
+    state.providerPresets = presets;
+    renderProviderName();
+    return providers;
+}
+
+async function loadModels(providerId = state.activeProvider, currentModel = '') {
+    const requestedProvider = typeof providerId === 'string' ? providerId.trim() : '';
+    const requestId = ++latestRequest.models;
+    const configured = providerFromSnapshot(requestedProvider);
+    if (!configured) {
+        if (requestId === latestRequest.models && state.activeProvider === requestedProvider) {
+            state.modelsProvider = null;
+            renderModelOptions([], currentModel, { forceStatus: 'missing_provider' });
+        }
+        return [];
+    }
+    setModelStatus('loading');
+    let models = configured ? [...configured.models] : [];
+    let loadError = null;
+    if (!models.length) {
+        try {
+            models = [...(await providerService.models(requestedProvider)).models];
+        } catch (error) {
+            console.warn(`读取 ${requestedProvider} 模型列表失败`, error);
+            loadError = error;
+        }
+    }
+    if (requestId !== latestRequest.models || state.activeProvider !== requestedProvider) return null;
+    renderModelOptions(
+        models,
+        currentModel || (state.session && state.session.current_model) || '',
+        { loadError },
+    );
+    state.modelsProvider = requestedProvider;
+    renderProviderName(requestedProvider);
+    return models;
+}
+
+function syncModelsFromSession(session, { force = false } = {}) {
+    if (!session || typeof session !== 'object') return Promise.resolve(null);
+    const provider = typeof session.current_provider === 'string' ? session.current_provider.trim() : '';
+    const model = typeof session.current_model === 'string' ? session.current_model : '';
+    state.activeProvider = provider;
+    if (!providerFromSnapshot(provider)) {
+        latestRequest.models += 1;
+        activeModelLoad = null;
+        state.modelsProvider = null;
+        renderModelOptions([], model, { forceStatus: 'missing_provider' });
+        return Promise.resolve([]);
+    }
+    const select = document.getElementById('model-select');
+    const hasCurrentModel = !model || Boolean(select
+        && Array.from(select.options || []).some(option => option.value === model));
+    if (!force && state.modelsProvider === provider && state.modelStatus === 'ready' && hasCurrentModel) {
+        if (select && model) select.value = model;
+        return Promise.resolve(Array.from(select?.options || []).map(option => option.value).filter(Boolean));
+    }
+    const key = `${provider}\u0000${model}`;
+    if (activeModelLoad && activeModelLoad.key === key) return activeModelLoad.promise;
+    const promise = loadModels(provider, model).finally(() => {
+        if (activeModelLoad && activeModelLoad.promise === promise) activeModelLoad = null;
+    });
+    activeModelLoad = { key, promise };
+    return promise;
+}
+
+function announceProviderModelState() {
+    if (state.modelStatus === 'loading') {
+        showToast('模型列表正在同步，请稍候', 2500);
+    } else if (state.modelStatus === 'missing_provider') {
+        showToast('当前存档的模型来源已缺失，请在“模型来源”中选择替代来源', 6000);
+    } else if (state.modelStatus === 'missing_model') {
+        showToast(`当前模型「${state.modelStatusDetail}」已不可用，请重新选择`, 6000);
+    } else if (state.modelStatus === 'load_error') {
+        showToast('模型列表读取失败，请打开模型来源设置检查连接', 6000);
+    } else if (state.modelStatus === 'no_models') {
+        showToast('当前来源没有可用模型，请打开模型来源设置检查配置', 6000);
+    }
+}
+
+function handleProviderSnapshotChanged(snapshot) {
+    const activeChanged = activeProviderEntryChanged(
+        state.providerSnapshot,
+        snapshot,
+        state.activeProvider,
+    );
+    state.providerSnapshot = snapshot;
+    renderProviderName();
+    if (!activeChanged || !state.session) return;
+    latestRequest.models += 1;
+    activeModelLoad = null;
+    state.modelsProvider = null;
+    setModelStatus('loading');
+    void syncModelsFromSession(state.session, { force: true })
+        .then(announceProviderModelState)
+        .catch(error => {
+            console.warn('同步活动模型列表失败', error);
+            setModelStatus('load_error', error instanceof Error ? error.message : String(error));
+            announceProviderModelState();
+        });
 }
 
 async function loadUser(project = state.currentProject) {
@@ -629,6 +1140,7 @@ async function loadProjectContext(project, preferredSave = null) {
         state.characters = characters;
         state.saveList = nextSaves;
         if (!commitSessionState(session, candidateRef)) return false;
+        await syncModelsFromSession(session);
         window.location.hash = `#${project}`;
         const projectName = document.getElementById('project-name');
         if (projectName) projectName.textContent = project;
@@ -659,6 +1171,15 @@ function renderSaveListControls() {
     renderSaveDropdown();
     const badge = document.getElementById('save-count');
     if (badge) badge.textContent = state.saveList.length;
+    const current = state.saveList.find(item => item.session_id === state.currentSave);
+    const saveName = current && current.name ? current.name : state.session && state.session.name
+        ? state.session.name
+        : state.currentSave || '未选择存档';
+    const identity = document.getElementById('current-session-label');
+    if (identity) {
+        identity.textContent = `${state.currentProject} / ${saveName}`;
+        identity.title = `当前项目：${state.currentProject}；当前存档：${saveName}`;
+    }
 }
 
 function renderSaveDropdown() {
@@ -677,7 +1198,7 @@ function renderSaveDropdown() {
         const item = domElement('div', 'dropdown-item');
         item.classList.toggle('active', s.session_id === state.currentSave);
         item.dataset.save = String(s.session_id || '');
-        item.appendChild(domElement('span', 'item-name', `💾 ${s.name || ''}`));
+        item.appendChild(domElement('span', 'item-name', s.name || '未命名存档'));
         const messageCount = Number.isSafeInteger(s.message_count) && s.message_count >= 0
             ? s.message_count
             : 0;
@@ -709,7 +1230,7 @@ async function switchSave(newSaveId) {
         const session = await fetchSession(candidateRef);
         if (!isCurrentSessionRef(candidateRef)) return false;
         if (!commitSessionState(session, candidateRef)) return false;
-        clearSuggestions();
+        await syncModelsFromSession(session);
         document.getElementById('thinking-panel').classList.add('hidden');
         return true;
     } catch (error) {
@@ -733,7 +1254,7 @@ async function createNewSave(name) {
         if (!isCurrentSessionRef(candidateRef)) return null;
         state.saveList = saves;
         if (!commitSessionState(session, candidateRef)) return null;
-        clearSuggestions();
+        await syncModelsFromSession(session);
         return session;
     } catch (error) {
         rollbackSessionTransition(candidateRef);
@@ -761,6 +1282,7 @@ async function renameCurrentSave(newName) {
         throw new ApiError('重命名失败：响应缺少有效存档', { code: 'invalid_response_schema' });
     }
     const candidateRef = beginSessionTransition(requestRef.project, session.session_id);
+    moveComposerDraft(requestRef, candidateRef);
     const previousSaveList = state.saveList;
     state.saveList = state.saveList.map(item => item.session_id === requestRef.save
         ? { ...item, session_id: session.session_id, name: session.name || newName }
@@ -799,6 +1321,7 @@ async function deleteCurrentSave() {
         return;
     }
     if (!isCurrentSessionRef(requestRef)) return;
+    writeComposerDraft(requestRef, '');
     showToast('存档已移入回收区，可恢复');
     try {
         await loadProjectContext(requestRef.project);
@@ -870,16 +1393,22 @@ async function createNewProject(name) {
 
 // ===== 渲染 =====
 
+function sceneFactText(value, fallback = '') {
+    if (typeof value !== 'string') return fallback;
+    return value.split(/\r?\n/).map(line => line.trim()).find(Boolean) || fallback;
+}
+
 function renderSession(session) {
     if (!session) return;
     const meta = session.scene_meta || {};
     const user = session.user_status || {};
     document.getElementById('meta-location').textContent =
-        `📍 ${meta.location || '未知'} | ⏱️ ${meta.time || ''} ${meta.weather ? '/ ' + meta.weather : ''}`;
-    document.getElementById('meta-quest').textContent = `🎯 ${meta.main_quest || ''}`;
-    document.getElementById('meta-goal').textContent = `➡️ ${meta.next_goal || ''}`;
+        `${meta.location || '未知地点'} · ${meta.time || '时间未定'}${meta.weather ? ` · ${meta.weather}` : ''}`;
+    document.getElementById('meta-quest').textContent = sceneFactText(meta.main_quest, '暂无主线');
+    document.getElementById('meta-goal').textContent = sceneFactText(meta.next_goal, '等待下一步行动');
     document.getElementById('meta-user').textContent =
-        `👤 ${user.name || ''} | 🆔 ${user.identity || ''} | 💪 ${user.condition || ''} | ✨ ${(user.abilities || []).join(', ')}`;
+        `${user.name || '未命名'} · ${user.identity || '身份未设定'} · ${user.condition || '状态未设定'}`
+        + `${(user.abilities || []).length ? ` · 能力：${user.abilities.join('、')}` : ''}`;
     renderCharacterPanel(session);
 }
 
@@ -913,20 +1442,63 @@ function renderCharacterPanel(session) {
     state.roleplayPanel.setDisabled(state.navigationBusy || isTurnActiveForRef(panelRef));
 }
 
-function renderAffinityBar(percent) {
-    return affinityBar(percent, TavernSecurity.normalizeAffinity);
+function recordValue(value) {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function characterPresentationState(character, baseline) {
+    const states = Object.values(recordValue(baseline && baseline.characters));
+    const identity = String(character && character.name || '').trim();
+    if (!identity) return null;
+    const exactId = states.find(item => item.id === identity);
+    if (exactId) return exactId;
+    const byName = states.filter(item => item.name === identity);
+    return byName.length === 1 ? byName[0] : null;
 }
 
 function renderHistory(history) {
     const stream = document.getElementById('chat-stream');
+    const scrollSnapshot = captureChatScroll(stream);
+    const nextSessionKey = sessionIdentity(committedSessionRef);
     mountMessageHistory(document, stream, history, msg => {
         if (msg.role === 'user') return buildUserMessage(msg.content, msg);
         if (msg.role === 'assistant') return buildAssistantMessage(msg.content, msg.thinking || '', msg).container;
         return null;
     });
+    stream.dataset.sessionKey = nextSessionKey;
+    const latestAssistant = [...(Array.isArray(history) ? history : [])]
+        .reverse()
+        .find(message => message && message.role === 'assistant');
+    const latestPresentation = latestAssistant ? presentationForMessage(latestAssistant) : null;
+    if (latestPresentation && latestPresentation.suggestions.length > 0) {
+        renderSuggestions(latestPresentation.suggestions);
+    } else {
+        clearSuggestions();
+    }
     // 独立锚点保证空消息历史中也能展示并定位剧情记忆。
     renderSummaryPanel(ensureSummaryAnchor(document, stream), state.session);
-    scrollToBottom();
+    requestAnimationFrame(() => {
+        const sameSession = Boolean(
+            scrollSnapshot
+            && scrollSnapshot.sessionKey
+            && scrollSnapshot.sessionKey === nextSessionKey
+        );
+        if (sameSession && !scrollSnapshot.nearBottom) {
+            restoreChatScroll(stream, scrollSnapshot);
+            const messageCount = stream.querySelectorAll('.msg[data-message-id]').length;
+            const added = Math.max(0, messageCount - scrollSnapshot.messageCount);
+            if (added > 0) showLatestIndicator(added);
+            return;
+        }
+        const assistants = stream.querySelectorAll('.msg.assistant');
+        const latest = assistants[assistants.length - 1];
+        if (latest && latest.classList.contains('message-structured')) {
+            latest.scrollIntoView({ block: 'start', behavior: 'auto' });
+            hideLatestIndicator();
+        } else {
+            scrollToBottom({ behavior: 'auto' });
+        }
+    });
 }
 
 // ===== 消息追加 =====
@@ -943,31 +1515,215 @@ function buildUserMessage(text, msgData = null) {
 
 function appendUserMessage(text, msgData = null) {
     const stream = document.getElementById('chat-stream');
+    const wasNearBottom = chatShouldFollowLatest(stream);
     const div = buildUserMessage(text, msgData);
     stream.insertBefore(div, ensureSummaryAnchor(document, stream));
-    scrollToBottom();
+    followChatMutation(wasNearBottom, 1);
+}
+
+function assistantMessageTime(msgData) {
+    if (!msgData) return new Date().toLocaleTimeString();
+    const timestamps = recordValue(msgData.timestamps);
+    const value = timestamps.completed_at || timestamps.created_at || msgData.created_at || '';
+    if (typeof value !== 'string' || !value.trim()) return '';
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? '' : parsed.toLocaleTimeString();
+}
+
+function detailMetric(label, value, suffix = '') {
+    const item = domElement('div', 'product-metric');
+    item.appendChild(domElement('span', 'product-metric-label', label));
+    item.appendChild(domElement('strong', 'product-metric-value', `${value}${suffix}`));
+    return item;
+}
+
+function showMessageGenerationDetails(message) {
+    const details = normalizeMessageGenerationDetails(message);
+    const body = domElement('div', 'product-tool message-generation-details');
+    if (details.empty) {
+        body.appendChild(domElement(
+            'div', 'product-empty',
+            '这条消息没有上下文预算或生成遥测。旧消息与未经过模型生成的消息会显示此状态。',
+        ));
+        showModal({ title: '上下文与生成详情', body });
+        return;
+    }
+    if (details.context) {
+        const context = domElement('section', 'product-section');
+        context.appendChild(domElement('h3', '', '上下文预算'));
+        const metrics = domElement('div', 'product-metrics');
+        metrics.append(
+            detailMetric('上下文上限', details.context.contextLimit, ' tokens'),
+            detailMetric('输入预算', details.context.inputBudgetTokens, ' tokens'),
+            detailMetric('预估提示词', details.context.estimatedPromptTokens, ' tokens'),
+            detailMetric('剩余输入', details.context.remainingInputTokens, ' tokens'),
+        );
+        context.appendChild(metrics);
+        const note = domElement(
+            'p', 'product-help',
+            `估算器：${details.context.estimator || '未记录'} · 来源：${details.context.contextLimitSource || '未记录'} · 世界书命中：${details.context.worldbookMatchCount}`,
+        );
+        context.appendChild(note);
+        if (details.context.sources.length) {
+            const list = domElement('ul', 'product-plain-list');
+            for (const source of details.context.sources) {
+                const status = source.kept ? '已纳入' : '未纳入';
+                list.appendChild(domElement(
+                    'li', '', `${source.source} · ${source.estimatedTokens} tokens · ${status}${source.reason ? ` · ${source.reason}` : ''}`,
+                ));
+            }
+            context.appendChild(list);
+        }
+        body.appendChild(context);
+    }
+    if (details.telemetry) {
+        const telemetry = domElement('section', 'product-section');
+        telemetry.appendChild(domElement('h3', '', '生成遥测'));
+        const metrics = domElement('div', 'product-metrics');
+        metrics.append(
+            detailMetric('来源', details.telemetry.provider || '未记录'),
+            detailMetric('模型', details.telemetry.model || '未记录'),
+            detailMetric('状态', details.telemetry.status || '未记录'),
+            detailMetric('耗时', details.telemetry.latencyMs === null ? '未记录' : details.telemetry.latencyMs, details.telemetry.latencyMs === null ? '' : ' ms'),
+            detailMetric('输入预估', details.telemetry.inputTokensEstimated, ' tokens'),
+            detailMetric('输出预估', details.telemetry.outputTokensEstimated, ' tokens'),
+        );
+        telemetry.appendChild(metrics);
+        if (details.telemetry.errorCode) {
+            telemetry.appendChild(domElement('p', 'product-inline-error', `错误代码：${details.telemetry.errorCode}`));
+        }
+        body.appendChild(telemetry);
+    }
+    body.appendChild(domElement('p', 'product-privacy-note', '这里只展示白名单诊断字段，不展示提示词正文、API Key 或角色私密原文。'));
+    showModal({ title: '上下文与生成详情', body });
+}
+
+function replyPreview(content) {
+    const compact = String(content || '').replace(/\s+/g, ' ').trim();
+    return compact.length > 42 ? `${compact.slice(0, 42)}…` : (compact || '空回复');
+}
+
+function renderReplyAlternativeControls(messageElement, message) {
+    const model = normalizeReplyVariants(message);
+    if (model.count < 2 || model.activeIndex < 0) return;
+    const control = domElement('div', 'reply-alternative-control');
+    control.setAttribute('aria-label', '备选回复');
+    const previous = domElement('button', 'reply-alternative-step');
+    previous.type = 'button';
+    previous.title = '上一个备选回复';
+    previous.setAttribute('aria-label', '上一个备选回复');
+    previous.appendChild(createIcon(document, 'chevronLeft', { size: 16 }));
+    const label = domElement('span', 'reply-alternative-label', `回复 ${model.activeIndex + 1}/${model.count}`);
+    const select = domElement('select', 'reply-alternative-select');
+    select.setAttribute('aria-label', '选择备选回复');
+    model.variants.forEach((variant, index) => {
+        const option = domElement('option', '', `回复 ${index + 1} · ${replyPreview(variant.content)}`);
+        option.value = variant.id;
+        option.selected = variant.active;
+        select.appendChild(option);
+    });
+    const next = domElement('button', 'reply-alternative-step next');
+    next.type = 'button';
+    next.title = '下一个备选回复';
+    next.setAttribute('aria-label', '下一个备选回复');
+    next.appendChild(createIcon(document, 'chevronLeft', { size: 16 }));
+    const status = domElement('span', 'reply-alternative-status');
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    control.append(previous, label, select, next, status);
+
+    const switchTo = async alternativeId => {
+        const target = model.variants.find(variant => variant.id === alternativeId);
+        if (!target || target.active || control.getAttribute('aria-busy') === 'true') return;
+        const requestRef = captureSessionRef();
+        const previousValue = model.variants[model.activeIndex].id;
+        control.setAttribute('aria-busy', 'true');
+        previous.disabled = true;
+        next.disabled = true;
+        select.disabled = true;
+        status.textContent = '切换中…';
+        try {
+            const result = await replyAlternativeService.select(
+                requestRef,
+                currentRevision(requestRef),
+                message.id,
+                target.id,
+            );
+            if (!isCurrentSessionRef(requestRef)) return;
+            if (!applySessionResult(result.session, requestRef)) {
+                throw new Error('切换响应不属于当前存档');
+            }
+            if (!result.stateApplied) {
+                showToast('已切换回复；后续剧情与当前角色状态保持不变', 4500);
+            } else {
+                showToast('已切换备选回复');
+            }
+        } catch (error) {
+            select.value = previousValue;
+            status.textContent = `切换失败：${errorDetail(error)}`;
+            control.setAttribute('aria-busy', 'false');
+            previous.disabled = false;
+            next.disabled = false;
+            select.disabled = false;
+        }
+    };
+    previous.addEventListener('click', () => {
+        const index = (model.activeIndex - 1 + model.count) % model.count;
+        void switchTo(model.variants[index].id);
+    });
+    next.addEventListener('click', () => {
+        const index = (model.activeIndex + 1) % model.count;
+        void switchTo(model.variants[index].id);
+    });
+    select.addEventListener('change', event => { void switchTo(event.currentTarget.value); });
+    const header = messageElement.querySelector('.msg-header');
+    if (header) header.insertAdjacentElement('afterend', control);
+    else messageElement.prepend(control);
 }
 
 function buildAssistantMessage(content, thinking = '', msgData = null) {
     const rendered = createMessageElement(document, {
         role: 'assistant',
         content,
+        thinking,
         message: msgData || {},
-        timeText: new Date().toLocaleTimeString(),
+        timeText: assistantMessageTime(msgData),
     });
     const div = rendered.container;
+    div.__tavernRawContent = String(content || '');
+    div.__tavernMessageData = msgData || {};
     // 给 assistant 节点分配唯一 id，便于 SSE/regenerate 精确锁定目标（兜底 :last-child 选择器）
     div.id = div.id || `msg-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     renderRoleplayWarnings(document, div, msgData);
+    const presentation = presentationForMessage({ ...(msgData || {}), content });
+    if (presentation) {
+        renderResponsePresentation(div, presentation, msgData || presentation, null, {
+            updateSuggestions: false,
+            updateSummary: false,
+            scroll: false,
+        });
+    }
+    const actions = div.querySelector('.msg-actions');
+    if (actions) {
+        const detailsButton = domElement('button', 'msg-action-btn details');
+        detailsButton.type = 'button';
+        detailsButton.title = '上下文与生成详情';
+        detailsButton.setAttribute('aria-label', '上下文与生成详情');
+        detailsButton.appendChild(createIcon(document, 'eye', { size: 18 }));
+        const deleteButton = actions.querySelector('.delete');
+        actions.insertBefore(detailsButton, deleteButton || null);
+    }
+    renderReplyAlternativeControls(div, msgData || {});
     bindMessageActions(div);
     return rendered;
 }
 
 function appendAssistantMessage(content, thinking = '', msgData = null) {
     const stream = document.getElementById('chat-stream');
+    const wasNearBottom = chatShouldFollowLatest(stream);
     const rendered = buildAssistantMessage(content, thinking, msgData);
     stream.insertBefore(rendered.container, ensureSummaryAnchor(document, stream));
-    scrollToBottom();
+    followChatMutation(wasNearBottom, 1);
     return rendered.contentElement;
 }
 
@@ -1000,10 +1756,20 @@ function bindMessageActions(msgEl) {
         } catch (error) { alert('删除失败：' + error.message); }
     });
     msgEl.querySelector('.msg-action-btn.edit').addEventListener('click', () => enterMessageEditMode(msgEl, messageRef));
+    const detailsButton = msgEl.querySelector('.msg-action-btn.details');
+    if (detailsButton) {
+        detailsButton.addEventListener('click', () => showMessageGenerationDetails(msgEl.__tavernMessageData || {}));
+    }
     msgEl.querySelector('.msg-action-btn.regenerate').addEventListener('click', async () => {
         if (!confirm('重新生成？将回滚到这条消息之前重新调用 AI。')) return;
         try { await regenerateFrom(messageRef); }
-        catch (error) { alert('重生成准备失败：' + error.message); }
+        catch (error) {
+            if (error && error.code === 'regeneration_would_rewrite_history') {
+                showToast('只能为最新回复生成备选，不会删除或重排任何后续内容', 5000);
+                return;
+            }
+            showToast(`重生成准备失败：${errorDetail(error)}`, 4000);
+        }
     });
     const pinBtn = msgEl.querySelector('.msg-action-btn.pin');
     if (pinBtn) {
@@ -1073,12 +1839,16 @@ function recoverDetachedMessageDraft({ messageRef, draft, error }) {
 }
 
 function enterMessageEditMode(msgEl, messageRef, initial = {}) {
+    const hasExplicitDraft = Object.prototype.hasOwnProperty.call(initial, 'draft');
+    const rawContent = typeof msgEl.__tavernRawContent === 'string'
+        ? msgEl.__tavernRawContent
+        : undefined;
     return enterMessageEditor({
         documentRef: document,
         messageElement: msgEl,
         messageRef,
         save: editMessage,
-        initialValue: initial.draft,
+        initialValue: hasExplicitDraft ? initial.draft : rawContent,
         initialError: initial.error,
         recover: recoverDetachedMessageDraft,
     });
@@ -1116,6 +1886,10 @@ async function regenerateFrom(messageRef) {
     if (!sessionBelongsToRef(state.session, requestRef)) {
         throw new ApiError('当前存档尚未加载完成', { code: 'stale_session_ref' });
     }
+    if (state.modelStatus !== 'ready') {
+        announceProviderModelState();
+        return;
+    }
     prepareProvisionalTurn(requestRef);
     await runTurnLifecycle(
         turnClient.regenerate({
@@ -1131,107 +1905,239 @@ async function reloadCurrentSession(requestRef = captureSessionRef()) {
     return loadCurrentSession(requestRef);
 }
 
-// ===== 角色卡渲染 =====
+// ===== 结构化剧情与角色回应 =====
 
-function renderParsedResponse(parsed, warningSource = parsed) {
+function createResponseModuleHeader(kind, title, iconName, metaText = '') {
+    const header = domElement('header', `response-module-header response-${kind}-header`);
+    const titleWrap = domElement('div', 'response-module-title');
+    titleWrap.appendChild(createIcon(document, iconName, { size: 18 }));
+    titleWrap.appendChild(domElement('h3', '', title));
+    header.appendChild(titleWrap);
+    if (metaText) header.appendChild(domElement('span', 'response-module-meta', metaText));
+    return header;
+}
+
+function appendStoryFact(host, label, value, className) {
+    if (!value) return false;
+    const item = domElement('div', `story-fact ${className}`);
+    item.appendChild(domElement('span', 'story-fact-label', label));
+    item.appendChild(domElement('span', 'story-fact-value', value));
+    host.appendChild(item);
+    return true;
+}
+
+function createStoryModule(parsed, baseline) {
+    const scene = recordValue(parsed && parsed.scene_meta);
+    const narration = typeof parsed.narration === 'string' ? parsed.narration.trim() : '';
+    const currentScene = sceneFactText(scene.current_scene);
+    const mainQuest = sceneFactText(scene.main_quest);
+    const nextGoal = sceneFactText(scene.next_goal);
+    const sceneChanges = Array.isArray(baseline && baseline.sceneChanges)
+        ? baseline.sceneChanges
+        : (Array.isArray(parsed && parsed.scene_changes) ? parsed.scene_changes : []);
+    if (!narration && !currentScene && !mainQuest && !nextGoal && sceneChanges.length === 0) return null;
+
+    const section = domElement('section', 'response-module story-module');
+    section.setAttribute('aria-label', '剧情推进');
+    section.appendChild(createResponseModuleHeader('story', '剧情推进', 'book'));
+
+    if (mainQuest || nextGoal) {
+        const facts = domElement('div', 'story-facts');
+        appendStoryFact(facts, '主线', mainQuest, 'story-main-quest');
+        appendStoryFact(facts, '下一步', nextGoal, 'story-next-goal');
+        section.appendChild(facts);
+    }
+    if (currentScene) section.appendChild(domElement('p', 'story-scene-summary', currentScene));
+    if (narration) section.appendChild(domElement('div', 'story-narration', narration));
+    if (sceneChanges.length > 0) {
+        const update = domElement('div', 'story-context-update');
+        update.appendChild(domElement('span', 'story-context-label', '场景更新'));
+        update.appendChild(domElement(
+            'span',
+            'story-context-values',
+            sceneChanges.map(item => `${item.label}：${item.value}`).join(' · '),
+        ));
+        section.appendChild(update);
+    }
+    return section;
+}
+
+function appendCharacterStateRow(list, label, value) {
+    if (!value) return false;
+    const term = domElement('dt', '', label);
+    const description = domElement('dd', '', value);
+    list.appendChild(term);
+    list.appendChild(description);
+    return true;
+}
+
+function createCharacterModule(parsed, baseline) {
+    const characters = Array.isArray(parsed && parsed.characters) ? parsed.characters : [];
+    if (characters.length === 0) return null;
+    const section = domElement('section', 'response-module characters-module');
+    section.setAttribute('aria-label', '角色回应');
+    section.appendChild(createResponseModuleHeader(
+        'characters',
+        '角色回应',
+        'users',
+        `${characters.length} 位角色`,
+    ));
+    const list = domElement('div', 'character-response-list');
+
+    characters.forEach(character => {
+        const card = domElement('article', 'character-card character-response');
+        const stateContext = characterPresentationState(character, baseline);
+        const header = domElement('header', 'char-header');
+        header.appendChild(domElement('h4', 'char-name', character.name || '未命名角色'));
+        const indicator = createAffinityIndicator(document, {
+            value: stateContext ? stateContext.currentAffinity : character.affinity,
+            previousValue: stateContext
+                ? stateContext.previousAffinity
+                : (character.previous_affinity ?? null),
+            normalize: TavernSecurity.normalizeAffinity,
+        });
+        header.appendChild(indicator.element);
+        card.appendChild(header);
+
+        const dialogueText = typeof character.dialogue === 'string' ? character.dialogue.trim() : '';
+        if (dialogueText) {
+            const dialogue = domElement('div', 'char-dialogue');
+            dialogue.appendChild(domElement('span', 'char-section-label', '对白'));
+            dialogue.appendChild(domElement('blockquote', 'char-dialogue-text', `“${dialogueText}”`));
+            if (character.expected_effect) {
+                const effect = domElement('div', 'effect');
+                effect.appendChild(domElement('span', 'effect-label', '预期影响'));
+                effect.appendChild(document.createTextNode(` ${character.expected_effect}`));
+                dialogue.appendChild(effect);
+            }
+            card.appendChild(dialogue);
+        }
+
+        const stateRows = [
+            ['心情', (stateContext && stateContext.mood) || character.mood],
+            ['内心', character.inner_thought],
+            ['穿着', character.outfit],
+            ['姿态', character.posture],
+        ].filter(([, value]) => typeof value === 'string' && value.trim());
+        if (stateRows.length > 0) {
+            const details = domElement('details', 'character-state-details');
+            const summary = domElement('summary', 'character-state-summary');
+            summary.appendChild(createIcon(document, 'sliders', { size: 16 }));
+            summary.appendChild(domElement('span', 'character-state-title', '状态与细节'));
+            summary.appendChild(domElement('span', 'character-state-count', `${stateRows.length} 项`));
+            details.appendChild(summary);
+            const states = domElement('dl', 'character-state-list');
+            stateRows.forEach(([label, value]) => appendCharacterStateRow(states, label, value.trim()));
+            details.appendChild(states);
+            if (!dialogueText) details.open = true;
+            card.appendChild(details);
+        }
+        list.appendChild(card);
+    });
+    section.appendChild(list);
+    return section;
+}
+
+function renderResponsePresentation(
+    messageElement,
+    parsed,
+    warningSource = parsed,
+    presentationBaseline = null,
+    options = {},
+) {
+    if (!messageElement) return false;
+    const contentEl = messageElement.querySelector('.content');
+    if (!contentEl) return false;
     const stream = document.getElementById('chat-stream');
-    const msgs = stream.querySelectorAll('.msg.assistant');
-    const lastAssistant = msgs[msgs.length - 1];
-    if (!lastAssistant) return;
-    const contentEl = lastAssistant.querySelector('.content');
-    const previousRoleplayWarnings = lastAssistant.querySelector('.roleplay-warning-panel');
+    const wasNearBottom = chatShouldFollowLatest(stream);
+    const previousRoleplayWarnings = messageElement.querySelector('.roleplay-warning-panel');
     if (previousRoleplayWarnings) previousRoleplayWarnings.remove();
-    renderRoleplayWarnings(document, lastAssistant, warningSource);
-    // C4：解析失败兜底 — 若 parsed 既无 characters 也无 scene_meta，保留流式累积的原文
-    const isParsedEmpty = (!parsed.characters || parsed.characters.length === 0)
-                       && (!parsed.scene_meta || !parsed.scene_meta.location)
-                       && !parsed.narration;
+    renderRoleplayWarnings(document, messageElement, warningSource);
+    const storyModule = createStoryModule(parsed, presentationBaseline);
+    const characterModule = createCharacterModule(parsed, presentationBaseline);
+    // 解析失败兜底：没有任何可展示模块时保留流式累积原文。
+    const isParsedEmpty = !storyModule && !characterModule;
     if (isParsedEmpty) {
-        // 不清空 contentEl，让用户看到流式原文。追加一个降级提示。
-        const warn = document.createElement('div');
-        warn.className = 'voice-warning';
-        warn.textContent = '⚠️ 本轮未解析出结构化内容，已保留原文';
-        contentEl.appendChild(warn);
-        document.getElementById('thinking-panel').classList.add('hidden');
-        return;
+        if (options.showFallbackWarning === true) {
+            // 不清空 contentEl，让用户看到流式原文。追加一个降级提示。
+            const warn = document.createElement('div');
+            warn.className = 'voice-warning';
+            warn.textContent = '解析提示：本轮未解析出结构化内容，已保留原文';
+            contentEl.appendChild(warn);
+        }
+        return false;
     }
     contentEl.replaceChildren();
-    document.getElementById('thinking-panel').classList.add('hidden');
+    contentEl.classList.add('structured-response');
+    messageElement.classList.add('message-structured');
+    const roleLabel = messageElement.querySelector('.msg-role');
+    if (roleLabel) roleLabel.textContent = '剧情回合';
 
     if (parsed.warnings && parsed.warnings.length > 0) {
         const warnDiv = document.createElement('div');
         warnDiv.className = 'voice-warning';
-        warnDiv.textContent = '⚠️ 检测到角色语气可能串味：'
+        warnDiv.textContent = '语气提示：检测到角色语气可能串味：'
             + parsed.warnings.map(warning => String(warning)).join('；');
         contentEl.appendChild(warnDiv);
     }
 
-    if (parsed.scene_meta && parsed.scene_meta.location) {
-        const metaDiv = document.createElement('div');
-        metaDiv.className = 'character-card';
-        const locationLine = domElement('div');
-        locationLine.appendChild(domElement('strong', '', `📍 ${parsed.scene_meta.location}`));
-        locationLine.appendChild(document.createTextNode(' | '));
-        const time = domElement('span', '', `⏱️ ${parsed.scene_meta.time_weather || ''}`);
-        time.style.color = 'var(--text-dim)';
-        locationLine.appendChild(time);
-        metaDiv.appendChild(locationLine);
-        for (const [value, prefix, withMargin] of [
-            [parsed.scene_meta.main_quest, '🎯 ', true],
-            [parsed.scene_meta.current_scene, '📌 ', false],
-            [parsed.scene_meta.next_goal, '➡️ ', false],
-        ]) {
-            if (!value) continue;
-            const row = domElement('div', '', `${prefix}${value}`);
-            row.style.fontSize = '12px';
-            row.style.color = 'var(--text-dim)';
-            if (withMargin) row.style.marginTop = '4px';
-            metaDiv.appendChild(row);
-        }
-        contentEl.appendChild(metaDiv);
-    }
+    if (storyModule) contentEl.appendChild(storyModule);
+    if (characterModule) contentEl.appendChild(characterModule);
 
-    (parsed.characters || []).forEach(c => {
-        const card = document.createElement('div');
-        card.className = 'character-card';
-        const affinity = TavernSecurity.normalizeAffinity(c.affinity);
-        const header = domElement('div', 'char-header');
-        header.appendChild(domElement('span', 'char-name', `🎭 ${c.name || ''}`));
-        header.appendChild(domElement(
-            'span', 'char-affinity', `${renderAffinityBar(affinity)} ${affinity}%`,
+    const storedRaw = typeof messageElement.__tavernRawContent === 'string'
+        ? messageElement.__tavernRawContent
+        : '';
+    const eventRaw = warningSource && typeof warningSource.raw === 'string'
+        ? warningSource.raw
+        : '';
+    const rawContent = storedRaw.trim() ? storedRaw : eventRaw;
+    if (rawContent.trim()) {
+        messageElement.__tavernRawContent = rawContent;
+        const rawDetails = domElement('details', 'response-raw-details');
+        rawDetails.appendChild(domElement(
+            'summary',
+            'response-raw-summary',
+            '原始回复（上下文文本）',
         ));
-        card.appendChild(header);
-        for (const [value, label] of [
-            [c.inner_thought, '💭 内心:'],
-            [c.outfit, '👗 穿着:'],
-            [c.posture, '🧍 姿势:'],
-        ]) {
-            if (!value) continue;
-            const row = domElement('div', 'char-row');
-            row.appendChild(domElement('strong', '', label));
-            row.appendChild(document.createTextNode(` ${value}`));
-            card.appendChild(row);
-        }
-        const dialogue = domElement('div', 'char-dialogue', `💬 "${c.dialogue || ''}"`);
-        if (c.expected_effect) {
-            dialogue.appendChild(domElement('div', 'effect', `(预期影响: ${c.expected_effect})`));
-        }
-        card.appendChild(dialogue);
-        contentEl.appendChild(card);
-    });
-
-    if (parsed.narration) {
-        const narDiv = document.createElement('div');
-        narDiv.className = 'msg-narration';
-        narDiv.textContent = parsed.narration;
-        contentEl.appendChild(narDiv);
+        const raw = domElement('pre', 'response-raw-content');
+        raw.textContent = rawContent;
+        rawDetails.appendChild(raw);
+        contentEl.appendChild(rawDetails);
     }
 
-    if (parsed.suggestions && parsed.suggestions.length > 0) renderSuggestions(parsed.suggestions);
-    else clearSuggestions();
+    if (options.updateSuggestions !== false) {
+        if (parsed.suggestions && parsed.suggestions.length > 0) renderSuggestions(parsed.suggestions);
+        else clearSuggestions();
+    }
 
-    renderSummaryPanel(ensureSummaryAnchor(document, stream), state.session);
-    scrollToBottom();
+    if (options.updateSummary !== false) {
+        renderSummaryPanel(ensureSummaryAnchor(document, stream), state.session);
+    }
+    if (options.scroll !== false) {
+        if (wasNearBottom) {
+            requestAnimationFrame(() => {
+                if (!messageElement.isConnected) return;
+                messageElement.scrollIntoView({ block: 'start', behavior: 'auto' });
+                hideLatestIndicator();
+            });
+        } else {
+            showLatestIndicator(0);
+        }
+    }
+    return true;
+}
+
+function renderParsedResponse(parsed, warningSource = parsed, presentationBaseline = null) {
+    const stream = document.getElementById('chat-stream');
+    const msgs = stream.querySelectorAll('.msg.assistant');
+    const lastAssistant = msgs[msgs.length - 1];
+    return renderResponsePresentation(
+        lastAssistant,
+        parsed,
+        warningSource,
+        presentationBaseline,
+        { showFallbackWarning: true },
+    );
 }
 
 function renderSummaryPanel(lastAssistant, sess) {
@@ -1405,8 +2311,14 @@ function renderSuggestions(suggestions) {
         btn.className = 'suggestion-btn';
         btn.textContent = s;
         btn.title = s;
-        // C4：点击建议直接填入并发送，无需再点发送按钮
-        btn.onclick = () => { document.getElementById('user-input').value = s; sendMessage(); };
+        btn.setAttribute('aria-label', `填入行动建议：${s}`);
+        btn.onclick = () => {
+            const input = document.getElementById('user-input');
+            input.value = s;
+            persistComposerDraft(committedSessionRef, s);
+            input.focus();
+            showToast('建议已填入输入框，确认后发送');
+        };
         container.appendChild(btn);
     });
 }
@@ -1441,11 +2353,13 @@ function setTurnUiState(active, cancelling = false, syncPending = false) {
         cancelBtn.disabled = !active || cancelling || waitingForSession;
         cancelBtn.classList.toggle('hidden', !active);
         cancelBtn.setAttribute('aria-busy', String(cancelling || waitingForSession));
-        cancelBtn.textContent = waitingForSession ? '正在同步存档…' : cancelling ? '正在取消…' : '⏹ 取消';
+        const label = cancelBtn.querySelector('span:last-child');
+        if (label) label.textContent = waitingForSession ? '正在同步存档…' : cancelling ? '正在取消…' : '取消';
     }
 
     const selectors = [
-        '#project-btn', '#tab-world', '#tab-relations', '#tab-saves', '#model-select', '#reset-btn',
+        '#project-btn', '#tab-world', '#tab-relations', '#tab-saves', '#model-select',
+        '#provider-settings-btn', '#reset-btn',
         '#save-new-inline', '#save-rename-inline', '#save-delete-inline',
         '#save-import-inline', '#history-btn',
         '.msg-action-btn', '.msg-checkbox',
@@ -1458,6 +2372,7 @@ function setTurnUiState(active, cancelling = false, syncPending = false) {
         if ('disabled' in element) element.disabled = active;
         element.setAttribute('aria-disabled', String(active));
     });
+    syncModelSelectAvailability();
     if (state.roleplayPanel) state.roleplayPanel.setDisabled(active || state.navigationBusy);
     if (state.relationshipEditor) state.relationshipEditor.setDisabled(active || state.navigationBusy);
     const stream = document.getElementById('chat-stream');
@@ -1502,15 +2417,15 @@ function activeTurnSnapshot(turn = state.activeTurn) {
 
 function renderTurnSnapshot(snapshot) {
     if (!snapshot) return;
+    const stream = document.getElementById('chat-stream');
+    const wasNearBottom = chatShouldFollowLatest(stream);
     if (snapshot.targetEl && snapshot.targetEl.isConnected) {
         snapshot.targetEl.textContent = snapshot.content || (snapshot.terminal ? '' : '（生成中…）');
     }
-    const thinking = document.getElementById('thinking-content');
-    const panel = document.getElementById('thinking-panel');
-    if (thinking) thinking.textContent = snapshot.thinking;
-    if (panel) panel.classList.toggle('hidden', !snapshot.thinking);
-    const stream = document.getElementById('chat-stream');
-    if (stream) stream.scrollTop = stream.scrollHeight;
+    if (snapshot.targetEl) {
+        updateMessageThinking(snapshot.targetEl, snapshot.thinking, { expand: Boolean(snapshot.thinking) });
+    }
+    if (stream) followChatMutation(wasNearBottom, 0);
 }
 
 function ensureActiveTurnFrame() {
@@ -1588,8 +2503,17 @@ function applyTurnEvent(event) {
     } else if (event.type === 'parsed') {
         flushActiveTurnFrame();
         const parsedEvent = state.activeTurn.parsed;
+        const presentationBaseline = captureResponsePresentationBaseline(
+            state.session,
+            parsedEvent,
+            state.activeTurn && state.activeTurn.turnId,
+        );
+        state.activeTurn = { ...state.activeTurn, presentationBaseline };
+        persistActiveTurn();
         if (parsedEvent.legacySession) applySessionResult(parsedEvent.legacySession, active.ref);
-        if (isCurrentSessionRef(active.ref)) renderParsedResponse(parsedEvent.parsed, parsedEvent);
+        if (isCurrentSessionRef(active.ref)) {
+            renderParsedResponse(parsedEvent.parsed, parsedEvent, presentationBaseline);
+        }
         setTurnUiState(true, state.activeTurn.cancelling);
     } else if (event.type === 'terminal') {
         flushActiveTurnFrame();
@@ -1711,7 +2635,13 @@ async function finalizeActiveTurn(turnId) {
     if (!current || current.turnId !== turnId) return false;
     active = current;
     if (active.parsed && isCurrentSessionRef(active.ref)) {
-        try { renderParsedResponse(active.parsed.parsed, active.parsed); }
+        try {
+            renderParsedResponse(
+                active.parsed.parsed,
+                active.parsed,
+                active.presentationBaseline,
+            );
+        }
         catch (error) { console.warn('结构化响应渲染失败，已保留刷新后的存档', error); }
     }
     showToast(terminalMessage(active), active.status === 'completed' ? 1800 : 3500);
@@ -1783,6 +2713,7 @@ function buildTurnPayload(requestRef, userInput = undefined) {
     return createTurnPayload({
         ref: requestRef,
         revision: currentRevision(requestRef),
+        provider: (state.session && state.session.current_provider) || state.activeProvider,
         model: state.session.current_model || document.getElementById('model-select').value || null,
         params: state.modelParams,
         userInput,
@@ -1791,8 +2722,6 @@ function buildTurnPayload(requestRef, userInput = undefined) {
 
 function prepareProvisionalTurn(requestRef) {
     cancelActiveTurnFrame({ flush: true });
-    const thinking = document.getElementById('thinking-content');
-    if (thinking) thinking.textContent = '';
     state.activeTurn = makeProvisionalTurn(requestRef);
     setTurnUiState(true, false);
 }
@@ -1806,7 +2735,10 @@ async function runTurnLifecycle(turnRequest, requestRef, options = {}) {
             throw new ApiError('发送期间存档引用已失效', { code: 'stale_session_ref' });
         }
         installActiveTurn(turn, requestRef);
-        if (options.clearInput && input) input.value = '';
+        if (options.clearInput && input) {
+            input.value = '';
+            persistComposerDraft(requestRef, '');
+        }
         try { await reloadCurrentSession(requestRef); } catch (error) {
             console.warn('同步 pending user 失败，继续读取持久 turn', error);
         }
@@ -1835,6 +2767,14 @@ async function runTurnLifecycle(turnRequest, requestRef, options = {}) {
                 }
             }
         }
+        if (error instanceof ApiError && error.code === 'regeneration_would_rewrite_history') {
+            state.activeTurn = null;
+            activeController = null;
+            cancelActiveTurnFrame();
+            setTurnUiState(false, false);
+            showToast('只能为最新回复生成备选，不会删除或重排任何后续内容', 5000);
+            return;
+        }
         if (state.activeTurn && !state.activeTurn.provisional) {
             setTurnUiState(true, Boolean(state.activeTurn.cancelling));
             showToast(`生成流处理异常：${errorDetail(error)}；持久 turn 仍可恢复`, 5000);
@@ -1855,6 +2795,14 @@ async function sendMessage(text = null) {
     if (!userText || state.navigationBusy || !canPerformTurnAction('send', requestRef)) return;
     if (!sessionBelongsToRef(state.session, requestRef)) {
         showToast('当前存档尚未加载完成');
+        return;
+    }
+    if (state.modelStatus !== 'ready') {
+        announceProviderModelState();
+        const providerButton = document.getElementById('provider-settings-btn');
+        if (providerButton && state.modelStatus !== 'missing_model') providerButton.focus();
+        const modelSelect = document.getElementById('model-select');
+        if (modelSelect && state.modelStatus === 'missing_model') modelSelect.focus();
         return;
     }
     prepareProvisionalTurn(requestRef);
@@ -2089,7 +3037,9 @@ async function createCardEditor(config) {
         row.appendChild(body);
         if (!fd.builtin) {
             const del = document.createElement('button'); del.className = 'fld-del'; del.title = '删除此字段';
-            del.textContent = '✕'; del.addEventListener('click', () => row.remove()); row.appendChild(del);
+            del.setAttribute('aria-label', '删除字段');
+            del.appendChild(createIcon(document, 'x', { size: 16 }));
+            del.addEventListener('click', () => row.remove()); row.appendChild(del);
         } else { const spacer = document.createElement('span'); spacer.className = 'fld-del-spacer'; row.appendChild(spacer); }
         return row;
     }
@@ -2108,7 +3058,9 @@ async function createCardEditor(config) {
         titleLabel.textContent = g.label; titleBar.appendChild(titleLabel);
         if (!g.builtin) {
             const grpDel = document.createElement('button'); grpDel.className = 'grp-del'; grpDel.title = '删除此分组';
-            grpDel.textContent = '✕'; grpDel.addEventListener('click', () => { container.remove(); });
+            grpDel.setAttribute('aria-label', '删除分组');
+            grpDel.appendChild(createIcon(document, 'x', { size: 16 }));
+            grpDel.addEventListener('click', () => { container.remove(); });
             titleBar.appendChild(grpDel);
         }
         container.appendChild(titleBar);
@@ -2121,7 +3073,8 @@ async function createCardEditor(config) {
         addBtn.textContent = '＋ 添加字段';
         addBtn.addEventListener('click', () => {
             const row = makeFieldRow({ key: '', label: '', value: '', type: 'custom', builtin: false });
-            fieldList.appendChild(row); row.scrollIntoView({ behavior: 'smooth' });
+            fieldList.appendChild(row);
+            row.scrollIntoView({ behavior: preferredScrollBehavior('smooth') });
         });
         container.appendChild(addBtn);
 
@@ -2238,11 +3191,11 @@ async function createCardEditor(config) {
             const saveButton = event.currentTarget;
             if (cardPending) return;
             if (!isCurrentSessionRef(editorRef)) {
-                updateCardStatus('✗ 当前项目或存档已切换，请重新打开编辑器', true);
+                updateCardStatus('当前项目或存档已切换，请重新打开编辑器', true);
                 return;
             }
             if (!canPerformTurnAction('card_write', editorRef)) {
-                updateCardStatus('✗ 当前存档正在生成，请先取消或等待完成', true);
+                updateCardStatus('当前存档正在生成，请先取消或等待完成', true);
                 return;
             }
             for (const control of groupsEl.querySelectorAll('[aria-invalid="true"]')) {
@@ -2261,7 +3214,7 @@ async function createCardEditor(config) {
                 if (!saveUrl) throw new Error('缺少保存 API');
                 await apiClient.put(saveUrl, { data });
                 if (!isCurrentSessionRef(editorRef)) return;
-                cardStatusMessage = '✓ 已保存';
+                cardStatusMessage = '已保存';
                 cardStatusError = false;
                 // 刷新列表
                 if (config.allowNew) {
@@ -2274,9 +3227,9 @@ async function createCardEditor(config) {
                     renderList(); renderForm();
                 }
                 if (config.postSave) await config.postSave(data);
-                updateCardStatus('✓ 已保存');
+                updateCardStatus('已保存');
             } catch (e) {
-                updateCardStatus(`✗ ${errorDetail(e)}`, true);
+                updateCardStatus(errorDetail(e), true);
                 const invalidField = e && e.field
                     ? groupsEl.querySelector(`.fld-row[data-key="${CSS.escape(e.field)}"] .ce-field-val`)
                     : null;
@@ -2302,15 +3255,15 @@ async function createCardEditor(config) {
                 if (!deleteId) return;
                 const requestRef = editorRef;
                 if (!isCurrentSessionRef(requestRef)) {
-                    updateCardStatus('✗ 当前存档已切换，请重新打开编辑器', true);
+                    updateCardStatus('当前存档已切换，请重新打开编辑器', true);
                     return;
                 }
                 if (config.project && state.currentProject !== config.project) {
-                    updateCardStatus('✗ 当前项目已切换，请重新打开编辑器', true);
+                    updateCardStatus('当前项目已切换，请重新打开编辑器', true);
                     return;
                 }
                 if (!canPerformTurnAction('card_write', editorRef)) {
-                    updateCardStatus('✗ 当前存档正在生成，请先取消或等待完成', true);
+                    updateCardStatus('当前存档正在生成，请先取消或等待完成', true);
                     return;
                 }
                 if (!confirm(`确定要删除「${displayName}」吗？删除后将移入回收区，可以恢复。`)) return;
@@ -2370,7 +3323,7 @@ async function createCardEditor(config) {
                     } catch (refreshError) {
                         if (!isCurrentSessionRef(requestRef)) return;
                         updateCardStatus(
-                            `✓ 已移入回收区，可恢复${impactText}；列表刷新失败：${errorDetail(refreshError)}`,
+                            `已移入回收区，可恢复${impactText}；列表刷新失败：${errorDetail(refreshError)}`,
                             true,
                         );
                         if (recoveryId) statusEl.title = `恢复记录：${recoveryId}`;
@@ -2390,7 +3343,7 @@ async function createCardEditor(config) {
                     }
                     const nextStatusEl = formEl.querySelector('.ce-status');
                     if (nextStatusEl) {
-                        updateCardStatus(`✓ 已移入回收区，可恢复${impactText}`);
+                        updateCardStatus(`已移入回收区，可恢复${impactText}`);
                         if (recoveryId) nextStatusEl.title = `恢复记录：${recoveryId}`;
                     }
                     showToast('已移入回收区，可恢复');
@@ -2400,7 +3353,7 @@ async function createCardEditor(config) {
                     }
                 } catch (e) {
                     deleteFailed = true;
-                    updateCardStatus(`✗ ${errorDetail(e)}`, true);
+                    updateCardStatus(errorDetail(e), true);
                 } finally {
                     setCardPending(false);
                     if (deleteFailed && delBtn.isConnected) delBtn.focus();
@@ -2432,7 +3385,7 @@ async function openCharactersEditor() {
     }
     if (!isCurrentSessionRef(editorRef)) return;
     await createCardEditor({
-        title: '👥 角色卡 — 当前世界观的演员',
+        title: '角色卡 — 当前世界观的演员',
         listApi: `${API.characters}?project=${encodeURIComponent(editorRef.project)}`,
         listKey: 'characters',
         saveApi: (id) => `${API.characterSave(id)}?project=${encodeURIComponent(editorRef.project)}`,
@@ -2535,13 +3488,13 @@ async function openWorldbookEditor() {
             return worldbookService.saveManual(editorRef, entryIds);
         },
     });
-    showModal({ title: '📖 世界书 — 触发与预算', body: editor.root });
+    showModal({ title: '世界书 — 触发与预算', body: editor.root });
 }
 
 async function openUserEditor() {
     const editorRef = captureSessionRef();
     await createCardEditor({
-        title: '👤 用户档案 — 当前世界的观众设定',
+        title: '用户档案 — 当前世界的观众设定',
         listApi: null,
         allowNew: false,
         idField: null,
@@ -2595,7 +3548,7 @@ function showModelParamsEditor() {
     };
 
     showModal({
-        title: '🎛 AI 说话风格',
+        title: 'AI 说话风格',
         body: editor.root,
         footer: {
             confirmText: '保存', pendingText: '保存中…', cancelText: '取消', onConfirm: saveParams,
@@ -2623,7 +3576,7 @@ async function showHistoryEditor() {
     listEl.setAttribute('aria-describedby', status.id);
     body.appendChild(status);
     body.appendChild(listEl);
-    showModal({ title: '🕐 历史存档', body });
+    showModal({ title: '历史存档', body });
 
     const isMounted = () => body.isConnected && modalToken === historyModalSerial;
     let restorePending = false;
@@ -2651,20 +3604,20 @@ async function showHistoryEditor() {
         if (snaps.length === 0) {
             setStatus('');
             listEl.appendChild(domElement(
-                'p', 'empty', '还没有历史快照。点一轮对话的「🔄」重新生成，或先聊一会再回来看。',
+                'p', 'empty', '还没有历史快照。可从任一消息选择“重新生成”，或先聊一会再回来看。',
             ));
             return;
         }
         setStatus(`共 ${snaps.length} 份历史快照`);
         snaps.forEach(s => {
-            const typeLabel = s.type === 'trim' ? ' 📄 trim'
-                : s.type === 'reset' ? ' 🔄 重置'
+            const typeLabel = s.type === 'trim' ? ' · trim'
+                : s.type === 'reset' ? ' · 重置'
                 : '';
             const isTrim = s.type === 'trim';
             const item = domElement('div', 'history-item');
             item.classList.toggle('history-item-trim', isTrim);
             item.appendChild(domElement(
-                'span', 'history-time', `🕐 ${s.timestamp || s.modified_at || s.filename}${typeLabel}`,
+                'span', 'history-time', `${s.timestamp || s.modified_at || s.filename}${typeLabel}`,
             ));
             const actions = domElement('div', 'history-actions');
             const preview = domElement('button', 'modal-btn history-preview', '预览');
@@ -2745,7 +3698,7 @@ async function showSnapshotPreview(filename, snapshotRef = captureSessionRef()) 
     status.style.color = 'var(--text-dim)';
     previewEl.appendChild(status);
     body.appendChild(previewEl);
-    showModal({ title: '🔍 快照预览', body });
+    showModal({ title: '快照预览', body });
 
     const isMounted = () => body.isConnected && modalToken === historyModalSerial;
     const showPreviewError = message => {
@@ -2765,9 +3718,9 @@ async function showSnapshotPreview(filename, snapshotRef = captureSessionRef()) 
             showPreviewError('当前存档已切换，请重新打开快照。');
             return;
         }
-        const typeBadge = data.snapshot_type === 'trim' ? '📄 trim（被截消息）'
-            : data.snapshot_type === 'reset' ? '🔄 重置归档'
-            : '💾 快照';
+        const typeBadge = data.snapshot_type === 'trim' ? 'trim（被截消息）'
+            : data.snapshot_type === 'reset' ? '重置归档'
+            : '快照';
         const msgs = data.messages || [];
         previewEl.replaceChildren();
         previewEl.setAttribute('aria-busy', 'false');
@@ -2926,10 +3879,10 @@ async function showPromptsEditor() {
             setPromptPending(true);
             try {
                 await promptService.save(currentTab, drafts[currentTab]);
-                statusEl.textContent = '✓ 已保存，下次对话生效';
+                statusEl.textContent = '已保存，下次对话生效';
                 setTimeout(() => { statusEl.textContent = ''; }, 3000);
             } catch (error) {
-                statusEl.textContent = '✗ ' + errorDetail(error);
+                statusEl.textContent = errorDetail(error);
             } finally {
                 setPromptPending(false);
                 textarea.focus();
@@ -2945,9 +3898,9 @@ async function showPromptsEditor() {
                 const fresh = await promptService.reset(currentTab);
                 drafts[currentTab] = fresh[currentTab] || '';
                 textarea.value = drafts[currentTab];
-                statusEl.textContent = '✓ 已恢复默认'; setTimeout(() => { statusEl.textContent = ''; }, 3000);
+                statusEl.textContent = '已恢复默认'; setTimeout(() => { statusEl.textContent = ''; }, 3000);
             } catch (error) {
-                statusEl.textContent = '✗ ' + errorDetail(error);
+                statusEl.textContent = errorDetail(error);
             } finally {
                 setPromptPending(false);
                 textarea.focus();
@@ -3250,8 +4203,171 @@ function showGlobalSearch() {
     showModal({ title: '全局剧情搜索', body });
 }
 
+
+async function showProviderSettings() {
+    if (state.navigationBusy || isTurnActiveForRef(committedSessionRef)) {
+        showToast('当前正在切换或生成，请稍候');
+        return;
+    }
+    const requestRef = captureSessionRef();
+    let initial;
+    let presets;
+    try {
+        [initial, presets] = await Promise.all([
+            providerService.list(),
+            providerService.presets(),
+        ]);
+    } catch (error) {
+        showToast(`读取模型来源失败：${errorDetail(error)}`, 3500);
+        return;
+    }
+    if (!isCurrentSessionRef(requestRef)) return;
+    state.providerPresets = presets;
+    handleProviderSnapshotChanged(initial);
+    const view = createProviderSettingsView({
+        documentRef: document,
+        service: providerService,
+        initial,
+        presets,
+        currentProvider: state.activeProvider,
+        currentModel: (state.session && state.session.current_model) || '',
+        onPendingChange: pending => modalController.setPending(pending),
+        onChanged: snapshot => handleProviderSnapshotChanged(snapshot),
+        confirmCredentialDelete: provider => confirm(
+            `删除「${provider.name}」的本机密钥？删除后该来源将无法调用，除非重新保存密钥。`,
+        ),
+        confirmProviderDelete: provider => {
+            if (provider.id === state.activeProvider) {
+                showToast('请先切换到其他模型来源，再删除当前配置');
+                return false;
+            }
+            return confirm(`删除模型来源「${provider.name}」及其本机密钥？此操作无法撤销。`);
+        },
+        onActivate: async ({ provider, model }) => {
+            if (!isCurrentSessionRef(requestRef)) throw new Error('当前项目或存档已切换，请重新打开设置');
+            const token = modelSwitchGate.acquire();
+            if (token === null) throw new Error('另一个模型切换仍在进行');
+            try {
+                const result = await sessionWrite(API.switchModel, 'POST', {
+                    project: requestRef.project,
+                    save: requestRef.save,
+                    provider,
+                    model,
+                }, '切换模型来源');
+                if (state.session) await syncModelsFromSession(state.session);
+                showToast(`已切换到「${providerFromSnapshot(provider)?.name || provider}」`);
+                return result;
+            } finally {
+                modelSwitchGate.release(token);
+            }
+        },
+    });
+    showModal({ title: '模型来源与连接', body: view.root });
+}
+
+function setResponsiveMenuOpen(button, menu, open, { restoreFocus = false } = {}) {
+    if (!button || !menu) return false;
+    const isOpen = Boolean(open);
+    menu.classList.toggle('open', isOpen);
+    button.setAttribute('aria-expanded', String(isOpen));
+    if (!isOpen && restoreFocus) button.focus();
+    return isOpen;
+}
+
+function closeResponsiveMenus(exceptButton = null) {
+    for (const [buttonId, menuId] of [
+        ['nav-more-btn', 'nav-more-menu'],
+        ['topbar-more-btn', 'topbar-more-menu'],
+    ]) {
+        const button = document.getElementById(buttonId);
+        if (button === exceptButton) continue;
+        setResponsiveMenuOpen(button, document.getElementById(menuId), false);
+    }
+}
+
+function bindResponsiveMenu(buttonId, menuId) {
+    const button = document.getElementById(buttonId);
+    const menu = document.getElementById(menuId);
+    if (!button || !menu) return;
+    button.addEventListener('click', event => {
+        event.stopPropagation();
+        const next = button.getAttribute('aria-expanded') !== 'true';
+        closeResponsiveMenus(button);
+        setResponsiveMenuOpen(button, menu, next);
+    });
+    menu.addEventListener('click', event => {
+        if (event.target.closest('button')) setResponsiveMenuOpen(button, menu, false);
+    });
+}
+
+function inspectorIsCompact() {
+    return window.matchMedia('(max-width: 899px)').matches;
+}
+
+function inspectorFocusableElements(panel) {
+    return [...panel.querySelectorAll(
+        'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), '
+        + 'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )].filter(element => !element.hidden && element.getClientRects().length > 0);
+}
+
+function setInspectorExpanded(expanded, options = {}) {
+    const shell = document.getElementById('workspace-shell');
+    const panel = document.getElementById('character-panel');
+    const toggle = document.getElementById('inspector-toggle');
+    const backdrop = document.getElementById('inspector-backdrop');
+    if (!shell || !panel || !toggle) return;
+    const isExpanded = Boolean(expanded);
+    const compact = inspectorIsCompact();
+    if (isExpanded && compact) {
+        inspectorRestoreFocus = options.opener || document.activeElement || toggle;
+    }
+    shell.classList.toggle('inspector-collapsed', !isExpanded);
+    panel.setAttribute('aria-hidden', String(!isExpanded));
+    if ('inert' in panel) panel.inert = !isExpanded;
+    if (compact && isExpanded) {
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-modal', 'true');
+    } else {
+        panel.removeAttribute('role');
+        panel.removeAttribute('aria-modal');
+    }
+    if (backdrop) {
+        backdrop.setAttribute('aria-hidden', String(!isExpanded || !compact));
+        backdrop.tabIndex = -1;
+    }
+    toggle.setAttribute('aria-expanded', String(isExpanded));
+    toggle.setAttribute('aria-label', isExpanded ? '收起角色检视器' : '展开角色检视器');
+    toggle.title = isExpanded ? '收起角色检视器' : '展开角色检视器';
+    if (isExpanded && compact && options.focusPanel !== false) {
+        requestAnimationFrame(() => document.getElementById('inspector-close')?.focus());
+    } else if (!isExpanded && options.restoreFocus) {
+        const target = inspectorRestoreFocus && inspectorRestoreFocus.isConnected
+            ? inspectorRestoreFocus
+            : toggle;
+        inspectorRestoreFocus = null;
+        target.focus();
+    }
+}
+
+function initializeInspector() {
+    const compactQuery = window.matchMedia('(max-width: 899px)');
+    setInspectorExpanded(!compactQuery.matches);
+    const handleViewportChange = event => setInspectorExpanded(!event.matches, { focusPanel: false });
+    if (typeof compactQuery.addEventListener === 'function') {
+        compactQuery.addEventListener('change', handleViewportChange);
+    } else if (typeof compactQuery.addListener === 'function') {
+        compactQuery.addListener(handleViewportChange);
+    }
+}
+
 function bindUI() {
+    if (uiBound) return;
+    uiBound = true;
     // ===== 新顶栏 v3 =====
+
+    bindResponsiveMenu('nav-more-btn', 'nav-more-menu');
+    bindResponsiveMenu('topbar-more-btn', 'topbar-more-menu');
 
     // 项目按钮 → 弹出项目下拉
     const projectBtn = document.getElementById('project-btn');
@@ -3323,6 +4439,10 @@ function bindUI() {
         if (!e.target.closest('.dropdown-panel') && !e.target.closest('#project-btn') && !e.target.closest('#tab-saves')) {
             hideAllDropdowns();
         }
+        if (!e.target.closest('.nav-more-menu') && !e.target.closest('#nav-more-btn')
+            && !e.target.closest('.topbar-more-menu') && !e.target.closest('#topbar-more-btn')) {
+            closeResponsiveMenus();
+        }
     });
 
     // 模型切换
@@ -3339,6 +4459,7 @@ function bindUI() {
             await sessionWrite(API.switchModel, 'POST', {
                 project: state.currentProject,
                 save: state.currentSave,
+                provider: state.activeProvider,
                 model,
             }, '切换模型');
             showToast('模型已切换');
@@ -3347,8 +4468,8 @@ function bindUI() {
             if (state.session && state.session.current_model) control.value = state.session.current_model;
         } finally {
             if (modelSwitchGate.release(token)) {
-                control.disabled = state.navigationBusy || isTurnActiveForRef(committedSessionRef);
                 control.setAttribute('aria-busy', 'false');
+                syncModelSelectAvailability();
             }
         }
     });
@@ -3393,15 +4514,82 @@ function bindUI() {
     document.getElementById('model-params-btn').addEventListener('click', showModelParamsEditor);
     document.getElementById('history-btn').addEventListener('click', showHistoryEditor);
     document.getElementById('search-btn').addEventListener('click', showGlobalSearch);
+    document.getElementById('memory-notes-btn').addEventListener('click', () => { void memoryController.showCenter(); });
+    document.getElementById('backup-center-btn').addEventListener('click', () => { void backupController.showCenter(); });
+    document.getElementById('diagnostics-center-btn').addEventListener('click', () => { void diagnosticsController.showCenter(); });
     document.getElementById('tab-relations').addEventListener('click', showRelationshipsEditor);
+    document.getElementById('provider-settings-btn').addEventListener('click', () => void showProviderSettings());
+    document.getElementById('inspector-toggle').addEventListener('click', event => {
+        const opening = event.currentTarget.getAttribute('aria-expanded') !== 'true';
+        setInspectorExpanded(opening, {
+            opener: event.currentTarget,
+            focusPanel: opening,
+            restoreFocus: !opening,
+        });
+    });
+    document.getElementById('inspector-close').addEventListener('click', () => {
+        setInspectorExpanded(false, { restoreFocus: true });
+    });
+    document.getElementById('inspector-backdrop').addEventListener('click', () => {
+        setInspectorExpanded(false, { restoreFocus: true });
+    });
+    document.getElementById('character-panel').addEventListener('keydown', event => {
+        if (event.key !== 'Tab' || !inspectorIsCompact()) return;
+        const panel = event.currentTarget;
+        const focusable = inspectorFocusableElements(panel);
+        if (focusable.length === 0) {
+            event.preventDefault();
+            panel.focus();
+            return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+        }
+    });
+    document.addEventListener('keydown', event => {
+        if (event.key !== 'Escape') return;
+        const topbarMore = document.getElementById('topbar-more-btn');
+        const navMore = document.getElementById('nav-more-btn');
+        if (topbarMore?.getAttribute('aria-expanded') === 'true') {
+            event.preventDefault();
+            setResponsiveMenuOpen(topbarMore, document.getElementById('topbar-more-menu'), false, { restoreFocus: true });
+            return;
+        }
+        if (navMore?.getAttribute('aria-expanded') === 'true') {
+            event.preventDefault();
+            setResponsiveMenuOpen(navMore, document.getElementById('nav-more-menu'), false, { restoreFocus: true });
+            return;
+        }
+        const inspectorToggle = document.getElementById('inspector-toggle');
+        if (inspectorIsCompact() && inspectorToggle?.getAttribute('aria-expanded') === 'true') {
+            event.preventDefault();
+            setInspectorExpanded(false, { restoreFocus: true });
+        }
+    });
 
     // 发送
     document.getElementById('send-btn').addEventListener('click', () => sendMessage());
     // 业务取消必须由服务端收口 turn；POST 完成后才关闭本地 SSE。
     const cancelGenBtn = document.getElementById('send-cancel-btn');
     cancelGenBtn.addEventListener('click', () => cancelActiveTurn());
-    document.getElementById('user-input').addEventListener('keydown', (e) => {
+    const userInput = document.getElementById('user-input');
+    userInput.addEventListener('input', () => persistComposerDraft(committedSessionRef));
+    userInput.addEventListener('keydown', (e) => {
+        if (e.isComposing || e.keyCode === 229) return;
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    });
+    const stream = document.getElementById('chat-stream');
+    stream.addEventListener('scroll', () => {
+        if (chatIsNearBottom(stream)) hideLatestIndicator();
+    }, { passive: true });
+    document.getElementById('chat-latest-btn').addEventListener('click', () => {
+        scrollToBottom({ behavior: 'smooth' });
     });
 
     // thinking 关闭
@@ -3539,10 +4727,25 @@ function promptForImportSave() {
     inp.click();
 }
 
-function scrollToBottom() {
+function preferredScrollBehavior(requested = 'auto') {
+    if (requested !== 'smooth') return 'auto';
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+}
+
+function scrollToBottom(options = {}) {
     const stream = document.getElementById('chat-stream');
-    requestAnimationFrame(() => { stream.scrollTop = stream.scrollHeight; });
+    if (!stream) return;
+    const behavior = preferredScrollBehavior(options.behavior || 'auto');
+    requestAnimationFrame(() => {
+        if (typeof stream.scrollTo === 'function') {
+            stream.scrollTo({ top: stream.scrollHeight, behavior });
+        } else {
+            stream.scrollTop = stream.scrollHeight;
+        }
+        hideLatestIndicator();
+    });
 }
 
 // 启动
+hydrateIcons(document);
 init();

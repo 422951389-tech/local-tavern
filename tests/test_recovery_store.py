@@ -262,6 +262,7 @@ def test_forged_manifest_path_and_tampered_payload_are_rejected(tmp_path):
 async def test_damaged_trash_payload_cannot_restore_or_create_partial_target(tmp_path):
     recovery, projects_root, _ = _store(tmp_path)
     sessions = SessionStore(projects_root, recovery_store=recovery)
+    (projects_root / "project_t").mkdir(parents=True, exist_ok=True)
     target = {
         "session_id": "target",
         "name": "target",

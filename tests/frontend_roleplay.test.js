@@ -43,6 +43,7 @@ class FakeElement {
         this.disabled = false;
         this.isConnected = true;
         this.focused = false;
+        this.style = {};
     }
     set className(value) {
         this._className = String(value || '');
@@ -108,6 +109,47 @@ test('roleplay session normalization supports 0/1/N and rejects invalid strict v
     }
 });
 
+test('角色检视器把阶段、当前值、变化、人工关系和最近证据合并为可追溯上下文', async () => {
+    const { characterRelationshipContexts, normalizeRoleplaySession } = await loadRoleplay();
+    const assistantId = '11111111-1111-4111-8111-111111111111';
+    const session = sessionFixture(2, {
+        characters_state: {
+            alpha: { name: '阿尔法', affinity: 58, mood: '放松' },
+            beta: { name: '贝塔', affinity: 75, mood: '坚定' },
+        },
+        message_history: [{
+            id: assistantId,
+            role: 'assistant',
+            content: '阿尔法与贝塔达成约定。',
+            presentation: {
+                schema_version: 1,
+                characters: [{
+                    name: '阿尔法', affinity: 58, previous_affinity: 50,
+                    dialogue: '我会和你并肩。', expected_effect: '建立信任',
+                }],
+            },
+        }],
+        relationship_edges: [{
+            source_character_id: 'alpha',
+            target_character_id: 'beta',
+            relation_type: '盟友',
+            strength: 75,
+            evidence_message_ids: [assistantId],
+            updated_at: '2026-07-29T12:00:00+08:00',
+        }],
+    });
+
+    const contexts = characterRelationshipContexts(session);
+    assert.equal(contexts.get('alpha').previousAffinity, 50);
+    assert.deepEqual(contexts.get('alpha').relationship, {
+        counterpartId: 'beta', counterpartName: '贝塔', relationType: '盟友', strength: 75,
+    });
+    assert.match(contexts.get('alpha').recentEvidence, /我会和你并肩.*建立信任/);
+    const normalized = normalizeRoleplaySession(session);
+    assert.equal(normalized.characters[0].previousAffinity, 50);
+    assert.equal(normalized.characters[0].relationship.relationType, '盟友');
+});
+
 test('roleplay service delegates exact PATCH payloads to sessionWrite CAS', async () => {
     const { createRoleplayService } = await loadRoleplay();
     const calls = [];
@@ -157,6 +199,11 @@ test('roleplay panel renders 0/1/N controls with explicit labels and strict poli
             assert.equal(controls.input.min, '0');
             assert.equal(controls.input.max, '999');
             assert.equal(controls.input.step, '1');
+            const affinity = controls.card.children[1];
+            assert.equal(affinity.classList.contains('roleplay-affinity'), true);
+            assert.equal(affinity.children[0].children[0].textContent, '好感度');
+            assert.match(affinity.children[0].children[1].textContent, /\/100$/);
+            assert.equal(affinity.children[1].attributes.role, 'meter');
         }
     }
 });

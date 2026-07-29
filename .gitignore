@@ -12,13 +12,21 @@ coverage.json
 htmlcov/
 .venv/
 .venv-dev/
+.venv-desktop/
 venv/
+
+# Reproducible desktop build outputs (generated from tracked spec/scripts)
+build/
+.desktop-build/
+dist/
+release/
 
 # Dev-only Node/Playwright outputs
 node_modules/
 playwright-report/
 test-results/
 .playwright/
+artifacts/
 
 # Local secrets and machine-specific settings
 .env

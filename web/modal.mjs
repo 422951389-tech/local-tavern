@@ -130,6 +130,8 @@ export function createModalController(elements, options = {}) {
         body.replaceChildren();
         if (typeof config.body === 'string') body.textContent = config.body;
         else if (config.body) body.appendChild(config.body);
+        body.scrollTop = 0;
+        dialog.scrollTop = 0;
         setError('');
 
         const footerConfig = config.footer || null;
@@ -149,6 +151,8 @@ export function createModalController(elements, options = {}) {
         if (footerConfig && !confirmHandler) confirmButton.disabled = true;
         backdrop.classList.remove('hidden');
         backdrop.setAttribute('aria-hidden', 'false');
+        body.scrollTop = 0;
+        dialog.scrollTop = 0;
         focusFirstInput(body, closeButton);
         return true;
     }

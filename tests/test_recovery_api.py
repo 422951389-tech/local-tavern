@@ -11,6 +11,7 @@ from tests.data_guard import file_manifest
 
 
 async def _seed_session(project: str, save: str, content: str = "原始消息") -> dict:
+    (session_manager.ROOT_DIR / project).mkdir(parents=True, exist_ok=True)
     session = session_manager.new_session(project, save)
     session_manager.append_history(session, "user", content)
     return await session_manager.create_session(project, save, session)

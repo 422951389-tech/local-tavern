@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 
+from core.async_utils import run_sync_critical
 from core.character_loader import WORLD_BOOK_SCHEMA, load_worldbook, save_worldbook
 from core.destructive_service import DestructiveOperationError
 from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
@@ -119,7 +120,7 @@ async def api_save_worldbook(
     project_lock = await get_session_store().project_lock(project)
     try:
         async with project_lock:
-            await asyncio.to_thread(save_worldbook, project, entry_id, req.data)
+            await run_sync_critical(save_worldbook, project, entry_id, req.data)
         return {"saved": True, "id": entry_id}
     except WorldbookValidationError as exc:
         _raise_worldbook_validation(exc)

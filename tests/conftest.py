@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -25,6 +26,7 @@ TEST_LOG_DIR = TEST_ROOT / "logs"
 TEST_LOG_FILE = TEST_LOG_DIR / "tavern.log"
 TEST_PID_PATH = TEST_ROOT / "tavern.pid"
 TEST_STOP_REQUEST_PATH = TEST_ROOT / "tavern.stop.pid"
+TEST_PROVIDER_DATA_DIR = TEST_ROOT / "provider-data"
 
 # 必须先配置环境，再导入任何 core/routes/server 模块。
 os.environ["TAVERN_DATA_DIR"] = str(TEST_DATA_DIR)
@@ -38,8 +40,11 @@ os.environ["TAVERN_LOG_DIR"] = str(TEST_LOG_DIR)
 os.environ["TAVERN_LOG_FILE"] = str(TEST_LOG_FILE)
 os.environ["TAVERN_PID_PATH"] = str(TEST_PID_PATH)
 os.environ["TAVERN_STOP_REQUEST_PATH"] = str(TEST_STOP_REQUEST_PATH)
+os.environ["TAVERN_PROVIDER_DATA_DIR"] = str(TEST_PROVIDER_DATA_DIR)
 os.environ["TAVERN_HOST"] = "127.0.0.1"
-os.environ["TAVERN_PORT"] = "8765"
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _port_probe:
+    _port_probe.bind(("127.0.0.1", 0))
+    os.environ["TAVERN_PORT"] = str(_port_probe.getsockname()[1])
 os.environ["TAVERN_ALLOW_REMOTE"] = "false"
 os.environ["TAVERN_LOG_MAX_BYTES"] = str(5 * 1024 * 1024)
 os.environ["TAVERN_LOG_BACKUP_COUNT"] = "5"
@@ -96,6 +101,7 @@ def isolated_paths() -> dict[str, Path]:
         "log_file": TEST_LOG_FILE,
         "pid": TEST_PID_PATH,
         "stop_request": TEST_STOP_REQUEST_PATH,
+        "provider_data": TEST_PROVIDER_DATA_DIR,
         "real_data": REAL_DATA_DIR,
         "real_prompts": REAL_PROMPTS_DIR,
         "real_backups": REAL_BACKUPS_DIR,
@@ -114,10 +120,14 @@ def fake_ollama(monkeypatch: pytest.MonkeyPatch) -> FakeOllamaClient:
 
 @pytest_asyncio.fixture
 async def app_client(fake_ollama: FakeOllamaClient):
+    from core.config import PORT
     from server import app
 
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=True)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url=f"http://127.0.0.1:{PORT}",
+    ) as client:
         yield client
 
 

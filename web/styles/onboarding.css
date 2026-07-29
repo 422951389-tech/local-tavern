@@ -1,0 +1,51 @@
+/* 首次使用引导 */
+.onboarding-lead {
+    margin: 0;
+    color: var(--workspace-ink);
+    line-height: 1.7;
+}
+
+.onboarding-options {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.onboarding-card {
+    display: grid;
+    gap: 10px;
+    align-content: start;
+    padding: 18px;
+    background: var(--workspace-panel-raised);
+    border: 1px solid var(--workspace-line);
+    border-radius: var(--workspace-radius);
+}
+
+.onboarding-card.recommended {
+    border-color: var(--workspace-gold-soft);
+    box-shadow: inset 3px 0 0 var(--workspace-gold);
+}
+
+.onboarding-card h3,
+.onboarding-card p {
+    margin: 0;
+}
+
+.onboarding-card h3 {
+    color: var(--workspace-ink);
+}
+
+.onboarding-card p {
+    min-height: 70px;
+    line-height: 1.65;
+}
+
+@media (max-width: 899px) {
+    .onboarding-options {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .onboarding-card p {
+        min-height: 0;
+    }
+}

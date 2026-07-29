@@ -1,4 +1,5 @@
 """项目级破坏性操作：先写入可验证 trash，再执行可补偿变更。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +11,11 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
-from core.active_turns import assert_project_write_allowed
+from core.active_turns import (
+    advance_project_write_generation,
+    assert_project_write_allowed,
+)
+from core.async_utils import run_sync_critical
 from core.library_lock import library_lock
 from core.path_policy import resolve_project_dir, resolve_under, validate_file_id
 from core.recovery_store import (
@@ -37,7 +42,7 @@ DESTRUCTIVE_ENTITY_TYPES = frozenset({"project", "character", "user", "worldbook
 
 
 def _run_with_library_shared(callback, *args, **kwargs):
-    with library_lock.shared():
+    with library_lock.shared_write():
         return callback(*args, **kwargs)
 
 
@@ -349,20 +354,22 @@ class DestructiveService:
             mutator,
         )
         metadata = self._tombstone_metadata(source, kind="file")
-        metadata.update({
-            "active_save_id": active_save_id,
-            "affected_saves": sorted(changed),
-            "post_delete_sessions": {
-                save_id: {
-                    "revision": changed[save_id]["revision"],
-                    "sha256": self._session_digest(
-                        self.session_store,
-                        changed[save_id],
-                    ),
-                }
-                for save_id in sorted(changed)
-            },
-        })
+        metadata.update(
+            {
+                "active_save_id": active_save_id,
+                "affected_saves": sorted(changed),
+                "post_delete_sessions": {
+                    save_id: {
+                        "revision": changed[save_id]["revision"],
+                        "sha256": self._session_digest(
+                            self.session_store,
+                            changed[save_id],
+                        ),
+                    }
+                    for save_id in sorted(changed)
+                },
+            }
+        )
         operation = f"delete_{entity_type}"
         source_paths = [
             source,
@@ -393,7 +400,10 @@ class DestructiveService:
                     save_id,
                 )
                 expected = metadata["post_delete_sessions"][save_id]["sha256"]
-                if sha256_file(self.session_store.session_path(project, save_id)) != expected:
+                if (
+                    sha256_file(self.session_store.session_path(project, save_id))
+                    != expected
+                ):
                     raise RecoveryIntegrityError("删除后的存档哈希不匹配")
 
             primary_digest = self._manifest_item_digest(
@@ -422,6 +432,7 @@ class DestructiveService:
             raise AssertionError("unreachable") from exc
 
         active_result = changed.get(active_save_id, active)
+        advance_project_write_generation(project, f"delete_{entity_type}")
         return {
             "deleted": True,
             "id": entity_id,
@@ -449,6 +460,7 @@ class DestructiveService:
                 [*save_ids, save_id],
             ):
                 assert_project_write_allowed(project)
+
                 def remove_character(session: dict) -> bool:
                     changed = remove_incident_relationship_edges(session, char_id)
                     states = session.get("characters_state")
@@ -457,7 +469,7 @@ class DestructiveService:
                     del states[char_id]
                     return True
 
-                return await asyncio.to_thread(
+                return await run_sync_critical(
                     _run_with_library_shared,
                     self._delete_profile_sync,
                     entity_type="character",
@@ -487,13 +499,14 @@ class DestructiveService:
                 [*save_ids, save_id],
             ):
                 assert_project_write_allowed(project)
+
                 def clear_user(session: dict) -> bool:
                     if session.get("user_status") == EMPTY_USER_STATUS:
                         return False
                     session["user_status"] = deepcopy(EMPTY_USER_STATUS)
                     return True
 
-                return await asyncio.to_thread(
+                return await run_sync_critical(
                     _run_with_library_shared,
                     self._delete_profile_sync,
                     entity_type="user",
@@ -554,6 +567,7 @@ class DestructiveService:
                 compensation_error = rollback_exc
             self._raise_delete_failure(recovery_id, compensation_error)
             raise AssertionError("unreachable") from exc
+        advance_project_write_generation(project, f"delete_{entity_type}")
         return {
             "deleted": True,
             "id": entity_id,
@@ -572,7 +586,7 @@ class DestructiveService:
         project_lock = await self.session_store.project_lock(project)
         async with project_lock:
             assert_project_write_allowed(project)
-            return await asyncio.to_thread(
+            return await run_sync_critical(
                 _run_with_library_shared,
                 self._delete_file_only_sync,
                 entity_type="worldbook",
@@ -631,6 +645,7 @@ class DestructiveService:
                 compensation_error = rollback_exc
             self._raise_delete_failure(recovery_id, compensation_error)
             raise AssertionError("unreachable") from exc
+        advance_project_write_generation(project, "delete_project")
         return {"deleted": True, "recovery_id": recovery_id}
 
     async def delete_project(self, project: str) -> dict:
@@ -641,7 +656,7 @@ class DestructiveService:
             save_ids = self._list_save_ids_sync(project)
             async with self.session_store._save_lock_group(project, save_ids):
                 assert_project_write_allowed(project)
-                return await asyncio.to_thread(
+                return await run_sync_critical(
                     _run_with_library_exclusive,
                     self._delete_project_sync,
                     project,
@@ -815,7 +830,9 @@ class DestructiveService:
         if entity_type == "worldbook":
             sibling_suffix = ".yml" if target.suffix.casefold() == ".yaml" else ".yaml"
             if target.with_suffix(sibling_suffix).exists():
-                raise RecoveryConflict("世界书另一扩展目标已存在", code="target_changed")
+                raise RecoveryConflict(
+                    "世界书另一扩展目标已存在", code="target_changed"
+                )
         if not target.parent.is_dir():
             raise RecoveryConflict("恢复目标父目录不存在", code="target_changed")
         if metadata["tombstone_kind"] == "directory":
@@ -897,6 +914,7 @@ class DestructiveService:
                 recovery_id=recovery_id,
             ) from exc
 
+        advance_project_write_generation(project, f"restore_{entity_type}")
         return {
             "restored": True,
             "recovery_id": recovery_id,
@@ -921,7 +939,7 @@ class DestructiveService:
         async with project_lock:
             async with self.session_store._save_lock_group(project, save_ids):
                 assert_project_write_allowed(project)
-                return await asyncio.to_thread(
+                return await run_sync_critical(
                     _run_with_library_shared,
                     self._restore_trash_sync,
                     recovery_id,

@@ -1,10 +1,14 @@
 """用户档案路由。"""
+
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Request, Query
 
+from core.async_utils import run_sync_critical
 from core.character_loader import load_user_profile, save_user_profile
 from core.destructive_service import DestructiveOperationError
 from core.recovery_store import RecoveryConflict, RecoveryIntegrityError
-from core.session_manager import RevisionConflict, delete_user_data
+from core.session_manager import RevisionConflict, delete_user_data, get_session_store
 from routes.common import (
     _json_object,
     _norm_save,
@@ -20,7 +24,7 @@ router = APIRouter()
 @router.get("/api/user")
 async def api_get_user(project: str = Query("默认项目")):
     project = _norm_project(project)
-    return load_user_profile(project)
+    return await asyncio.to_thread(load_user_profile, project)
 
 
 @router.put("/api/user")
@@ -37,10 +41,14 @@ async def api_save_user(req: Request, project: str = Query("默认项目")):
             },
         )
     try:
-        save_user_profile(project, data)
+        project_lock = await get_session_store().project_lock(project)
+        async with project_lock:
+            await run_sync_critical(save_user_profile, project, data)
         return {"saved": True, "id": data.get("id", "user")}
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
 
 
 @router.delete("/api/user")

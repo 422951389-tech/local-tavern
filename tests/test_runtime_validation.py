@@ -308,24 +308,17 @@ def test_loopback_host_needs_no_remote_opt_in(monkeypatch, host):
     assert config._configured_host(
         "TAVERN_TEST_HOST",
         "127.0.0.1",
-        allow_remote=False,
     ) == host
 
 
 @pytest.mark.parametrize("host", ("0.0.0.0", "::", "192.168.1.20", "tavern.lan"))
-def test_non_loopback_host_requires_explicit_remote_opt_in(monkeypatch, host):
+def test_non_loopback_host_is_always_rejected(monkeypatch, host):
     monkeypatch.setenv("TAVERN_TEST_HOST", host)
-    with pytest.raises(ValueError, match="TAVERN_ALLOW_REMOTE=true"):
+    with pytest.raises(ValueError, match="仅支持本机回环地址"):
         config._configured_host(
             "TAVERN_TEST_HOST",
             "127.0.0.1",
-            allow_remote=False,
         )
-    assert config._configured_host(
-        "TAVERN_TEST_HOST",
-        "127.0.0.1",
-        allow_remote=True,
-    ) == host
 
 
 @pytest.mark.parametrize(
@@ -338,7 +331,6 @@ def test_invalid_server_host_is_rejected(monkeypatch, host):
         config._configured_host(
             "TAVERN_TEST_HOST",
             "127.0.0.1",
-            allow_remote=True,
         )
 
 

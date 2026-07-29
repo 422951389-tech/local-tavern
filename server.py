@@ -1,6 +1,6 @@
 """Local Tavern — FastAPI 主程序
 
-启动：双击 start.bat，或由 core.launcher 统一校验后启动。
+正式使用由独立桌面程序进程内加载；start.bat/core.launcher 仅保留浏览器开发模式。
 
 v2: 项目+存档双层架构
   data/projects/<项目>/
@@ -9,8 +9,11 @@ v2: 项目+存档双层架构
     ├── user.yaml      用户档案
     └── saves/         存档（状态独立）
 """
+
 import asyncio
 import logging
+from time import perf_counter
+from uuid import uuid4
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -31,13 +34,17 @@ from core.config import (
     BACKUP_INTERVAL_HOURS,
     BACKUP_SCHEDULE_ENABLED,
     BACKUP_SCHEDULER_POLL_SECONDS,
+    DESKTOP_MODE,
 )
 from core.ollama_client import get_client
+from core.provider_registry import close_provider_registry, get_provider_registry
 from core.process_guard import claim_pid_file, release_pid_file, wait_for_stop_request
 from core.recovery_store import DataCorruptionError
+from core.request_security import host_header_allowed
 from routes import (
     backups,
     models,
+    providers,
     projects,
     characters,
     user,
@@ -53,6 +60,8 @@ from routes import (
     prompts,
     recovery,
     health,
+    diagnostics,
+    memory,
     static,
 )
 
@@ -69,7 +78,7 @@ async def _cancel_task(task: asyncio.Task | None) -> None:
 
 
 async def _cleanup_lifespan(
-    process_metadata: dict,
+    process_metadata: dict | None,
     *,
     stop_monitor: asyncio.Task | None,
     backup_scheduler: asyncio.Task | None,
@@ -103,20 +112,24 @@ async def _cleanup_lifespan(
         if turn_coordinator is not None:
             await run_cleanup("turn_coordinator", turn_coordinator.shutdown)
         await run_cleanup("chat_background", chat.shutdown_chat_background_tasks)
+        await run_cleanup("provider_registry", close_provider_registry)
         await run_cleanup("ollama_client", lambda: get_client().close())
     finally:
-        try:
-            release_pid_file(process_metadata)
-        except Exception as exc:
-            release_error = exc
-            logger.error(
-                "lifespan_cleanup code=pid_release exception=%s",
-                type(exc).__name__,
+        if process_metadata is not None:
+            try:
+                await asyncio.to_thread(release_pid_file, process_metadata)
+            except Exception as exc:
+                release_error = exc
+                logger.error(
+                    "lifespan_cleanup code=pid_release exception=%s",
+                    type(exc).__name__,
+                )
+            logger.info(
+                "本地酒馆 PID %s 已完成 lifespan shutdown",
+                process_metadata.get("pid"),
             )
-        logger.info(
-            "本地酒馆 PID %s 已完成 lifespan shutdown",
-            process_metadata.get("pid"),
-        )
+        else:
+            logger.info("本地酒馆桌面运行时已完成 lifespan shutdown")
     if cancellation is not None:
         raise cancellation
     if release_error is not None:
@@ -126,15 +139,20 @@ async def _cleanup_lifespan(
 # ===== lifespan：替代已弃用的 @app.on_event("startup"/"shutdown") =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    process_metadata = claim_pid_file()
+    process_metadata = (
+        None if DESKTOP_MODE else await asyncio.to_thread(claim_pid_file)
+    )
     stop_monitor = None
     turn_coordinator = None
     backup_scheduler = None
     try:
-        stop_monitor = asyncio.create_task(wait_for_stop_request(process_metadata))
+        if process_metadata is not None:
+            stop_monitor = asyncio.create_task(wait_for_stop_request(process_metadata))
         pending_restores = await asyncio.to_thread(
             backups.get_backup_manager().pending_restore_ids
         )
+        # Provider 配置和 DPAPI 凭据索引含磁盘读取，启动阶段也不阻塞事件循环。
+        await asyncio.to_thread(get_provider_registry)
         if not pending_restores:
             from core.chat_turns import get_turn_coordinator
 
@@ -151,7 +169,10 @@ async def lifespan(app: FastAPI):
                     poll_seconds=BACKUP_SCHEDULER_POLL_SECONDS,
                 )
             )
-        logger.info("本地酒馆进程已登记 PID %s", process_metadata["pid"])
+        if process_metadata is not None:
+            logger.info("本地酒馆进程已登记 PID %s", process_metadata["pid"])
+        else:
+            logger.info("本地酒馆已进入无端口桌面模式")
         yield
     finally:
         await _cleanup_lifespan(
@@ -163,6 +184,39 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Local Tavern", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def add_correlation_context(request: Request, call_next):
+    """为每个请求生成本地关联 ID；日志不记录查询值或请求正文。"""
+    correlation_id = str(uuid4())
+    request.state.correlation_id = correlation_id
+    started = perf_counter()
+    response = await call_next(request)
+    response.headers["X-Correlation-ID"] = correlation_id
+    if request.url.path.startswith("/api/"):
+        logger.info(
+            "api_request correlation_id=%s method=%s path=%s status=%s duration_ms=%s",
+            correlation_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            max(0, round((perf_counter() - started) * 1000)),
+        )
+    return response
+
+
+@app.middleware("http")
+async def enforce_trusted_host(request: Request, call_next):
+    """本地模式只接受回环 Host，阻断 Host 欺骗与 DNS rebinding 写入口。"""
+    if not host_header_allowed(request.headers.get("host")):
+        return error_response(
+            400,
+            "host_not_allowed",
+            "请求 Host 不在服务允许范围内",
+            {},
+        )
+    return await call_next(request)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -203,7 +257,8 @@ async def handle_data_corruption(_request: Request, exc: DataCorruptionError):
 async def handle_unexpected_error(request: Request, exc: Exception):
     """未分类异常只在服务端记录，响应不暴露路径或异常文本。"""
     logger.error(
-        "api_unhandled method=%s path=%s exception=%s",
+        "api_unhandled correlation_id=%s method=%s path=%s exception=%s",
+        getattr(request.state, "correlation_id", "unavailable"),
         request.method,
         request.url.path,
         type(exc).__name__,
@@ -219,10 +274,34 @@ async def handle_unexpected_error(request: Request, exc: Exception):
 
 @app.middleware("http")
 async def enforce_restore_maintenance(request: Request, call_next):
-    """整库恢复未收口时阻断其他写入，避免 mixed 状态产生新数据后被回滚。"""
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        from core.active_turns import maintenance_operation
+    """维护期间冻结业务读写，避免响应暴露跨根 mixed 状态。"""
+    from core.active_turns import (
+        TurnMaintenanceConflict,
+        maintenance_operation,
+        register_api_read,
+        unregister_api_read,
+    )
 
+    is_api_read = (
+        request.method in {"GET", "HEAD"}
+        and request.url.path.startswith("/api/")
+    )
+    if is_api_read:
+        try:
+            register_api_read()
+        except TurnMaintenanceConflict as exc:
+            return error_response(
+                503,
+                "turn_maintenance",
+                "整库维护期间读取已暂停",
+                {"operation": exc.operation},
+            )
+        try:
+            return await call_next(request)
+        finally:
+            unregister_api_read()
+
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         maintenance = maintenance_operation()
         if maintenance is not None:
             return error_response(
@@ -277,10 +356,22 @@ async def add_security_headers(request, call_next):
     response = await call_next(request)
     return apply_security_headers(response)
 
+
+@app.middleware("http")
+async def bind_request_maintenance_generation(request, call_next):
+    """让写事务识别请求进入后跨越的整库恢复边界。"""
+
+    from core.active_turns import request_maintenance_generation_context
+
+    with request_maintenance_generation_context():
+        return await call_next(request)
+
+
 # 静态文件（需在 include_router 之前 mount，避免被路由覆盖）
 static.mount_static(app)
 
 # 注册路由
+app.include_router(providers.router)
 app.include_router(models.router)
 app.include_router(projects.router)
 app.include_router(characters.router)
@@ -298,6 +389,8 @@ app.include_router(prompts.router)
 app.include_router(recovery.router)
 app.include_router(backups.router)
 app.include_router(health.router)
+app.include_router(diagnostics.router)
+app.include_router(memory.router)
 app.include_router(static.router)
 
 

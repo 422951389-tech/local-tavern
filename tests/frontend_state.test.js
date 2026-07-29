@@ -32,6 +32,7 @@ function sessionFixture(project, save, revision, marker) {
         session_id: save,
         name: `${marker}-name`,
         revision,
+        current_provider: `${marker}-provider`,
         current_model: `${marker}-model`,
         message_history: [{ id: `${marker}-message`, role: 'user', content: marker }],
         scene_meta: { location: `${marker}-scene` },
@@ -334,6 +335,7 @@ test('delayed A response cannot overwrite the complete B session view', async ()
 
     assert.equal(commitB.project, 'project-b');
     assert.equal(commitB.save, 'save-b');
+    assert.equal(commitB.currentProvider, 'B-provider');
     assert.equal(commitB.currentModel, 'B-model');
     assert.equal(commitB.messageHistory[0].content, 'B');
     assert.equal(commitB.sceneMeta.location, 'B-scene');

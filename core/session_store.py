@@ -1,4 +1,5 @@
 """带 revision 的单进程事务化 SessionStore。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,8 +16,9 @@ from typing import Callable, Generic, TypeVar
 from uuid import UUID, uuid4, uuid5
 
 from core.active_turns import assert_write_allowed
+from core.async_utils import run_sync_critical
 from core.library_lock import library_lock
-from core.message_commands import plan_message_regeneration
+from core.message_commands import MAX_REPLY_ALTERNATIVES, plan_message_regeneration
 from core.path_policy import (
     resolve_project_dir,
     resolve_saves_dir,
@@ -42,8 +44,12 @@ LEGACY_MESSAGE_NAMESPACE = UUID("5ed9739c-d4a1-4baa-92a9-0e105fdd72a1")
 LEGACY_SUMMARY_NAMESPACE = UUID("1322c1c3-22f9-4cad-94f1-4c12ca7dfb21")
 
 
-def _run_with_library_shared(callback: Callable[..., T], *args, **kwargs) -> T:
-    with library_lock.shared():
+def _run_with_library_shared_write(
+    callback: Callable[..., T],
+    *args,
+    **kwargs,
+) -> T:
+    with library_lock.shared_write():
         return callback(*args, **kwargs)
 
 
@@ -74,7 +80,7 @@ class SessionRecoveryResult(dict):
 
 def atomic_write(path: Path, data: str) -> None:
     """同目录唯一临时文件 → flush/fsync → os.replace。"""
-    with library_lock.shared():
+    with library_lock.shared_write():
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temp_name = tempfile.mkstemp(
             dir=path.parent,
@@ -156,6 +162,370 @@ def _legacy_summary_uuid(
     return str(uuid5(LEGACY_SUMMARY_NAMESPACE, seed))
 
 
+class _SessionShapeError(ValueError):
+    """磁盘 Session 已有字段不满足可无损规范化的最低结构。"""
+
+
+def _shape_error(field: str, message: str) -> None:
+    raise _SessionShapeError(f"{field} {message}")
+
+
+def _validate_reply_state_snapshot(value: object, field: str) -> None:
+    if not isinstance(value, dict):
+        _shape_error(field, "必须是对象")
+    unknown = set(value) - {
+        "scene_meta",
+        "characters_state",
+        "relationship_edges",
+    }
+    if unknown:
+        _shape_error(field, "包含未知字段")
+    if "scene_meta" in value and not isinstance(value["scene_meta"], dict):
+        _shape_error(f"{field}.scene_meta", "必须是对象")
+    if "characters_state" in value and not isinstance(value["characters_state"], dict):
+        _shape_error(f"{field}.characters_state", "必须是对象")
+    if "relationship_edges" in value and not isinstance(
+        value["relationship_edges"], list
+    ):
+        _shape_error(f"{field}.relationship_edges", "必须是数组")
+
+
+def _validate_reply_variant(value: object, field: str) -> str:
+    if not isinstance(value, dict):
+        _shape_error(field, "必须是对象")
+    allowed = {
+        "id",
+        "content",
+        "thinking",
+        "presentation",
+        "context_diagnostics",
+        "generation_telemetry",
+        "roleplay_warnings",
+        "status",
+        "error",
+        "timestamps",
+        "turn_id",
+        "turn_kind",
+        "state_snapshot",
+    }
+    if set(value) - allowed:
+        _shape_error(field, "包含未知字段")
+    variant_id = _valid_uuid(value.get("id"))
+    if variant_id is None:
+        _shape_error(f"{field}.id", "必须是 UUID")
+    if not isinstance(value.get("content"), str):
+        _shape_error(f"{field}.content", "必须是字符串")
+    if "thinking" in value and not isinstance(value["thinking"], str):
+        _shape_error(f"{field}.thinking", "必须是字符串")
+    for object_field in (
+        "presentation",
+        "context_diagnostics",
+        "generation_telemetry",
+        "timestamps",
+    ):
+        object_value = value.get(object_field)
+        if object_field in value and not (
+            isinstance(object_value, dict)
+            or (object_field == "presentation" and object_value is None)
+        ):
+            _shape_error(f"{field}.{object_field}", "必须是对象")
+    if "roleplay_warnings" in value and not isinstance(
+        value["roleplay_warnings"], list
+    ):
+        _shape_error(f"{field}.roleplay_warnings", "必须是数组")
+    if "error" in value and not (
+        value["error"] is None or isinstance(value["error"], dict)
+    ):
+        _shape_error(f"{field}.error", "必须是对象或 null")
+    for text_field in ("status", "turn_id", "turn_kind"):
+        if text_field in value and not isinstance(value[text_field], str):
+            _shape_error(f"{field}.{text_field}", "必须是字符串")
+    _validate_reply_state_snapshot(
+        value.get("state_snapshot"),
+        f"{field}.state_snapshot",
+    )
+    return variant_id
+
+
+def _validate_session_shape(session: dict, project: str, save_id: str) -> None:
+    """严格检查磁盘数据；缺失字段由 ``normalize_session`` 兼容补齐。
+
+    这里仅拒绝会在规范化或后续消费时被静默清空、截断、覆盖或隐藏的
+    已有数据。校验只读取内存中的 JSON 对象，不执行任何磁盘写入。
+    """
+    for field, expected in (("project", project), ("session_id", save_id)):
+        if field not in session:
+            continue
+        value = session[field]
+        if not isinstance(value, str):
+            _shape_error(field, "必须是字符串")
+        if value != expected:
+            _shape_error(field, "与存档路径不一致")
+
+    if "revision" in session:
+        revision = session["revision"]
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            _shape_error("revision", "必须是非负整数")
+
+    container_types = {
+        "scene_meta": dict,
+        "characters_state": dict,
+        "summaries": list,
+        "message_history": list,
+        "manual_worldbook_ids": list,
+        "roleplay_policy": dict,
+        "relationship_edges": list,
+    }
+    for field, expected_type in container_types.items():
+        if field in session and not isinstance(session[field], expected_type):
+            label = "对象" if expected_type is dict else "数组"
+            _shape_error(field, f"必须是{label}")
+
+    if "current_provider" in session:
+        provider = session["current_provider"]
+        if not isinstance(provider, str) or not provider.strip():
+            _shape_error("current_provider", "必须是非空字符串")
+    if "current_model" in session and not isinstance(session["current_model"], str):
+        _shape_error("current_model", "必须是字符串")
+
+    manual_ids = session.get("manual_worldbook_ids")
+    if isinstance(manual_ids, list):
+        if len(manual_ids) > MAX_MANUAL_WORLDBOOK_IDS:
+            _shape_error(
+                "manual_worldbook_ids",
+                f"最多包含 {MAX_MANUAL_WORLDBOOK_IDS} 项",
+            )
+        seen_manual_ids: set[str] = set()
+        for index, entry_id in enumerate(manual_ids):
+            try:
+                normalized_id = validate_file_id(
+                    entry_id,
+                    label=f"manual_worldbook_ids[{index}]",
+                )
+            except (TypeError, ValueError) as exc:
+                _shape_error(f"manual_worldbook_ids[{index}]", f"无效：{exc}")
+            if normalized_id in seen_manual_ids:
+                _shape_error("manual_worldbook_ids", "不能包含重复 ID")
+            seen_manual_ids.add(normalized_id)
+
+    policy = session.get("roleplay_policy")
+    if isinstance(policy, dict) and "strict_muted_writeback" in policy:
+        if not isinstance(policy["strict_muted_writeback"], bool):
+            _shape_error("roleplay_policy.strict_muted_writeback", "必须是布尔值")
+
+    states = session.get("characters_state")
+    if isinstance(states, dict):
+        for character_id, state in states.items():
+            field = f"characters_state.{character_id}"
+            if not isinstance(state, dict):
+                _shape_error(field, "必须是对象")
+            if "remaining_silent_turns" in state:
+                turns = state["remaining_silent_turns"]
+                if (
+                    isinstance(turns, bool)
+                    or not isinstance(turns, int)
+                    or not 0 <= turns <= 999
+                ):
+                    _shape_error(
+                        f"{field}.remaining_silent_turns",
+                        "必须是 0 到 999 的整数",
+                    )
+
+    edges = session.get("relationship_edges")
+    if isinstance(edges, list):
+        for index, edge in enumerate(edges):
+            if not isinstance(edge, dict):
+                _shape_error(f"relationship_edges[{index}]", "必须是对象")
+
+    summaries = session.get("summaries")
+    if isinstance(summaries, list):
+        seen_summary_ids: set[str] = set()
+        for index, summary in enumerate(summaries):
+            field = f"summaries[{index}]"
+            if not isinstance(summary, dict):
+                _shape_error(field, "必须是对象")
+            if "id" in summary:
+                summary_id = _valid_uuid(summary["id"])
+                if summary_id is None:
+                    _shape_error(f"{field}.id", "必须是 UUID")
+                if summary_id in seen_summary_ids:
+                    _shape_error("summaries.id", "不能重复")
+            else:
+                salt = 0
+                summary_id = _legacy_summary_uuid(
+                    project,
+                    save_id,
+                    index,
+                    summary,
+                    salt=salt,
+                )
+                while summary_id in seen_summary_ids:
+                    salt += 1
+                    summary_id = _legacy_summary_uuid(
+                        project,
+                        save_id,
+                        index,
+                        summary,
+                        salt=salt,
+                    )
+            seen_summary_ids.add(summary_id)
+            if "source_snapshot_id" in summary:
+                source_id = summary["source_snapshot_id"]
+                if source_id is not None and (
+                    not isinstance(source_id, str) or not source_id
+                ):
+                    _shape_error(
+                        f"{field}.source_snapshot_id",
+                        "必须是非空字符串或 null",
+                    )
+            if "status" in summary and summary["status"] not in {
+                "pending",
+                "completed",
+                "failed",
+            }:
+                _shape_error(f"{field}.status", "取值无效")
+            for text_field in ("text", "time"):
+                if text_field in summary and not isinstance(summary[text_field], str):
+                    _shape_error(f"{field}.{text_field}", "必须是字符串")
+            for list_field in ("facts", "relations"):
+                if list_field in summary and not isinstance(summary[list_field], list):
+                    _shape_error(f"{field}.{list_field}", "必须是数组")
+                if list_field in summary:
+                    for item_index, item in enumerate(summary[list_field]):
+                        if not isinstance(item, str):
+                            _shape_error(
+                                f"{field}.{list_field}[{item_index}]",
+                                "必须是字符串",
+                            )
+            if "error" in summary and not (
+                summary["error"] is None or isinstance(summary["error"], str)
+            ):
+                _shape_error(f"{field}.error", "必须是字符串或 null")
+            if "content_status" in summary and summary["content_status"] not in {
+                "valid",
+                "empty",
+            }:
+                _shape_error(f"{field}.content_status", "取值无效")
+            if "generation_attempt" in summary:
+                attempt = summary["generation_attempt"]
+                if (
+                    isinstance(attempt, bool)
+                    or not isinstance(attempt, int)
+                    or attempt < 0
+                ):
+                    _shape_error(
+                        f"{field}.generation_attempt",
+                        "必须是非负整数",
+                    )
+            if "kind" in summary and (
+                not isinstance(summary["kind"], str) or not summary["kind"]
+            ):
+                _shape_error(f"{field}.kind", "必须是非空字符串")
+            if summary.get("kind") == "memory_note":
+                character_id = summary.get("character_id")
+                if character_id is not None and (
+                    not isinstance(character_id, str)
+                    or character_id not in session.get("characters_state", {})
+                ):
+                    _shape_error(
+                        f"{field}.character_id",
+                        "必须为空或引用当前存档角色",
+                    )
+
+    history = session.get("message_history")
+    if isinstance(history, list):
+        seen_message_ids: set[str] = set()
+        for index, message in enumerate(history):
+            field = f"message_history[{index}]"
+            if not isinstance(message, dict):
+                _shape_error(field, "必须是对象")
+            if message.get("role") not in {"user", "assistant"}:
+                _shape_error(f"{field}.role", "必须是 user 或 assistant")
+            if not isinstance(message.get("content"), str):
+                _shape_error(f"{field}.content", "必须是字符串")
+            if "thinking" in message and not isinstance(message["thinking"], str):
+                _shape_error(f"{field}.thinking", "必须是字符串")
+            for boolean_field in ("pinned", "in_prompt"):
+                if boolean_field in message and not isinstance(
+                    message[boolean_field], bool
+                ):
+                    _shape_error(f"{field}.{boolean_field}", "必须是布尔值")
+            if "presentation" in message and not (
+                message["presentation"] is None
+                or isinstance(message["presentation"], dict)
+            ):
+                _shape_error(f"{field}.presentation", "必须是对象或 null")
+            for object_field in (
+                "context_diagnostics",
+                "generation_telemetry",
+            ):
+                if object_field in message and not isinstance(
+                    message[object_field], dict
+                ):
+                    _shape_error(f"{field}.{object_field}", "必须是对象")
+            for temporary_field in (
+                "regeneration_source_snapshot",
+                "regeneration_original_assistant",
+            ):
+                if temporary_field in message and not isinstance(
+                    message[temporary_field], dict
+                ):
+                    _shape_error(f"{field}.{temporary_field}", "必须是对象")
+            if "regeneration_original_state" in message:
+                _validate_reply_state_snapshot(
+                    message["regeneration_original_state"],
+                    f"{field}.regeneration_original_state",
+                )
+            active_variant_id = None
+            if "reply_variant_id" in message:
+                active_variant_id = _valid_uuid(message["reply_variant_id"])
+                if active_variant_id is None:
+                    _shape_error(f"{field}.reply_variant_id", "必须是 UUID")
+            if "reply_variant_state" in message:
+                _validate_reply_state_snapshot(
+                    message["reply_variant_state"],
+                    f"{field}.reply_variant_state",
+                )
+            if "reply_alternatives" in message:
+                alternatives = message["reply_alternatives"]
+                if message.get("role") != "assistant":
+                    _shape_error(f"{field}.reply_alternatives", "只允许 assistant")
+                if not isinstance(alternatives, list):
+                    _shape_error(f"{field}.reply_alternatives", "必须是数组")
+                if len(alternatives) > MAX_REPLY_ALTERNATIVES:
+                    _shape_error(f"{field}.reply_alternatives", "数量超过上限")
+                if active_variant_id is None or "reply_variant_state" not in message:
+                    _shape_error(field, "备选回复缺少当前变体状态")
+                seen_variant_ids = {active_variant_id}
+                for alternative_index, alternative in enumerate(alternatives):
+                    alternative_id = _validate_reply_variant(
+                        alternative,
+                        f"{field}.reply_alternatives[{alternative_index}]",
+                    )
+                    if alternative_id in seen_variant_ids:
+                        _shape_error(
+                            f"{field}.reply_alternatives.id",
+                            "不能重复",
+                        )
+                    seen_variant_ids.add(alternative_id)
+            if "id" in message:
+                message_id = _valid_uuid(message["id"])
+                if message_id is None:
+                    _shape_error(f"{field}.id", "必须是 UUID")
+                if message_id in seen_message_ids:
+                    _shape_error("message_history.id", "不能重复")
+                seen_message_ids.add(message_id)
+            else:
+                legacy_id = _legacy_message_uuid(
+                    project,
+                    save_id,
+                    index,
+                    message,
+                )
+                if legacy_id not in seen_message_ids:
+                    seen_message_ids.add(legacy_id)
+
+
 def normalize_session(session: dict, project: str, save_id: str) -> dict:
     """只改内存副本；为旧存档补 revision、默认字段和稳定消息 UUID。"""
     session["project"] = project
@@ -164,10 +534,19 @@ def normalize_session(session: dict, project: str, save_id: str) -> dict:
     raw_scene_meta = session.get("scene_meta")
     scene_meta = dict(raw_scene_meta) if isinstance(raw_scene_meta, dict) else {}
     for field in (
-        "location", "time", "weather", "main_quest", "current_scene", "next_goal",
+        "location",
+        "time",
+        "weather",
+        "main_quest",
+        "current_scene",
+        "next_goal",
     ):
         scene_meta.setdefault(field, "")
     session["scene_meta"] = scene_meta
+    current_provider = session.get("current_provider", "ollama")
+    if not isinstance(current_provider, str) or not current_provider.strip():
+        current_provider = "ollama"
+    session["current_provider"] = current_provider.strip().casefold()
     if not isinstance(session.get("current_model"), str):
         session["current_model"] = ""
     manual_worldbook_ids = session.get("manual_worldbook_ids", [])
@@ -240,7 +619,11 @@ def normalize_session(session: dict, project: str, save_id: str) -> dict:
             raw_summary["source_snapshot_id"] = None
         status = raw_summary.get("status")
         if status not in {"pending", "completed", "failed"}:
-            status = "failed" if raw_summary.get("failed") or raw_summary.get("error") else "completed"
+            status = (
+                "failed"
+                if raw_summary.get("failed") or raw_summary.get("error")
+                else "completed"
+            )
             raw_summary["status"] = status
         raw_summary.setdefault("text", "")
         raw_summary.setdefault("time", "")
@@ -249,7 +632,9 @@ def normalize_session(session: dict, project: str, save_id: str) -> dict:
         raw_summary.setdefault("error", None)
         if raw_summary.get("content_status") not in {"valid", "empty"}:
             raw_summary["content_status"] = (
-                "valid" if isinstance(raw_summary.get("text"), str) and raw_summary.get("text") else "empty"
+                "valid"
+                if isinstance(raw_summary.get("text"), str) and raw_summary.get("text")
+                else "empty"
             )
         attempt = raw_summary.get("generation_attempt", 0)
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
@@ -363,7 +748,7 @@ class SessionStore:
         )
         if deleted:
             raise FileNotFoundError(f"项目 {project} 已移入回收区")
-        return project_dir
+        raise FileNotFoundError(f"项目 {project} 不存在")
 
     def _history_paths_sync(self, project: str, save_id: str) -> list[Path]:
         history_dir = self.history_dir(project)
@@ -391,11 +776,7 @@ class SessionStore:
         selected_history_paths = (
             list(history_paths)
             if history_paths is not None
-            else (
-                self._history_paths_sync(project, save_id)
-                if include_history
-                else []
-            )
+            else (self._history_paths_sync(project, save_id) if include_history else [])
         )
         return self.recovery_store.create_session_entry(
             category=category,
@@ -463,6 +844,17 @@ class SessionStore:
                 entity_id=save_id,
                 reason="JSON 顶层必须是对象",
             )
+        try:
+            _validate_session_shape(data, project, save_id)
+        except _SessionShapeError as exc:
+            raise DataCorruptionError.from_bytes(
+                path,
+                payload,
+                entity_type="session",
+                project=project,
+                entity_id=save_id,
+                reason=f"Session 结构无效：{exc}",
+            ) from exc
         normalized = normalize_session(data, project, save_id)
         self._refresh_summary_source_status_sync(normalized, project, save_id)
         return normalized
@@ -489,9 +881,7 @@ class SessionStore:
                 summary["source_status"] = "invalid"
                 continue
             summary["source_status"] = (
-                "available"
-                if (history_dir / filename).is_file()
-                else "missing"
+                "available" if (history_dir / filename).is_file() else "missing"
             )
 
     def read_sync(self, project: str, save_id: str) -> dict | None:
@@ -516,30 +906,36 @@ class SessionStore:
                 data = self._read_sync(project, path.stem)
                 if data is None:
                     continue
-                sessions.append({
-                    "session_id": data.get("session_id", path.stem),
-                    "name": data.get("name", path.stem),
-                    "revision": data.get("revision", 0),
-                    "updated_at": data.get("updated_at", ""),
-                    "created_at": data.get("created_at", ""),
-                    "message_count": len(data.get("message_history", [])),
-                    "current_model": data.get("current_model", ""),
-                    "status": "ready",
-                })
+                sessions.append(
+                    {
+                        "session_id": data.get("session_id", path.stem),
+                        "name": data.get("name", path.stem),
+                        "revision": data.get("revision", 0),
+                        "updated_at": data.get("updated_at", ""),
+                        "created_at": data.get("created_at", ""),
+                        "message_count": len(data.get("message_history", [])),
+                        "current_provider": data.get("current_provider", "ollama"),
+                        "current_model": data.get("current_model", ""),
+                        "status": "ready",
+                    }
+                )
             except DataCorruptionError as exc:
-                sessions.append({
-                    "session_id": path.stem,
-                    "name": path.stem,
-                    "revision": None,
-                    "updated_at": "",
-                    "created_at": "",
-                    "message_count": None,
-                    "current_model": "",
-                    "status": "corrupt",
-                    "error_code": exc.code,
-                    "fingerprint": exc.fingerprint,
-                    "quarantine_available": True,
-                })
+                sessions.append(
+                    {
+                        "session_id": path.stem,
+                        "name": path.stem,
+                        "revision": None,
+                        "updated_at": "",
+                        "created_at": "",
+                        "message_count": None,
+                        "current_provider": "ollama",
+                        "current_model": "",
+                        "status": "corrupt",
+                        "error_code": exc.code,
+                        "fingerprint": exc.fingerprint,
+                        "quarantine_available": True,
+                    }
+                )
         sessions.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
         return sessions
 
@@ -593,7 +989,9 @@ class SessionStore:
             raise ValueError("expected_revision 必须是非负整数")
         current_revision = _coerce_revision(current.get("revision", 0))
         if expected_revision != current_revision:
-            raise RevisionConflict(expected_revision, current_revision, deepcopy(current))
+            raise RevisionConflict(
+                expected_revision, current_revision, deepcopy(current)
+            )
 
     async def create(self, project: str, save_id: str, session: dict) -> dict:
         project_lock = await self.project_lock(project)
@@ -601,6 +999,7 @@ class SessionStore:
             save_lock = await self.save_lock(project, save_id)
             async with save_lock:
                 assert_write_allowed(project, save_id)
+
                 def create_sync() -> dict:
                     self._require_project_sync(project)
                     if self.session_path(project, save_id).exists():
@@ -611,7 +1010,10 @@ class SessionStore:
                     self._write_session_sync(created, project, save_id)
                     return created
 
-                return await asyncio.to_thread(_run_with_library_shared, create_sync)
+                return await run_sync_critical(
+                    _run_with_library_shared_write,
+                    create_sync,
+                )
 
     async def accept_chat_turn(
         self,
@@ -645,22 +1047,43 @@ class SessionStore:
                     self._check_revision(expected_revision, current)
                     active_turns.register(project, save_id, turn_id)
                     try:
-                        working = deepcopy(current)
+                        # 项目创建流程会预先落下 revision=0 的空默认存档。
+                        # _prepare_turn 会基于角色卡和用户卡初始化同 revision 的
+                        # initial_session；若这里仍一律采用磁盘空壳，accepted 回调
+                        # 就会把已初始化角色状态整体覆盖掉。只允许在磁盘会话尚无
+                        # 角色且尚无消息时采用这份同 revision、无历史的初始化基线，
+                        # 并继续在当前 save lock 内原子登记 pending user。
+                        initial = normalize_session(
+                            deepcopy(initial_session),
+                            project,
+                            save_id,
+                        )
+                        use_initialized_baseline = (
+                            not current.get("characters_state")
+                            and not current.get("message_history")
+                            and not initial.get("message_history")
+                            and initial.get("revision") == current.get("revision")
+                        )
+                        working = deepcopy(
+                            initial if use_initialized_baseline else current
+                        )
                         message_id = str(uuid4())
-                        working.setdefault("message_history", []).append({
-                            "id": message_id,
-                            "role": "user",
-                            "content": user_input,
-                            "turn_id": turn_id,
-                            "status": "pending",
-                            "error": None,
-                            "timestamps": {
-                                "created_at": created_at,
-                                "completed_at": None,
-                            },
-                            "pinned": False,
-                            "in_prompt": True,
-                        })
+                        working.setdefault("message_history", []).append(
+                            {
+                                "id": message_id,
+                                "role": "user",
+                                "content": user_input,
+                                "turn_id": turn_id,
+                                "status": "pending",
+                                "error": None,
+                                "timestamps": {
+                                    "created_at": created_at,
+                                    "completed_at": None,
+                                },
+                                "pinned": False,
+                                "in_prompt": True,
+                            }
+                        )
                         working = normalize_session(working, project, save_id)
                         working["revision"] = current["revision"] + 1
                         working["updated_at"] = datetime.now().isoformat()
@@ -673,7 +1096,10 @@ class SessionStore:
                         value=message_id,
                     )
 
-                return await asyncio.to_thread(_run_with_library_shared, accept_sync)
+                return await run_sync_critical(
+                    _run_with_library_shared_write,
+                    accept_sync,
+                )
 
     async def accept_regenerated_chat_turn(
         self,
@@ -745,7 +1171,10 @@ class SessionStore:
                         value=plan.source_message_id,
                     )
 
-                return await asyncio.to_thread(_run_with_library_shared, accept_sync)
+                return await run_sync_critical(
+                    _run_with_library_shared_write,
+                    accept_sync,
+                )
 
     async def mutate(
         self,
@@ -759,6 +1188,7 @@ class SessionStore:
         lock = await self.save_lock(project, save_id)
         async with lock:
             assert_write_allowed(project, save_id)
+
             def mutate_sync() -> MutationResult[T]:
                 self._require_project_sync(project)
                 current = self._read_sync(project, save_id)
@@ -788,7 +1218,10 @@ class SessionStore:
                     ),
                 )
 
-            return await asyncio.to_thread(_run_with_library_shared, mutate_sync)
+            return await run_sync_critical(
+                _run_with_library_shared_write,
+                mutate_sync,
+            )
 
     async def snapshot(
         self,
@@ -800,6 +1233,7 @@ class SessionStore:
         lock = await self.save_lock(project, save_id)
         async with lock:
             assert_write_allowed(project, save_id)
+
             def snapshot_sync() -> tuple[dict, Path]:
                 current = self._read_sync(project, save_id)
                 if current is None:
@@ -812,7 +1246,10 @@ class SessionStore:
                     current,
                 )
 
-            return await asyncio.to_thread(_run_with_library_shared, snapshot_sync)
+            return await run_sync_critical(
+                _run_with_library_shared_write,
+                snapshot_sync,
+            )
 
     async def delete(
         self,
@@ -827,13 +1264,16 @@ class SessionStore:
             save_lock = await self.save_lock(project, save_id)
             async with save_lock:
                 assert_write_allowed(project, save_id)
+
                 def delete_sync() -> SessionRecoveryResult | None:
                     current = self._read_sync(project, save_id)
                     if current is None:
                         return None
                     self._check_revision(expected_revision, current)
                     saves_dir = self.saves_dir(project)
-                    count = len(list(saves_dir.glob("*.json"))) if saves_dir.exists() else 0
+                    count = (
+                        len(list(saves_dir.glob("*.json"))) if saves_dir.exists() else 0
+                    )
                     if count <= minimum_remaining:
                         raise ValueError("至少保留 1 个存档")
                     history_paths = self._history_paths_sync(project, save_id)
@@ -864,7 +1304,10 @@ class SessionStore:
                         manifest["recovery_id"],
                     )
 
-                return await asyncio.to_thread(_run_with_library_shared, delete_sync)
+                return await run_sync_critical(
+                    _run_with_library_shared_write,
+                    delete_sync,
+                )
 
     async def rename(
         self,
@@ -879,6 +1322,7 @@ class SessionStore:
             async with self._save_lock_group(project, [old_id, new_id]):
                 assert_write_allowed(project, old_id)
                 assert_write_allowed(project, new_id)
+
                 def rename_sync() -> dict:
                     current = self._read_sync(project, old_id)
                     if current is None:
@@ -893,7 +1337,7 @@ class SessionStore:
                         for source in history_paths:
                             target = resolve_under(
                                 history_dir,
-                                new_id + source.name[len(old_id):],
+                                new_id + source.name[len(old_id) :],
                             )
                             if target.exists():
                                 raise FileExistsError(
@@ -930,7 +1374,7 @@ class SessionStore:
                             for source in history_paths:
                                 target = resolve_under(
                                     history_dir,
-                                    new_id + source.name[len(old_id):],
+                                    new_id + source.name[len(old_id) :],
                                 )
                                 source.rename(target)
                                 moved.append((source, target))
@@ -946,7 +1390,10 @@ class SessionStore:
                         recovery["recovery_id"],
                     )
 
-                return await asyncio.to_thread(_run_with_library_shared, rename_sync)
+                return await run_sync_critical(
+                    _run_with_library_shared_write,
+                    rename_sync,
+                )
 
     async def list_recoveries(
         self,
@@ -971,8 +1418,8 @@ class SessionStore:
         lock = await self.save_lock(project, save_id)
         async with lock:
             assert_write_allowed(project, save_id)
-            return await asyncio.to_thread(
-                _run_with_library_shared,
+            return await run_sync_critical(
+                _run_with_library_shared_write,
                 self.recovery_store.quarantine_session,
                 project=project,
                 save_id=save_id,
@@ -1019,6 +1466,7 @@ class SessionStore:
             ):
                 assert_write_allowed(project, save_id)
                 assert_write_allowed(project, active_save_id)
+
                 def restore_sync() -> dict:
                     verified = self.recovery_store.get_verified(recovery_id)
                     current_manifest = verified.manifest
@@ -1043,7 +1491,9 @@ class SessionStore:
                     primary_target = self.recovery_store.target_path(primary_relpath)
                     expected_target = self.session_path(project, save_id)
                     if primary_target != expected_target:
-                        raise RecoveryIntegrityError("恢复项主路径与 session 归属不一致")
+                        raise RecoveryIntegrityError(
+                            "恢复项主路径与 session 归属不一致"
+                        )
 
                     primary_item = next(
                         (
@@ -1062,7 +1512,9 @@ class SessionStore:
                     try:
                         restored = json.loads(payload_path.read_text(encoding="utf-8"))
                     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                        raise RecoveryIntegrityError("恢复项主 payload 无法解析") from exc
+                        raise RecoveryIntegrityError(
+                            "恢复项主 payload 无法解析"
+                        ) from exc
                     if not isinstance(restored, dict):
                         raise RecoveryIntegrityError("恢复项主 payload 顶层必须是对象")
                     restored = normalize_session(restored, project, save_id)
@@ -1085,7 +1537,9 @@ class SessionStore:
                                 output_path.unlink(missing_ok=True)
                             self.recovery_store.restore_non_primary_items(
                                 undo_verified,
-                                primary_relpath=undo_verified.manifest["source_relpath"],
+                                primary_relpath=undo_verified.manifest[
+                                    "source_relpath"
+                                ],
                             )
                             self.recovery_store.restore_primary_exact(undo_verified)
                         current_verified = self.recovery_store.get_verified(recovery_id)
@@ -1121,7 +1575,9 @@ class SessionStore:
                         if (
                             not isinstance(result_sha256, str)
                             or len(result_sha256) != 64
-                            or any(char not in "0123456789abcdef" for char in result_sha256)
+                            or any(
+                                char not in "0123456789abcdef" for char in result_sha256
+                            )
                             or isinstance(result_revision, bool)
                             or not isinstance(result_revision, int)
                             or not isinstance(result_updated_at, str)
@@ -1144,10 +1600,15 @@ class SessionStore:
                         ):
                             raise RecoveryIntegrityError("恢复 journal 字段无效")
 
-                        if output_path.is_file() and sha256_file(output_path) == result_sha256:
-                            pending, _ = self.recovery_store.preflight_non_primary_items(
-                                verified,
-                                primary_relpath=primary_relpath,
+                        if (
+                            output_path.is_file()
+                            and sha256_file(output_path) == result_sha256
+                        ):
+                            pending, _ = (
+                                self.recovery_store.preflight_non_primary_items(
+                                    verified,
+                                    primary_relpath=primary_relpath,
+                                )
                             )
                             created_targets = [target for _item, target in pending]
                             self.recovery_store.restore_non_primary_items(
@@ -1237,7 +1698,9 @@ class SessionStore:
                                     code="rename_target_missing",
                                 )
                             if expected_revision is None:
-                                raise ValueError("恢复 rename checkpoint 必须提供 expected_revision")
+                                raise ValueError(
+                                    "恢复 rename checkpoint 必须提供 expected_revision"
+                                )
                             self._check_revision(expected_revision, active_current)
                             current = active_current
                         else:
@@ -1304,9 +1767,7 @@ class SessionStore:
                             result_text.encode("utf-8")
                         ).hexdigest()
                         pre_restore_sha256 = (
-                            sha256_file(active_path)
-                            if current is not None
-                            else None
+                            sha256_file(active_path) if current is not None else None
                         )
                         verified = self.recovery_store.begin_restore(
                             verified,
@@ -1346,4 +1807,7 @@ class SessionStore:
                         raise commit_exc
                     return response(restored, undo_recovery_id)
 
-                return await asyncio.to_thread(_run_with_library_shared, restore_sync)
+                return await run_sync_critical(
+                    _run_with_library_shared_write,
+                    restore_sync,
+                )

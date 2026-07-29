@@ -1,4 +1,5 @@
 """提示词编辑路由。"""
+
 import asyncio
 
 from fastapi import APIRouter, HTTPException, Request
@@ -14,9 +15,13 @@ from routes.common import _json_object
 router = APIRouter()
 
 
+def _read_all_prompts() -> dict[str, str]:
+    return {name: read_prompt(name) for name in VALID_NAMES}
+
+
 @router.get("/api/prompts")
 async def api_get_prompts():
-    return {name: read_prompt(name) for name in VALID_NAMES}
+    return await asyncio.to_thread(_read_all_prompts)
 
 
 @router.put("/api/prompts/{name}")

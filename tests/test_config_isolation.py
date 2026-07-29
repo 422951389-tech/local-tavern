@@ -1,4 +1,5 @@
 import hashlib
+import os
 
 import pytest
 
@@ -18,7 +19,7 @@ def test_all_mutable_paths_use_the_pytest_sandbox(isolated_paths):
     assert config.PID_PATH == isolated_paths["pid"]
     assert config.STOP_REQUEST_PATH == isolated_paths["stop_request"]
     assert config.HOST == "127.0.0.1"
-    assert config.PORT == 8765
+    assert config.PORT == int(os.environ["TAVERN_PORT"])
     assert config.ALLOW_REMOTE is False
     assert config.LOG_MAX_BYTES == 5 * 1024 * 1024
     assert config.LOG_BACKUP_COUNT == 5

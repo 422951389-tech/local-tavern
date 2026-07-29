@@ -1,4 +1,4 @@
-export function createTurnPayload({ ref, revision, model, params, userInput }) {
+export function createTurnPayload({ ref, revision, provider, model, params, userInput }) {
     if (!ref || typeof ref.project !== 'string' || typeof ref.save !== 'string') {
         throw new TypeError('回合请求缺少 SessionRef');
     }
@@ -9,6 +9,7 @@ export function createTurnPayload({ ref, revision, model, params, userInput }) {
         model: model || null,
         ...(params || {}),
     };
+    if (provider) payload.provider = String(provider);
     if (userInput !== undefined) payload.user_input = String(userInput);
     return payload;
 }

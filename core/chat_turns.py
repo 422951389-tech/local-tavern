@@ -4,12 +4,13 @@
 元数据；进程异常退出后可从日志识别终态，未终结 turn 会标记为
 ``server_restarted``，不会静默恢复生成。
 """
+
 from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 from pathlib import Path
@@ -18,20 +19,30 @@ from typing import Awaitable, Callable
 from uuid import UUID, uuid4
 
 from core import active_turns
-from core.config import DATA_DIR
+from core.async_utils import await_critical, run_sync_critical
+from core.config import (
+    DATA_DIR,
+    TURN_EVENT_LOG_MAX_BYTES,
+    TURN_EVENT_MAX_BYTES,
+    TURN_RETENTION_COUNT,
+    TURN_RETENTION_DAYS,
+    TURN_TERMINAL_EVENT_RESERVE_BYTES,
+)
 from core.library_lock import library_lock
 from core.session_store import MutationResult, atomic_write
 
 
 ACTIVE_STATUSES = frozenset({"pending", "streaming"})
 TERMINAL_STATUSES = frozenset({"completed", "cancelled", "failed"})
-MAX_EVENT_LOG_BYTES = 128 * 1024 * 1024
-MAX_EVENT_BYTES = 16 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
 class TurnNotFound(FileNotFoundError):
     pass
+
+
+class TurnEventLogLimitExceeded(RuntimeError):
+    """单个 turn 的追加事件将超过持久化安全边界。"""
 
 
 def _now() -> str:
@@ -40,21 +51,12 @@ def _now() -> str:
 
 async def _await_critical(awaitable):
     """等待不可取消的异步临界区；外层取消不留下半提交。"""
-    task = asyncio.create_task(awaitable)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        return await task
+    return await await_critical(awaitable, propagate_cancellation=False)
 
 
 async def _run_sync_critical(callback, *args, **kwargs):
     """同步磁盘动作在线程中收口后再传播取消。"""
-    task = asyncio.create_task(asyncio.to_thread(callback, *args, **kwargs))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await task
-        raise
+    return await run_sync_critical(callback, *args, **kwargs)
 
 
 def _validate_turn_id(turn_id: str) -> str:
@@ -70,9 +72,7 @@ def _validate_turn_id(turn_id: str) -> str:
 
 def _public_turn(turn: dict) -> dict:
     result = {
-        key: deepcopy(value)
-        for key, value in turn.items()
-        if key not in {"events"}
+        key: deepcopy(value) for key, value in turn.items() if key not in {"events"}
     }
     result["events_url"] = f"/api/chat/turns/{turn['turn_id']}/events"
     result["cancel_url"] = f"/api/chat/turns/{turn['turn_id']}/cancel"
@@ -96,25 +96,30 @@ class TurnStore:
     def _write_json(path: Path, payload: dict) -> None:
         atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
+    @staticmethod
+    def _payload_size(payload: dict) -> int:
+        return len(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+
     def create(self, payload: dict) -> dict:
         turn_id = _validate_turn_id(payload["turn_id"])
         turn_kind = payload.get("turn_kind", "chat")
         if turn_kind not in {"chat", "regenerate"}:
             raise ValueError("无效 turn_kind")
         turn_dir = self._turn_dir(turn_id)
-        with library_lock.shared():
+        with library_lock.shared_write():
             turn_dir.mkdir(parents=True, exist_ok=False)
             meta = deepcopy(payload)
             meta["turn_kind"] = turn_kind
             meta["last_event_id"] = 0
             meta["event_count"] = 0
+            meta["event_log_bytes"] = 0
             self._write_json(turn_dir / "meta.json", meta)
             (turn_dir / "events").mkdir()
         return meta
 
     def abort_unaccepted(self, turn_id: str) -> None:
         turn_dir = self._turn_dir(turn_id)
-        with library_lock.shared():
+        with library_lock.shared_write():
             if turn_dir.is_dir():
                 shutil.rmtree(turn_dir)
 
@@ -131,7 +136,7 @@ class TurnStore:
                 raise ValueError("turn 事件文件序号不连续")
             size = path.stat().st_size
             total_size += size
-            if size > MAX_EVENT_BYTES or total_size > MAX_EVENT_LOG_BYTES:
+            if size > TURN_EVENT_MAX_BYTES or total_size > TURN_EVENT_LOG_MAX_BYTES:
                 raise ValueError("turn 事件日志超过安全上限")
             try:
                 event = json.loads(path.read_text(encoding="utf-8"))
@@ -161,7 +166,7 @@ class TurnStore:
                     raise ValueError("turn 事件文件序号不连续")
                 size = path.stat().st_size
                 total_size += size
-                if size > MAX_EVENT_BYTES or total_size > MAX_EVENT_LOG_BYTES:
+                if size > TURN_EVENT_MAX_BYTES or total_size > TURN_EVENT_LOG_MAX_BYTES:
                     raise ValueError("turn 事件日志超过安全上限")
                 try:
                     event = json.loads(path.read_text(encoding="utf-8"))
@@ -191,9 +196,12 @@ class TurnStore:
         meta.setdefault("turn_kind", "chat")
         if meta["turn_kind"] not in {"chat", "regenerate"}:
             raise ValueError("turn 元数据类型无效")
+        # Provider 抽象引入前的持久 turn 均由 Ollama 执行。
+        meta.setdefault("provider", "ollama")
         events = self._read_events(turn_id)
         meta["last_event_id"] = events[-1]["id"] if events else 0
         meta["event_count"] = len(events)
+        meta["event_log_bytes"] = sum(self._payload_size(event) for event in events)
         meta["content"] = "".join(
             str(event.get("content", ""))
             for event in events
@@ -213,8 +221,10 @@ class TurnStore:
         return meta
 
     def update(self, turn: dict) -> dict:
-        payload = {key: deepcopy(value) for key, value in turn.items() if key != "events"}
-        with library_lock.shared():
+        payload = {
+            key: deepcopy(value) for key, value in turn.items() if key != "events"
+        }
+        with library_lock.shared_write():
             self._write_json(self._meta_path(turn["turn_id"]), payload)
         return payload
 
@@ -224,10 +234,30 @@ class TurnStore:
         stored = deepcopy(event)
         stored["id"] = int(turn.get("last_event_id", 0)) + 1
         stored.setdefault("created_at", _now())
+        event_bytes = self._payload_size(stored)
+        if event_bytes > TURN_EVENT_MAX_BYTES:
+            raise TurnEventLogLimitExceeded("turn 单事件超过安全上限")
+        current_bytes = turn.get("event_log_bytes", 0)
+        if (
+            isinstance(current_bytes, bool)
+            or not isinstance(current_bytes, int)
+            or current_bytes < 0
+        ):
+            raise ValueError("turn 事件日志字节计数损坏")
+        total_bytes = current_bytes + event_bytes
+        is_terminal = stored.get("type") == "terminal"
+        write_limit = (
+            TURN_EVENT_LOG_MAX_BYTES
+            if is_terminal
+            else (TURN_EVENT_LOG_MAX_BYTES - TURN_TERMINAL_EVENT_RESERVE_BYTES)
+        )
+        if total_bytes > write_limit:
+            raise TurnEventLogLimitExceeded("turn 事件日志超过安全上限")
         updated = deepcopy(turn)
         updated.pop("events", None)
         updated["last_event_id"] = stored["id"]
         updated["event_count"] = int(updated.get("event_count", 0)) + 1
+        updated["event_log_bytes"] = total_bytes
         updated["updated_at"] = stored["created_at"]
         if stored.get("type") == "terminal":
             status = stored.get("status")
@@ -240,7 +270,7 @@ class TurnStore:
             updated["status"] = "streaming"
             updated["started_at"] = stored["created_at"]
 
-        with library_lock.shared():
+        with library_lock.shared_write():
             path = self._events_dir(turn["turn_id"]) / f"{stored['id']:012d}.json"
             self._write_json(path, stored)
             self._write_json(self._meta_path(turn["turn_id"]), updated)
@@ -259,6 +289,74 @@ class TurnStore:
                 except ValueError:
                     continue
             return sorted(result)
+
+    @staticmethod
+    def _retention_timestamp(meta: dict, path: Path) -> datetime:
+        for key in ("completed_at", "updated_at", "created_at"):
+            raw = meta.get(key)
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            try:
+                value = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if value.tzinfo is None:
+                value = value.astimezone()
+            return value
+        return datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+
+    def prepare_recovery(
+        self,
+        *,
+        retention_days: int = TURN_RETENTION_DAYS,
+        retention_count: int = TURN_RETENTION_COUNT,
+    ) -> tuple[list[str], int]:
+        """返回需完整恢复的 turn，并清理越界的已终结日志。
+
+        启动扫描只读取每个 turn 的 meta.json。只有活动态、未知态或元数据
+        损坏的目录才会在恢复阶段读取完整事件流，避免历史完成记录导致启动
+        时间随事件总量线性膨胀。
+        """
+
+        if retention_days < 1 or retention_count < 1:
+            raise ValueError("turn 保留策略必须为正整数")
+        with library_lock.shared_write():
+            if not self.root.is_dir():
+                return [], 0
+            recovery_ids: list[str] = []
+            terminal: list[tuple[datetime, str, Path]] = []
+            for path in self.root.iterdir():
+                if not path.is_dir():
+                    continue
+                try:
+                    turn_id = _validate_turn_id(path.name)
+                except ValueError:
+                    continue
+                meta_path = path / "meta.json"
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    recovery_ids.append(turn_id)
+                    continue
+                if not isinstance(meta, dict) or meta.get("turn_id") != turn_id:
+                    recovery_ids.append(turn_id)
+                    continue
+                if meta.get("status") in TERMINAL_STATUSES:
+                    terminal.append(
+                        (self._retention_timestamp(meta, path), turn_id, path)
+                    )
+                else:
+                    recovery_ids.append(turn_id)
+
+            terminal.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            cutoff = datetime.now().astimezone() - timedelta(days=retention_days)
+            removed = 0
+            for index, (timestamp, _turn_id, path) in enumerate(terminal):
+                if index < retention_count and timestamp >= cutoff:
+                    continue
+                shutil.rmtree(path)
+                removed += 1
+            return sorted(recovery_ids), removed
 
 
 class TurnRuntime:
@@ -354,8 +452,7 @@ class TurnCoordinator:
             for message in matched
         )
         has_completed_assistant = any(
-            message.get("role") == "assistant"
-            and message.get("status") == "completed"
+            message.get("role") == "assistant" and message.get("status") == "completed"
             for message in matched
         )
         if not (has_completed_user and has_completed_assistant):
@@ -404,14 +501,16 @@ class TurnCoordinator:
             turn = await _run_sync_critical(self.store.load, turn_id)
             if turn.get("status") != "completed":
                 completed_at = _now()
-                turn.update({
-                    "status": "completed",
-                    "error": None,
-                    "completed_at": completed_at,
-                    "updated_at": completed_at,
-                    "session_revision": session_revision,
-                    "session_committed_revision": session_revision,
-                })
+                turn.update(
+                    {
+                        "status": "completed",
+                        "error": None,
+                        "completed_at": completed_at,
+                        "updated_at": completed_at,
+                        "session_revision": session_revision,
+                        "session_committed_revision": session_revision,
+                    }
+                )
                 turn = await _run_sync_critical(self.store.update, turn)
             self._records[turn_id] = deepcopy(turn)
         active_turns.unregister(turn["project"], turn["save"], turn_id)
@@ -419,6 +518,7 @@ class TurnCoordinator:
         return turn
 
     async def _recover_session(self, turn: dict, error: dict) -> int | None:
+        from core.message_commands import restore_regeneration_original
         from core.session_manager import aload_session, append_history, mutate_session
         from core.session_store import RevisionConflict
 
@@ -456,6 +556,14 @@ class TurnCoordinator:
                         metadata={**metadata, "in_prompt": True},
                     )
                 else:
+                    had_regeneration_snapshot = isinstance(
+                        user_message.get("regeneration_source_snapshot"),
+                        dict,
+                    )
+                    if turn.get("turn_kind") == "regenerate":
+                        restore_regeneration_original(current, user_message)
+                    if had_regeneration_snapshot:
+                        return
                     user_message.update({**metadata, "in_prompt": True})
 
                 content = turn.get("content", "")
@@ -499,7 +607,9 @@ class TurnCoordinator:
             if self._recovered:
                 return 0
             recovered = 0
-            turn_ids = await _run_sync_critical(self.store.list_turn_ids)
+            turn_ids, pruned = await _run_sync_critical(self.store.prepare_recovery)
+            if pruned:
+                logger.info("已清理 %s 个过期终态 turn 日志", pruned)
             for turn_id in turn_ids:
                 try:
                     turn = await _run_sync_critical(self.store.load, turn_id)
@@ -517,9 +627,13 @@ class TurnCoordinator:
                         "code": "server_restarted",
                         "message": "服务进程在 turn 完成前重启",
                     }
-                    revision = await _await_critical(
-                        self._recover_session(turn, error)
-                    )
+                    # 同进程的新事件循环也会触发恢复（测试、嵌入式运行时重建）。
+                    # 若旧协调器留下的是同一个 turn 的活动登记，恢复写入仍属于该
+                    # turn；带上写入上下文即可放行自身，同时继续拒绝其他活动 turn。
+                    with active_turns.turn_write_context(turn_id):
+                        revision = await _await_critical(
+                            self._recover_session(turn, error)
+                        )
                     updates = {}
                     if revision is not None:
                         updates["session_revision"] = revision
@@ -531,7 +645,9 @@ class TurnCoordinator:
                     )
                     recovered += 1
                 except Exception:
-                    logger.exception("恢复中断 turn %s 失败，继续检查其他 turn", turn_id)
+                    logger.exception(
+                        "恢复中断 turn %s 失败，继续检查其他 turn", turn_id
+                    )
             self._recovered = True
             return recovered
 
@@ -555,6 +671,7 @@ class TurnCoordinator:
         accept_command: TurnAcceptor | None = None,
         prompt_diagnostics: dict | None = None,
         turn_kind: str = "chat",
+        provider: str = "ollama",
     ) -> dict:
         if turn_kind not in {"chat", "regenerate"}:
             raise ValueError("无效 turn_kind")
@@ -568,6 +685,7 @@ class TurnCoordinator:
             "expected_revision": expected_revision,
             "user_input": user_input,
             "turn_kind": turn_kind,
+            "provider": provider,
             "model": model,
             "parameters": deepcopy(parameters),
             "status": "pending",
@@ -635,16 +753,20 @@ class TurnCoordinator:
             if committed_revision is None:
                 committed_revision = await self._completed_session_revision(turn)
             if committed_revision is not None:
-                await asyncio.shield(self._complete_authoritative_turn(
-                    turn_id,
-                    committed_revision,
-                ))
+                await asyncio.shield(
+                    self._complete_authoritative_turn(
+                        turn_id,
+                        committed_revision,
+                    )
+                )
             else:
-                await asyncio.shield(runtime.terminal(
-                    "cancelled",
-                    error={"code": "cancelled", "message": "turn 已取消"},
-                ))
-        except Exception as exc:
+                await asyncio.shield(
+                    runtime.terminal(
+                        "cancelled",
+                        error={"code": "cancelled", "message": "turn 已取消"},
+                    )
+                )
+        except Exception:
             committed_revision = runtime.session_committed_revision
             if committed_revision is None:
                 committed_revision = await self._completed_session_revision(turn)
@@ -655,9 +777,13 @@ class TurnCoordinator:
                 )
                 await self._complete_authoritative_turn(turn_id, committed_revision)
             else:
+                logger.exception("turn %s 工作器发生未分类异常", turn_id)
                 await runtime.terminal(
                     "failed",
-                    error={"code": "internal_error", "message": str(exc)},
+                    error={
+                        "code": "internal_error",
+                        "message": "turn 执行失败，请重试",
+                    },
                 )
         finally:
             final = await _run_sync_critical(self.store.load, turn_id)
@@ -825,11 +951,7 @@ class TurnCoordinator:
         return _public_turn(final)
 
     async def shutdown(self) -> None:
-        turn_ids = [
-            turn_id
-            for turn_id, task in self._tasks.items()
-            if not task.done()
-        ]
+        turn_ids = [turn_id for turn_id, task in self._tasks.items() if not task.done()]
         if turn_ids:
             await asyncio.gather(
                 *(self.cancel(turn_id) for turn_id in turn_ids),

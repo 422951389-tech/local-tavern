@@ -314,11 +314,13 @@ test('Modal 圈闭 Tab/Shift+Tab，并在替换后恢复最初触发点', async 
     assert.equal(documentRef.activeElement, elements.confirmButton, '首位 Shift+Tab 应回到末尾控件');
 
     const replacementInput = documentRef.createElement('textarea');
+    elements.body.scrollTop = 240;
     assert.equal(controller.show({
         title: '替换后的对话框',
         body: replacementInput,
         footer: { onConfirm: async () => true },
     }), true);
+    assert.equal(elements.body.scrollTop, 0, '替换 Modal 必须从内容顶部开始，不能继承上一个弹窗滚动位置');
     assert.equal(documentRef.activeElement, replacementInput);
     assert.equal(controller.hide(), true);
     assert.equal(documentRef.activeElement, launcher, '替换对话框关闭后应恢复最初触发点');

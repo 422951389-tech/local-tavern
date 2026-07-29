@@ -1,12 +1,16 @@
 """server.py 与路由模块共享的依赖与工具函数。"""
+import asyncio
 import json
+import logging
 from typing import Annotated, Optional
 from uuid import UUID
 
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, field_validator
 
-from core.ollama_client import get_client
+from core.model_provider import ProviderError
+from core.provider_registry import get_provider_registry
+from core.secret_store import SecretStoreError
 from core.character_loader import (
     list_characters,
     load_user_profile,
@@ -27,11 +31,14 @@ from core.path_policy import (
 # 单一事实源：DEFAULT_SAVE 从 config 导入，session_manager 中的同名常量 _SESSION_DEFAULT_SAVE 仅作内部用
 del _SESSION_DEFAULT_SAVE
 
+logger = logging.getLogger(__name__)
+
 ExpectedRevision = Annotated[StrictInt, Field(ge=0)]
 
 
 class ChatRequest(BaseModel):
     user_input: str
+    provider: Optional[str] = None
     model: Optional[str] = None
     project: str = "默认项目"
     save: str = DEFAULT_SAVE
@@ -45,6 +52,7 @@ class ChatRequest(BaseModel):
 
 class RegenerateRequest(BaseModel):
     message_id: StrictStr
+    provider: Optional[str] = None
     model: Optional[str] = None
     project: str = "默认项目"
     save: str = DEFAULT_SAVE
@@ -203,8 +211,17 @@ def _id_from_display_name(name: str, *, label: str) -> str:
         raise HTTPException(400, str(exc)) from exc
 
 
-async def _initialize_session_from_profiles(session: dict, project: str):
-    user_profile = load_user_profile(project)
+async def _initialize_session_from_profiles(
+    session: dict,
+    project: str,
+    *,
+    requested_provider: str | None = None,
+    requested_model: str | None = None,
+):
+    user_profile, characters = await asyncio.gather(
+        asyncio.to_thread(load_user_profile, project),
+        asyncio.to_thread(list_characters, project),
+    )
     if user_profile.get("scene_meta"):
         session["scene_meta"].update(user_profile["scene_meta"])
     if user_profile.get("status"):
@@ -214,7 +231,7 @@ async def _initialize_session_from_profiles(session: dict, project: str):
     if user_profile.get("identity"):
         session["user_status"]["identity"] = user_profile["identity"]
 
-    for c in list_characters(project):
+    for c in characters:
         if c.get("active", True):
             stats = c.get("initial_stats", {})
             stats = stats if isinstance(stats, dict) else {}
@@ -228,8 +245,18 @@ async def _initialize_session_from_profiles(session: dict, project: str):
                 "dialogue": "",
             }
 
-    if not session.get("current_model"):
-        models = await get_client().list_models()
+    if not session.get("current_model") and not requested_model:
+        provider_id = requested_provider or session.get("current_provider", "ollama")
+        try:
+            registry = get_provider_registry()
+            models = await registry.list_models(provider_id)
+        except (ProviderError, SecretStoreError) as exc:
+            logger.warning(
+                "初始化存档模型失败 provider=%s code=%s",
+                provider_id,
+                getattr(exc, "code", "provider_unavailable"),
+            )
+            models = []
         if models:
             for m in models:
                 if "opus" in m.lower() or "35b" in m.lower():

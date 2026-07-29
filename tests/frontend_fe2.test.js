@@ -501,7 +501,31 @@ test('消息保存先重渲染再失败时按 message_id 交给恢复钩子保�
     assert.equal(recovered[0].error.message, 'revision conflict');
 });
 
-test('消息 Ctrl+Enter 与紧随其后的 blur 共用一次提交，成功后才退出编辑', async () => {
+test('结构化消息编辑使用原始文本，取消后完整恢复原模块 DOM', async () => {
+    const { enterMessageEditor } = await loadModule('message-editor');
+    const fixture = messageFixture();
+    fixture.content.textContent = '剧情推进角色回应';
+    const storyModule = fixture.documentRef.createElement('section');
+    storyModule.className = 'story-module';
+    fixture.content.appendChild(storyModule);
+    const raw = '📍 山门 | ⏱️ 清晨\n🎭 守门人 | 💝 55%';
+    const editor = enterMessageEditor({
+        documentRef: fixture.documentRef,
+        messageElement: fixture.messageElement,
+        messageRef: { message_id: '11111111-1111-4111-8111-111111111111' },
+        initialValue: raw,
+        save: async () => true,
+    });
+
+    assert.equal(editor.textarea.value, raw);
+    assert.equal(editor.cancel(), true);
+    assert.equal(fixture.content.isConnected, true);
+    assert.equal(fixture.content.textContent, '剧情推进角色回应');
+    assert.equal(fixture.content.children[0], storyModule);
+    assert.equal(storyModule.isConnected, true);
+});
+
+test('消息编辑离开输入框不保存，显式保存按钮成功后才退出编辑', async () => {
     const { enterMessageEditor } = await loadModule('message-editor');
     const fixture = messageFixture();
     const gate = deferred();
@@ -517,11 +541,17 @@ test('消息 Ctrl+Enter 与紧随其后的 blur 共用一次提交，成功后�
         },
     });
     editor.textarea.value = '只写一次的新文本';
-    const keydown = editor.textarea.dispatch('keydown', { key: 'Enter', ctrlKey: true });
     editor.textarea.dispatch('blur');
     await Promise.resolve();
 
-    assert.equal(keydown.defaultPrevented, true);
+    assert.equal(writes.length, 0);
+    assert.equal(editor.state(), 'editing');
+    assert.equal(editor.hint.textContent, 'Ctrl+Enter 保存 · Esc 取消；离开输入框不会自动保存');
+    assert.equal(editor.saveButton.isConnected, true);
+    assert.equal(editor.cancelButton.isConnected, true);
+
+    editor.saveButton.dispatch('click');
+    await Promise.resolve();
     assert.equal(writes.length, 1);
     assert.equal(editor.state(), 'saving');
     assert.equal(editor.textarea.disabled, true);
@@ -538,11 +568,39 @@ test('消息 Ctrl+Enter 与紧随其后的 blur 共用一次提交，成功后�
     assert.equal(editor.textarea.isConnected, false);
 });
 
+test('消息编辑输入法组合期间 Ctrl+Enter 不提交，组合结束后快捷键只提交一次', async () => {
+    const { enterMessageEditor } = await loadModule('message-editor');
+    const fixture = messageFixture();
+    const writes = [];
+    const editor = enterMessageEditor({
+        documentRef: fixture.documentRef,
+        messageElement: fixture.messageElement,
+        messageRef: { messageId: 'message-ime' },
+        save: async (_ref, text) => { writes.push(text); },
+    });
+    editor.textarea.value = '输入法文本';
+
+    const composing = editor.textarea.dispatch('keydown', {
+        key: 'Enter', ctrlKey: true, isComposing: true, keyCode: 229,
+    });
+    await flushTasks();
+    assert.equal(composing.defaultPrevented, false);
+    assert.deepEqual(writes, []);
+    assert.equal(editor.state(), 'editing');
+
+    const committed = editor.textarea.dispatch('keydown', { key: 'Enter', ctrlKey: true });
+    await flushTasks();
+    assert.equal(committed.defaultPrevented, true);
+    assert.deepEqual(writes, ['输入法文本']);
+    assert.equal(editor.state(), 'finished');
+});
+
 test('Chat payload 固定 SessionRef/revision，活动回合可写入、恢复和清除', async () => {
     const { createTurnPayload, createTurnPersistence } = await loadModule('chat');
     assert.deepEqual(createTurnPayload({
         ref: { project: '项目 A', save: '存档 A', epoch: 9 },
         revision: 12,
+        provider: 'anthropic',
         model: 'local-model',
         params: { temperature: 0.4, max_tokens: 800 },
         userInput: '继续故事',
@@ -550,6 +608,7 @@ test('Chat payload 固定 SessionRef/revision，活动回合可写入、恢复�
         project: '项目 A',
         save: '存档 A',
         expected_revision: 12,
+        provider: 'anthropic',
         model: 'local-model',
         temperature: 0.4,
         max_tokens: 800,

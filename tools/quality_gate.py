@@ -1,4 +1,5 @@
 """本地酒馆的可重现质量门编排器。"""
+
 from __future__ import annotations
 
 import argparse
@@ -14,6 +15,8 @@ from typing import Callable, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
+COVERAGE_FAIL_UNDER = 85
+GATE_EXECUTION_ERROR_RETURN_CODE = 127
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -38,7 +41,9 @@ class StepResult:
 
 
 class GateFailure(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str = "gate_configuration_error"):
+        super().__init__(message)
+        self.code = code
 
 
 class RealDataGuard:
@@ -65,7 +70,10 @@ class RealDataGuard:
 
     def verify(self) -> dict[str, dict[str, object]]:
         if not self.before:
-            raise GateFailure("真实数据清单尚未捕获")
+            raise GateFailure(
+                "真实数据清单尚未捕获",
+                code="real_data_guard_not_captured",
+            )
         after = {path: file_manifest(path) for path in self.paths}
         changes: dict[str, dict[str, list[str]]] = {}
         for path in self.paths:
@@ -77,22 +85,21 @@ class RealDataGuard:
                     "changed": changed,
                 }
         if changes:
-            raise GateFailure(f"质量门改动了真实数据：{json.dumps(changes, ensure_ascii=False)}")
+            raise GateFailure(
+                f"质量门改动了真实数据：{json.dumps(changes, ensure_ascii=False)}",
+                code="real_data_guard_changed",
+            )
         return self.summary(after)
 
 
 def javascript_files(root: Path) -> list[Path]:
     web_root = root / "web"
     files = [
-            path
-            for path in web_root.rglob("*")
-            if path.is_file() and path.suffix.casefold() in {".js", ".mjs"}
-    ]
-    files.extend(
         path
-        for path in (root / "tests").glob("*.mjs")
-        if path.is_file()
-    )
+        for path in web_root.rglob("*")
+        if path.is_file() and path.suffix.casefold() in {".js", ".mjs"}
+    ]
+    files.extend(path for path in (root / "tests").glob("*.mjs") if path.is_file())
     return sorted(
         files,
         key=lambda item: item.as_posix(),
@@ -110,7 +117,14 @@ def relative_arguments(root: Path, paths: Sequence[Path]) -> tuple[str, ...]:
     return tuple(path.relative_to(root).as_posix() for path in paths)
 
 
-def build_steps(mode: str, root: Path, python: str, node: str, npm: str | None) -> list[GateStep]:
+def build_steps(
+    mode: str,
+    root: Path,
+    python: str,
+    node: str,
+    npm: str | None,
+    desktop_python: str | None = None,
+) -> list[GateStep]:
     if mode not in {"preflight", "release"}:
         raise ValueError(f"未知质量门模式：{mode}")
     js_files = relative_arguments(root, javascript_files(root))
@@ -121,6 +135,8 @@ def build_steps(mode: str, root: Path, python: str, node: str, npm: str | None) 
         raise GateFailure("tests 目录中没有 Node 测试")
     if mode == "release" and npm is None:
         raise GateFailure("发布质量门需要 npm")
+    if mode == "release" and desktop_python is None:
+        raise GateFailure("发布质量门需要桌面构建 Python")
 
     node_lock_arguments = (
         ("--semantic-only",)
@@ -134,7 +150,11 @@ def build_steps(mode: str, root: Path, python: str, node: str, npm: str | None) 
             (
                 python,
                 "tools/dependency_locks.py",
-                *(('--semantic-only',) if mode == "preflight" else ('--environment', 'dev')),
+                *(
+                    ("--semantic-only",)
+                    if mode == "preflight"
+                    else ("--environment", "dev")
+                ),
             ),
         ),
         GateStep(
@@ -145,32 +165,137 @@ def build_steps(mode: str, root: Path, python: str, node: str, npm: str | None) 
                 *node_lock_arguments,
             ),
         ),
-        GateStep("pip-check", (python, "-m", "pip", "check")),
     ]
     if mode == "release":
+        steps.extend(
+            [
+                GateStep(
+                    "desktop-environment",
+                    (
+                        desktop_python,
+                        "tools/dependency_locks.py",
+                        "--environment",
+                        "desktop",
+                    ),
+                ),
+                GateStep(
+                    "desktop-pip-check",
+                    (desktop_python, "-m", "pip", "check"),
+                ),
+            ]
+        )
+    steps.append(GateStep("pip-check", (python, "-m", "pip", "check")))
+    if mode == "release":
         steps.append(GateStep("ruff", (python, "-m", "ruff", "check", ".")))
-    steps.append(GateStep(
-        "python-compile",
-        (
-            python, "-m", "compileall", "-q",
-            "core", "routes", "tests", "tools", "server.py", "verify_regression.py",
-        ),
-    ))
+    steps.append(
+        GateStep(
+            "python-compile",
+            (
+                python,
+                "-m",
+                "compileall",
+                "-q",
+                "core",
+                "desktop",
+                "routes",
+                "tests",
+                "tools",
+                "server.py",
+                "verify_regression.py",
+            ),
+        )
+    )
     steps.extend(
         GateStep(f"javascript-syntax:{filename}", (node, "--check", filename))
         for filename in js_files
     )
     if mode == "release":
-        steps.extend([
-            GateStep("coverage-erase", (python, "-m", "coverage", "erase")),
-            GateStep("python-tests-coverage", (python, "-m", "coverage", "run", "--branch", "-m", "pytest", "-q")),
-            GateStep("coverage-report", (python, "-m", "coverage", "report")),
-        ])
+        steps.extend(
+            [
+                GateStep("coverage-erase", (python, "-m", "coverage", "erase")),
+                GateStep(
+                    "python-tests-coverage",
+                    (python, "-m", "coverage", "run", "--branch", "-m", "pytest", "-q"),
+                ),
+                GateStep(
+                    "coverage-report",
+                    (
+                        python,
+                        "-m",
+                        "coverage",
+                        "report",
+                        f"--fail-under={COVERAGE_FAIL_UNDER}",
+                    ),
+                ),
+                GateStep(
+                    "backend-performance-budget",
+                    (
+                        python,
+                        "tools/performance_budget.py",
+                        "probe-backend",
+                        "--repeat",
+                        "3",
+                    ),
+                ),
+            ]
+        )
     else:
         steps.append(GateStep("python-tests", (python, "-m", "pytest", "-q")))
     steps.append(GateStep("node-tests", (node, "--test", *node_tests)))
     if mode == "release":
-        steps.append(GateStep("browser-e2e-axe", (node, "tests/browser_e2e.mjs")))
+        steps.extend(
+            [
+                GateStep("browser-e2e-axe", (node, "tests/browser_e2e.mjs")),
+                GateStep(
+                    "browser-performance-budget",
+                    (
+                        python,
+                        "tools/performance_budget.py",
+                        "check",
+                        "--input",
+                        "artifacts/browser-performance.json",
+                        "--scope",
+                        "browser",
+                    ),
+                ),
+            ]
+        )
+        steps.extend(
+            [
+                GateStep(
+                    "desktop-build",
+                    (desktop_python, "tools/build_desktop.py", "--clean"),
+                ),
+                GateStep(
+                    "desktop-smoke",
+                    (
+                        python,
+                        "tools/desktop_smoke.py",
+                        "--executable",
+                        "release/LocalTavern/LocalTavern.exe",
+                        "--timeout",
+                        "120",
+                        "--hold-ms",
+                        "5000",
+                    ),
+                ),
+                GateStep(
+                    "desktop-journey",
+                    (
+                        python,
+                        "tools/desktop_journey_smoke.py",
+                        "--executable",
+                        "release/LocalTavern/LocalTavern.exe",
+                        "--artifacts-dir",
+                        "artifacts/desktop-journey",
+                        "--timeout",
+                        "150",
+                        "--hold-ms",
+                        "3000",
+                    ),
+                ),
+            ]
+        )
     steps.append(GateStep("diff-check", ("git", "diff", "--check")))
     return steps
 
@@ -187,25 +312,31 @@ class GateRunner:
         self.executor = executor
         self.environment = dict(os.environ if environment is None else environment)
 
-    def run(self, steps: Sequence[GateStep], *, keep_going: bool = False) -> list[StepResult]:
+    def run(
+        self, steps: Sequence[GateStep], *, keep_going: bool = False
+    ) -> list[StepResult]:
         results: list[StepResult] = []
         for index, step in enumerate(steps, start=1):
             print(f"[gate {index}/{len(steps)}] {step.name}", flush=True)
             started = time.monotonic()
-            completed = self.executor(
-                list(step.command),
-                cwd=self.root,
-                env=self.environment,
-                text=True,
-            )
+            try:
+                completed = self.executor(
+                    list(step.command),
+                    cwd=self.root,
+                    env=self.environment,
+                    text=True,
+                )
+                returncode = completed.returncode
+            except OSError:
+                returncode = GATE_EXECUTION_ERROR_RETURN_CODE
             result = StepResult(
                 name=step.name,
                 command=step.command,
-                returncode=completed.returncode,
+                returncode=returncode,
                 duration_seconds=round(time.monotonic() - started, 3),
             )
             results.append(result)
-            if completed.returncode != 0 and not keep_going:
+            if returncode != 0 and not keep_going:
                 break
         return results
 
@@ -223,12 +354,18 @@ def _executable(value: str, label: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="执行本地酒馆质量门")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--preflight", action="store_true", help="运行无新增依赖的离线预检")
+    mode.add_argument(
+        "--preflight", action="store_true", help="运行无新增依赖的离线预检"
+    )
     mode.add_argument("--release", action="store_true", help="运行完整发布质量门")
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--node", default="node")
     parser.add_argument("--npm", default="npm")
+    parser.add_argument(
+        "--desktop-python",
+        default=str(ROOT / ".venv-desktop" / "Scripts" / "python.exe"),
+    )
     parser.add_argument("--keep-going", action="store_true")
     args = parser.parse_args(argv)
 
@@ -238,45 +375,90 @@ def main(argv: list[str] | None = None) -> int:
     try:
         python = _executable(args.python, "Python")
         node = _executable(args.node, "Node.js")
-        npm = _executable(args.npm, "npm") if selected_mode == "release" else shutil.which(args.npm)
-        steps = build_steps(selected_mode, root, python, node, npm)
+        npm = (
+            _executable(args.npm, "npm")
+            if selected_mode == "release"
+            else shutil.which(args.npm)
+        )
+        desktop_python = (
+            _executable(args.desktop_python, "桌面构建 Python")
+            if selected_mode == "release"
+            else None
+        )
+        steps = build_steps(
+            selected_mode,
+            root,
+            python,
+            node,
+            npm,
+            desktop_python,
+        )
         before = guard.capture()
         environment = dict(os.environ)
-        environment.update({
-            "PYTHONUTF8": "1",
-            "TAVERN_TEST_PYTHON": python,
-        })
+        environment.update(
+            {
+                "PYTHONUTF8": "1",
+                "TAVERN_TEST_PYTHON": python,
+                **(
+                    {
+                        "TAVERN_E2E_PERFORMANCE_OUTPUT": str(
+                            root / "artifacts" / "browser-performance.json"
+                        )
+                    }
+                    if selected_mode == "release"
+                    else {}
+                ),
+            }
+        )
         results = GateRunner(root, environment=environment).run(
             steps,
             keep_going=args.keep_going,
         )
         after = guard.verify()
     except GateFailure as error:
-        print(json.dumps({
-            "status": "failed",
-            "mode": selected_mode,
-            "release_ready": False,
-            "error": str(error),
-        }, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "mode": selected_mode,
+                    "release_ready": False,
+                    "error_code": error.code,
+                    "error": str(error),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 1
 
-    passed = len(results) == len(steps) and all(result.returncode == 0 for result in results)
-    print(json.dumps({
-        "status": "passed" if passed else "failed",
-        "mode": selected_mode,
-        "release_ready": passed and selected_mode == "release",
-        "release_only_checks_skipped": selected_mode == "preflight",
-        "real_data_before": before,
-        "real_data_after": after,
-        "steps": [
+    passed = len(results) == len(steps) and all(
+        result.returncode == 0 for result in results
+    )
+    failed_step = next((result for result in results if result.returncode != 0), None)
+    print(
+        json.dumps(
             {
-                "name": result.name,
-                "returncode": result.returncode,
-                "duration_seconds": result.duration_seconds,
-            }
-            for result in results
-        ],
-    }, ensure_ascii=False, indent=2))
+                "status": "passed" if passed else "failed",
+                "mode": selected_mode,
+                "release_ready": passed and selected_mode == "release",
+                "error_code": None if passed else "gate_step_failed",
+                "failed_step": None if failed_step is None else failed_step.name,
+                "release_only_checks_skipped": selected_mode == "preflight",
+                "real_data_before": before,
+                "real_data_after": after,
+                "steps": [
+                    {
+                        "name": result.name,
+                        "returncode": result.returncode,
+                        "duration_seconds": result.duration_seconds,
+                    }
+                    for result in results
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0 if passed else 1
 
 

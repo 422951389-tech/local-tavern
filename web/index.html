@@ -3,171 +3,265 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>本地酒馆</title>
-    <link rel="stylesheet" href="/static/style.css?v=rel1-20260722">
+    <meta name="color-scheme" content="dark">
+    <title>本地酒馆 · 叙事工作台</title>
+    <link rel="stylesheet" href="/static/style.css?v=workspace-20260728-h2">
+    <link rel="stylesheet" href="/static/styles/workspace.css?v=workspace-20260729-split1">
+    <link rel="stylesheet" href="/static/styles/backup.css?v=workspace-20260729-split1">
+    <link rel="stylesheet" href="/static/styles/diagnostics.css?v=workspace-20260729-split1">
+    <link rel="stylesheet" href="/static/styles/memory.css?v=workspace-20260729-split1">
+    <link rel="stylesheet" href="/static/styles/onboarding.css?v=workspace-20260729-split1">
 </head>
 <body>
-    <!-- 顶栏 v3：世界观做主标题，下属 4 tab -->
-    <header id="topbar" aria-label="项目与对话工具">
-        <!-- 左：项目（世界观） -->
-        <div class="topbar-group project-group">
-            <button id="project-btn" class="project-btn" type="button" title="切换项目（世界观）"
-                aria-label="切换项目（世界观）" aria-haspopup="listbox"
-                aria-controls="project-list" aria-expanded="false">
-                <span class="ico" aria-hidden="true">📁</span>
-                <span id="project-name">加载中…</span>
-                <span class="caret" aria-hidden="true">▾</span>
-            </button>
-            <span id="project-stats" class="project-stats"></span>
-        </div>
+    <a class="skip-link" href="#chat-stream">跳到叙事正文</a>
 
-        <!-- 中：5 个 tab（角色 / 关系 / 世界书 / 用户 / 存档） -->
-        <div class="topbar-group tabs-group" role="toolbar" aria-label="世界观编辑工具">
-            <button class="tab-btn" data-tab="chars" id="tab-chars" type="button"
-                title="角色卡（当前世界观的演员）" aria-label="编辑角色卡"
-                aria-haspopup="dialog" aria-controls="modal">
-                <span class="ico" aria-hidden="true">👥</span><span class="lbl">角色</span>
-            </button>
-            <button class="tab-btn" data-tab="relations" id="tab-relations" type="button"
-                title="角色关系（当前存档的人工关系记录）" aria-label="编辑角色关系"
-                aria-haspopup="dialog" aria-controls="modal">
-                <svg class="ico relation-tab-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                    <circle cx="6" cy="7" r="2.5"></circle>
-                    <circle cx="18" cy="7" r="2.5"></circle>
-                    <circle cx="12" cy="18" r="2.5"></circle>
-                    <path d="M8.4 7h6.2M7.5 9.2l3.2 6.2M16.5 9.2l-3.2 6.2"></path>
-                </svg><span class="lbl">关系</span>
-            </button>
-            <button class="tab-btn" data-tab="world" id="tab-world" type="button"
-                title="世界书（当前世界观的设定）" aria-label="编辑世界书"
-                aria-haspopup="dialog" aria-controls="modal">
-                <span class="ico" aria-hidden="true">📖</span><span class="lbl">世界书</span>
-            </button>
-            <button class="tab-btn" data-tab="user" id="tab-user" type="button"
-                title="用户档案（当前世界的观众设定）" aria-label="编辑用户档案"
-                aria-haspopup="dialog" aria-controls="modal">
-                <span class="ico" aria-hidden="true">👤</span><span class="lbl">用户</span>
-            </button>
-            <div class="tab-btn tab-save-wrap" id="tab-save-wrap">
-                <button class="tab-btn save-tab" data-tab="saves" id="tab-saves" type="button"
-                    title="存档（当前世界观下的演出录像）" aria-label="切换存档"
-                    aria-haspopup="listbox" aria-controls="save-list" aria-expanded="false">
-                    <span class="ico" aria-hidden="true">💾</span><span class="lbl">存档</span>
-                    <span class="badge" id="save-count">0</span>
-                    <span class="caret" aria-hidden="true">▾</span>
-                </button>
+    <div id="workspace-shell" class="workspace-shell">
+        <aside id="left-nav" class="left-nav" aria-label="叙事工作台导航">
+            <div class="brand-lockup">
+                <span class="brand-mark" data-icon="sparkles" aria-hidden="true"></span>
+                <span class="brand-copy"><strong>本地酒馆</strong><small>叙事工作台</small></span>
             </div>
-        </div>
 
-        <!-- 右：模型 + 工具 -->
-        <div class="topbar-group tools-group">
-            <select id="model-select" title="切换模型" aria-label="对话模型">
-                <option value="">加载中…</option>
-            </select>
-            <button id="reset-btn" class="icon-btn" type="button" title="重置当前存档内容"
-                aria-label="重置当前存档内容"><span aria-hidden="true">↺</span></button>
-            <button id="model-params-btn" class="icon-btn" type="button" title="调 AI 参数"
-                aria-label="调整 AI 参数" aria-haspopup="dialog" aria-controls="modal"><span aria-hidden="true">🎛</span></button>
-            <button id="history-btn" class="icon-btn" type="button" title="查看历史快照"
-                aria-label="查看历史快照" aria-haspopup="dialog" aria-controls="modal"><span aria-hidden="true">🕐</span></button>
-            <button id="search-btn" class="icon-btn" type="button" title="全局剧情搜索"
-                aria-label="全局剧情搜索" aria-haspopup="dialog" aria-controls="modal"><span aria-hidden="true">🔎</span></button>
-            <button id="prompts-btn" class="icon-btn" type="button" title="编辑提示词"
-                aria-label="编辑提示词" aria-haspopup="dialog" aria-controls="modal"><span aria-hidden="true">📝</span></button>
-        </div>
+            <div class="nav-context">
+                <span class="nav-eyebrow">当前世界</span>
+                <button id="project-btn" class="project-btn" type="button" title="切换项目（世界观）"
+                    aria-label="切换项目（世界观）" aria-haspopup="listbox"
+                    aria-controls="project-list" aria-expanded="false">
+                    <span class="ico" data-icon="folder" aria-hidden="true"></span>
+                    <span id="project-name">加载中…</span>
+                    <span class="caret" data-icon="chevronDown" aria-hidden="true"></span>
+                </button>
+                <span id="project-stats" class="project-stats"></span>
+            </div>
 
-    </header>
+            <nav class="primary-nav" aria-label="世界观编辑工具">
+                <span class="nav-eyebrow">世界构成</span>
+                <div class="tabs-group" role="toolbar" aria-label="世界观编辑工具">
+                    <div id="nav-more-menu" class="nav-more-menu" role="group" aria-label="更多世界观工具">
+                        <button class="tab-btn" data-tab="chars" id="tab-chars" type="button"
+                            title="角色卡（当前世界观的演员）" aria-label="编辑角色卡"
+                            aria-haspopup="dialog" aria-controls="modal">
+                            <span class="ico" data-icon="users" aria-hidden="true"></span><span class="lbl">角色</span>
+                        </button>
+                        <button class="tab-btn" data-tab="relations" id="tab-relations" type="button"
+                            title="角色关系（当前存档的人工关系记录）" aria-label="编辑角色关系"
+                            aria-haspopup="dialog" aria-controls="modal">
+                            <span class="ico relation-tab-icon" data-icon="network" aria-hidden="true"></span><span class="lbl">关系</span>
+                        </button>
+                        <button class="tab-btn" data-tab="world" id="tab-world" type="button"
+                            title="世界书（当前世界观的设定）" aria-label="编辑世界书"
+                            aria-haspopup="dialog" aria-controls="modal">
+                            <span class="ico" data-icon="book" aria-hidden="true"></span><span class="lbl">世界书</span>
+                        </button>
+                        <button class="tab-btn" data-tab="user" id="tab-user" type="button"
+                            title="用户档案（当前世界的观众设定）" aria-label="编辑用户档案"
+                            aria-haspopup="dialog" aria-controls="modal">
+                            <span class="ico" data-icon="user" aria-hidden="true"></span><span class="lbl">用户档案</span>
+                        </button>
+                    </div>
+                    <button class="tab-btn save-tab" data-tab="saves" id="tab-saves" type="button"
+                        title="存档（当前世界观下的演出记录）" aria-label="切换存档"
+                        aria-haspopup="listbox" aria-controls="save-list" aria-expanded="false">
+                        <span class="ico" data-icon="archive" aria-hidden="true"></span><span class="lbl">存档</span>
+                        <span class="badge" id="save-count">0</span>
+                        <span class="caret" data-icon="chevronDown" aria-hidden="true"></span>
+                    </button>
+                    <button id="nav-more-btn" class="nav-more-btn" type="button"
+                        aria-label="更多世界观工具" aria-controls="nav-more-menu" aria-expanded="false">
+                        <span data-icon="menu" aria-hidden="true"></span><span>更多</span>
+                    </button>
+                </div>
+            </nav>
 
-    <!-- 项目下拉面板（点击 📁 弹出） -->
-    <div id="project-dropdown" class="dropdown-panel hidden" aria-labelledby="project-btn">
-        <div id="project-list" class="dropdown-list" role="listbox" aria-label="项目列表" tabindex="-1"></div>
-        <div class="dropdown-footer">
-            <button id="project-new-inline" class="dropdown-action" type="button" aria-label="新建项目">➕ 新建项目</button>
-        </div>
-    </div>
+            <div class="nav-footer">
+                <span class="nav-footnote">LOCAL · PRIVATE · OFFLINE FIRST</span>
+            </div>
 
-    <!-- 存档下拉面板（点击 💾 弹出） -->
-    <div id="save-dropdown" class="dropdown-panel hidden" aria-labelledby="tab-saves">
-        <div id="save-list" class="dropdown-list" role="listbox" aria-label="存档列表" tabindex="-1"></div>
-        <div class="dropdown-footer">
-            <button id="save-new-inline" class="dropdown-action" type="button">➕ 新建存档</button>
-            <button id="save-rename-inline" class="dropdown-action" type="button">✎ 重命名</button>
-            <button id="save-delete-inline" class="dropdown-action" type="button">🗑 删除</button>
-            <button id="save-export-inline" class="dropdown-action" type="button">📤 导出</button>
-            <button id="save-import-inline" class="dropdown-action" type="button">📥 导入</button>
-        </div>
-    </div>
+            <div id="project-dropdown" class="dropdown-panel hidden" aria-labelledby="project-btn">
+                <div id="project-list" class="dropdown-list" role="listbox" aria-label="项目列表" tabindex="-1"></div>
+                <div class="dropdown-footer">
+                    <button id="project-new-inline" class="dropdown-action" type="button" aria-label="新建项目">
+                        <span data-icon="plus" aria-hidden="true"></span><span>新建项目</span>
+                    </button>
+                </div>
+            </div>
 
-    <!-- 场景元数据条 -->
-    <div id="scene-meta" class="scene-meta">
-        <div class="scene-row">
-            <span id="meta-location">📍 等待场景初始化…</span>
-        </div>
-        <div class="scene-row sub">
-            <span id="meta-quest"></span>
-            <span id="meta-goal"></span>
-        </div>
-        <div class="scene-row sub">
-            <span id="meta-user"></span>
-        </div>
-    </div>
+            <div id="save-dropdown" class="dropdown-panel hidden" aria-labelledby="tab-saves">
+                <div id="save-list" class="dropdown-list" role="listbox" aria-label="存档列表" tabindex="-1"></div>
+                <div class="dropdown-footer">
+                    <button id="save-new-inline" class="dropdown-action" type="button"><span data-icon="plus" aria-hidden="true"></span><span>新建存档</span></button>
+                    <button id="save-rename-inline" class="dropdown-action" type="button"><span data-icon="edit" aria-hidden="true"></span><span>重命名</span></button>
+                    <button id="save-delete-inline" class="dropdown-action" type="button"><span data-icon="trash" aria-hidden="true"></span><span>删除</span></button>
+                    <button id="save-export-inline" class="dropdown-action" type="button"><span data-icon="download" aria-hidden="true"></span><span>导出</span></button>
+                    <button id="save-import-inline" class="dropdown-action" type="button"><span data-icon="upload" aria-hidden="true"></span><span>导入</span></button>
+                </div>
+            </div>
+        </aside>
 
-    <!-- 主区 -->
-    <main id="main">
-        <!-- 对话流 -->
-        <section id="chat-stream" class="chat-stream" aria-label="对话记录">
-            <div class="welcome" id="welcome">
-                <p>👋 欢迎使用本地酒馆</p>
-                <p>选择一个项目开始冒险，点击右上角「重置」初始化场景</p>
+        <section class="workspace-center" aria-label="叙事阅读与输入">
+            <header id="topbar" aria-label="项目与对话工具">
+                <div class="chapter-heading">
+                    <span class="chapter-kicker">LIVE NARRATIVE</span>
+                    <h1>当前叙事</h1>
+                </div>
+                <div class="topbar-tools" role="toolbar" aria-label="模型与对话工具">
+                    <button id="provider-settings-btn" class="provider-entry" type="button"
+                        aria-label="模型来源设置" aria-haspopup="dialog" aria-controls="modal">
+                        <span data-icon="provider" aria-hidden="true"></span>
+                        <span class="provider-entry-copy"><small>模型来源</small><strong id="provider-name">默认来源</strong></span>
+                    </button>
+                    <label class="model-select-wrap" for="model-select">
+                        <span class="sr-only">对话模型</span>
+                        <select id="model-select" title="切换模型" aria-label="对话模型">
+                            <option value="">加载中…</option>
+                        </select>
+                    </label>
+                    <div id="topbar-more-menu" class="topbar-more-menu" role="group" aria-label="更多对话工具">
+                        <button id="model-params-btn" class="icon-btn" type="button" title="调整 AI 参数"
+                            aria-label="调整 AI 参数" aria-haspopup="dialog" aria-controls="modal"><span data-icon="sliders" aria-hidden="true"></span><span class="topbar-tool-label">AI 参数</span></button>
+                        <button id="history-btn" class="icon-btn" type="button" title="查看历史快照"
+                            aria-label="查看历史快照" aria-haspopup="dialog" aria-controls="modal"><span data-icon="history" aria-hidden="true"></span><span class="topbar-tool-label">历史快照</span></button>
+                        <button id="search-btn" class="icon-btn" type="button" title="全局剧情搜索"
+                            aria-label="全局剧情搜索" aria-haspopup="dialog" aria-controls="modal"><span data-icon="search" aria-hidden="true"></span><span class="topbar-tool-label">剧情搜索</span></button>
+                        <button id="prompts-btn" class="icon-btn" type="button" title="编辑提示词"
+                            aria-label="编辑提示词" aria-haspopup="dialog" aria-controls="modal"><span data-icon="edit" aria-hidden="true"></span><span class="topbar-tool-label">提示词</span></button>
+                        <button id="memory-notes-btn" class="icon-btn" type="button" title="长期记忆便签"
+                            aria-label="长期记忆便签" aria-haspopup="dialog" aria-controls="modal"><span data-icon="brain" aria-hidden="true"></span><span class="topbar-tool-label">长期记忆</span></button>
+                        <button id="backup-center-btn" class="icon-btn" type="button" title="备份中心"
+                            aria-label="备份中心" aria-haspopup="dialog" aria-controls="modal"><span data-icon="archive" aria-hidden="true"></span><span class="topbar-tool-label">备份中心</span></button>
+                        <button id="diagnostics-center-btn" class="icon-btn" type="button" title="诊断中心"
+                            aria-label="诊断中心" aria-haspopup="dialog" aria-controls="modal"><span data-icon="settings" aria-hidden="true"></span><span class="topbar-tool-label">诊断中心</span></button>
+                        <button id="reset-btn" class="icon-btn" type="button" title="重置当前存档内容"
+                            aria-label="重置当前存档内容"><span data-icon="regenerate" aria-hidden="true"></span><span class="topbar-tool-label">重置存档</span></button>
+                    </div>
+                    <button id="inspector-toggle" class="icon-btn inspector-toggle" type="button"
+                        title="收起角色检视器" aria-label="收起角色检视器" aria-controls="character-panel" aria-expanded="true">
+                        <span data-icon="panel" aria-hidden="true"></span>
+                    </button>
+                    <button id="topbar-more-btn" class="topbar-more-btn" type="button"
+                        aria-label="更多对话工具" aria-controls="topbar-more-menu" aria-expanded="false">
+                        <span data-icon="menu" aria-hidden="true"></span><span>更多</span>
+                    </button>
+                </div>
+            </header>
+
+            <details id="scene-meta" class="scene-meta" aria-label="当前剧情提要">
+                <summary class="scene-summary">
+                    <span class="scene-summary-icon" data-icon="book" aria-hidden="true"></span>
+                    <span class="scene-summary-copy">
+                        <span class="scene-summary-item scene-quest">
+                            <span class="scene-label">主线</span>
+                            <strong id="meta-quest">暂无主线</strong>
+                        </span>
+                        <span class="scene-summary-item scene-goal">
+                            <span class="scene-label">下一步</span>
+                            <span id="meta-goal">等待下一步行动</span>
+                        </span>
+                    </span>
+                    <span class="scene-disclosure" aria-hidden="true">
+                        <span>场景详情</span>
+                        <span class="scene-disclosure-icon" data-icon="chevronDown"></span>
+                    </span>
+                </summary>
+                <div class="scene-details">
+                    <div class="scene-detail-item">
+                        <span class="scene-detail-icon" data-icon="mapPin" aria-hidden="true"></span>
+                        <div>
+                            <span class="scene-label">地点与时空</span>
+                            <strong id="meta-location">等待场景初始化…</strong>
+                        </div>
+                    </div>
+                    <div class="scene-detail-item user-context">
+                        <span class="scene-detail-icon" data-icon="user" aria-hidden="true"></span>
+                        <div>
+                            <span class="scene-label">你的状态</span>
+                            <span id="meta-user"></span>
+                        </div>
+                    </div>
+                </div>
+            </details>
+
+            <main id="main">
+                <section id="chat-stream" class="chat-stream" aria-label="对话记录" tabindex="-1">
+                    <div class="welcome" id="welcome">
+                        <span class="welcome-mark" data-icon="sparkles" aria-hidden="true"></span>
+                        <p class="welcome-eyebrow">LOCAL NARRATIVE ENGINE</p>
+                        <h2>故事尚未落笔</h2>
+                        <p>选择一个世界与存档，然后重置当前场景或直接写下你的行动。</p>
+                    </div>
+                </section>
+                <button id="chat-latest-btn" class="chat-latest-btn hidden" type="button" aria-live="polite">
+                    回到最新
+                </button>
+            </main>
+
+            <section id="suggestions" class="suggestions" aria-label="行动建议"></section>
+
+            <footer id="input-bar">
+                <div class="composer-heading">
+                    <span class="composer-context">
+                        <span>你的行动</span>
+                        <strong id="current-session-label" class="current-session-label" aria-live="polite">正在载入存档…</strong>
+                    </span>
+                    <small>Enter 发送 · Shift+Enter 换行</small>
+                </div>
+                <div class="composer-row">
+                    <textarea
+                        id="user-input"
+                        placeholder="描述你的行动、对白或决定…"
+                        aria-label="对话输入"
+                        rows="2"
+                    ></textarea>
+                    <button id="send-btn" class="composer-send" type="button" aria-label="发送消息"><span data-icon="send" aria-hidden="true"></span><span>发送</span></button>
+                    <button id="send-cancel-btn" class="composer-cancel hidden" type="button" title="取消生成" aria-label="取消生成"><span data-icon="stop" aria-hidden="true"></span><span>取消</span></button>
+                </div>
+            </footer>
+            <div id="app-status" class="sr-only" role="status" aria-live="polite"></div>
+
+            <div id="thinking-panel" class="thinking-panel legacy-thinking hidden" role="region" aria-labelledby="thinking-title">
+                <div class="thinking-header">
+                    <span id="thinking-title">AI 思考过程</span>
+                    <button id="thinking-close" type="button" aria-label="收起 AI 思考面板" aria-controls="thinking-panel">收起</button>
+                </div>
+                <div id="thinking-content" class="thinking-content"></div>
             </div>
         </section>
 
-        <!-- 角色状态侧栏 -->
-        <aside id="character-panel" class="character-panel" aria-label="角色状态与禁言">
-            <h3>角色状态与禁言</h3>
+        <button id="inspector-backdrop" class="inspector-backdrop" type="button"
+            aria-label="关闭角色检视器" aria-hidden="true" tabindex="-1"></button>
+        <aside id="character-panel" class="character-panel inspector-panel" aria-label="角色状态与禁言">
+            <div class="inspector-heading">
+                <span class="inspector-kicker">LIVE CAST</span>
+                <h2>角色检视器</h2>
+                <p>当前角色、情绪、关系倾向与禁言状态。</p>
+                <button id="inspector-close" class="inspector-close" type="button" aria-label="关闭角色检视器">
+                    <span data-icon="x" aria-hidden="true"></span>
+                </button>
+            </div>
             <div id="character-list">
-                <p class="empty">无角色数据</p>
+                <p class="empty">暂无角色数据</p>
             </div>
         </aside>
-    </main>
-
-    <!-- 行动建议 -->
-    <div id="suggestions" class="suggestions"></div>
-
-    <!-- 底栏：输入 -->
-    <footer id="input-bar">
-        <textarea
-            id="user-input"
-            placeholder="输入你的行动或对话…(Shift+Enter 换行，Enter 发送)"
-            aria-label="对话输入"
-            rows="2"
-        ></textarea>
-        <button id="send-btn" type="button">发送</button>
-        <button id="send-cancel-btn" class="hidden" type="button" title="取消生成" aria-label="取消生成"><span aria-hidden="true">⏹</span> 取消</button>
-    </footer>
-    <div id="app-status" class="sr-only" role="status" aria-live="polite"></div>
-
-    <!-- Thinking 折叠面板 -->
-    <div id="thinking-panel" class="thinking-panel hidden" role="region" aria-labelledby="thinking-title">
-        <div class="thinking-header">
-            <span id="thinking-title"><span aria-hidden="true">💭</span> AI 思考中…</span>
-            <button id="thinking-close" type="button" aria-label="收起 AI 思考面板" aria-controls="thinking-panel">收起</button>
-        </div>
-        <div id="thinking-content" class="thinking-content"></div>
     </div>
 
-    <script src="/static/security.js?v=phase-a-sec-20260712"></script>
-    <script src="/static/api-client.js?v=fe1-20260715"></script>
-    <script src="/static/session-ref.js?v=fe1-20260715"></script>
-    <script src="/static/turn-client.js?v=fe1-20260715"></script>
-    <script type="module" src="/static/app.mjs?v=rel1-20260722"></script>
+    <section id="init-error" class="init-error hidden" role="alert" aria-live="assertive" aria-hidden="true">
+        <div class="init-error-card">
+            <span class="init-error-kicker">启动未完成</span>
+            <h1>本地酒馆暂未载入</h1>
+            <p id="init-error-message">读取本机数据失败。</p>
+            <p id="init-error-hint" class="init-error-hint"></p>
+            <div class="init-error-actions">
+                <button id="init-retry-btn" type="button">重试载入</button>
+                <button id="init-provider-btn" type="button">打开模型来源</button>
+            </div>
+        </div>
+    </section>
 
-    <!-- 通用 Modal 容器 -->
     <div id="modal-backdrop" class="modal-backdrop hidden" aria-hidden="true">
         <div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-error" tabindex="-1">
             <div class="modal-header">
                 <h2 id="modal-title"></h2>
-                <button id="modal-close" class="modal-close" type="button" aria-label="关闭对话框">×</button>
+                <button id="modal-close" class="modal-close" type="button" aria-label="关闭对话框"><span data-icon="x" aria-hidden="true"></span></button>
             </div>
             <div id="modal-body" class="modal-body"></div>
             <div id="modal-error" class="modal-error hidden" role="alert" aria-live="assertive"></div>
@@ -177,5 +271,12 @@
             </div>
         </div>
     </div>
+
+    <script src="/static/security.js?v=phase-a-sec-20260712"></script>
+    <script src="/static/desktop-transport.js?v=desktop-20260728"></script>
+    <script src="/static/api-client.js?v=fe1-20260715"></script>
+    <script src="/static/session-ref.js?v=fe1-20260715"></script>
+    <script src="/static/turn-client.js?v=fe1-20260715"></script>
+    <script type="module" src="/static/app.mjs?v=workspace-20260728-h2"></script>
 </body>
 </html>

@@ -239,3 +239,62 @@ async def test_external_cleanup_cancellation_still_closes_every_resource(monkeyp
     assert background_closed == [True]
     assert client.closed == 1
     assert released == [{"pid": 1234, "token": "test"}]
+
+
+@pytest.mark.asyncio
+async def test_desktop_lifespan_skips_process_guard_but_keeps_recovery_scheduler_and_cleanup(
+    monkeypatch,
+):
+    coordinator = _Coordinator()
+    client = _Client()
+    scheduler_started = asyncio.Event()
+    scheduler_stopped = asyncio.Event()
+    background_closed: list[bool] = []
+    providers_closed: list[bool] = []
+
+    monkeypatch.setattr(server, "DESKTOP_MODE", True)
+    monkeypatch.setattr(
+        server,
+        "claim_pid_file",
+        lambda: (_ for _ in ()).throw(AssertionError("桌面模式不得登记 PID")),
+    )
+    monkeypatch.setattr(
+        server,
+        "release_pid_file",
+        lambda _metadata: (_ for _ in ()).throw(AssertionError("桌面模式不得释放 PID 文件")),
+    )
+
+    async def reject_stop_monitor(_metadata):
+        raise AssertionError("桌面模式不得启动 stop monitor")
+
+    async def scheduler(*_args, **_kwargs):
+        scheduler_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            scheduler_stopped.set()
+
+    async def close_background():
+        background_closed.append(True)
+
+    async def close_providers():
+        providers_closed.append(True)
+
+    monkeypatch.setattr(server, "wait_for_stop_request", reject_stop_monitor)
+    monkeypatch.setattr(server.backups, "get_backup_manager", lambda: _Manager())
+    monkeypatch.setattr(server, "run_backup_scheduler", scheduler)
+    monkeypatch.setattr(server, "BACKUP_SCHEDULE_ENABLED", True)
+    monkeypatch.setattr(server, "get_client", lambda: client)
+    monkeypatch.setattr(server, "close_provider_registry", close_providers)
+    monkeypatch.setattr(server.chat, "shutdown_chat_background_tasks", close_background)
+    monkeypatch.setattr(chat_turns, "get_turn_coordinator", lambda: coordinator)
+
+    async with server.lifespan(server.app):
+        await asyncio.wait_for(scheduler_started.wait(), timeout=1)
+        assert coordinator.recovered == 1
+
+    assert scheduler_stopped.is_set()
+    assert coordinator.closed == 1
+    assert background_closed == [True]
+    assert providers_closed == [True]
+    assert client.closed == 1

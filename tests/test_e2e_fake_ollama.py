@@ -10,12 +10,13 @@ import pytest
 
 from tests.e2e_fake_ollama import (
     Control,
+    E2E_NORMAL_REPLY,
     MODEL_NAME,
     create_server,
     read_control,
     stream_chunks,
 )
-from tests.fakes.fake_ollama import NORMAL_REPLY, SUMMARY_REPLY
+from tests.fakes.fake_ollama import SUMMARY_REPLY
 
 
 def _request(url: str, *, body: dict | None = None) -> tuple[int, bytes]:
@@ -49,14 +50,14 @@ def test_control_file_is_bounded_and_invalid_values_fall_back(tmp_path: Path):
     assert read_control(control_file) == Control()
 
 
-def test_stream_chunks_reuse_the_existing_fixture_text():
+def test_stream_chunks_use_the_authoritative_affinity_fixture_text():
     normal = list(stream_chunks(Control()))
     assert normal[-1]["done"] is True
-    assert normal[1]["message"]["content"] == NORMAL_REPLY
+    assert normal[1]["message"]["content"] == E2E_NORMAL_REPLY
     slow = list(stream_chunks(Control(scenario="slow")))
     assert len(slow) == 2
     assert slow[-1]["done"] is False
-    assert NORMAL_REPLY.startswith(slow[-1]["message"]["content"])
+    assert E2E_NORMAL_REPLY.startswith(slow[-1]["message"]["content"])
 
 
 def test_http_server_serves_models_metadata_stream_summary_and_error(tmp_path: Path):
@@ -78,7 +79,7 @@ def test_http_server_serves_models_metadata_stream_summary_and_error(tmp_path: P
         assert status == 200
         chunks = [json.loads(line) for line in raw.splitlines()]
         assert chunks[-1]["done"] is True
-        assert chunks[1]["message"]["content"] == NORMAL_REPLY
+        assert chunks[1]["message"]["content"] == E2E_NORMAL_REPLY
 
         status, raw = _request(f"{base}/api/chat", body={"stream": False})
         assert status == 200

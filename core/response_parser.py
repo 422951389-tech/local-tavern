@@ -11,14 +11,122 @@ import re
 from typing import Optional
 
 
+_TASK_LABEL = (
+    r"🎯(?:\ufe0f)?[ \t]*"
+    r"(?:\[?[ \t]*主线[ \t]*\]?[ \t]*)?"
+    r"(?:任务(?:名称)?|主线任务)[ \t]*[:：][ \t]*"
+)
+_CURRENT_SCENE_LABEL = r"📌(?:\ufe0f)?[ \t]*当前场景[ \t]*[:：][ \t]*"
+_NEXT_GOAL_LABEL = r"➡(?:\ufe0f)?[ \t]*下一目标[ \t]*[:：][ \t]*"
+_USER_LABEL = r"👤(?:\ufe0f)?[ \t]*(?:用户|玩家)(?:[ \t]*[:：][ \t]*|[ \t]+)"
+_INNER_LABEL = (
+    r"💭(?:\ufe0f)?[ \t]*(?:内心(?:想法|活动)?|想法)[ \t]*[:：][ \t]*"
+)
+_OUTFIT_LABEL = r"👗(?:\ufe0f)?[ \t]*穿着[ \t]*[:：][ \t]*"
+_POSTURE_LABEL = (
+    r"🧍(?:\ufe0f)?(?:\u200d[♀♂](?:\ufe0f)?)?[ \t]*"
+    r"(?:当前)?姿势[ \t]*[:：][ \t]*"
+)
+_DIALOGUE_LABEL = r"💬(?:\ufe0f)?[ \t]*对白[ \t]*[:：][ \t]*"
+_NARRATION_LABEL = (
+    r"(?:📖(?:\ufe0f)?[ \t]*|#{1,6}[ \t]+)"
+    r"场景旁白(?:[ \t]*[:：][ \t]*)?"
+)
+_SUGGESTIONS_LABEL = r"💡(?:\ufe0f)?[ \t]*行动建议(?:[ \t]*[:：][ \t]*)?"
+
+# 角色标签只有在同一卡片中很快出现好感度标记时才算协议边界。这样对白里的普通
+# 🎭 或其他 emoji 不会被误当成新卡片；同时保留旧模型把 💝 放到下一行的退化格式。
+_ROLE_HEADER_START = (
+    r"🎭(?:\ufe0f)?"
+    r"(?=(?:(?!🎭|📖(?:\ufe0f)?[ \t]*场景旁白|"
+    r"💡(?:\ufe0f)?[ \t]*行动建议)[\s\S]){1,160}?💝)"
+)
+
+_PROTOCOL_BOUNDARY_PATTERN = "(?:" + "|".join((
+    _TASK_LABEL,
+    _CURRENT_SCENE_LABEL,
+    _NEXT_GOAL_LABEL,
+    _USER_LABEL,
+    _ROLE_HEADER_START,
+    _INNER_LABEL,
+    _OUTFIT_LABEL,
+    _POSTURE_LABEL,
+    _DIALOGUE_LABEL,
+    _NARRATION_LABEL,
+    _SUGGESTIONS_LABEL,
+)) + ")"
+_PROTOCOL_BOUNDARY_RE = re.compile(_PROTOCOL_BOUNDARY_PATTERN)
+_SECTION_END = rf"(?=^[ \t]*{_PROTOCOL_BOUNDARY_PATTERN}|\Z)"
+
 _NARRATION_RE = re.compile(
-    r"^[ \t]*📖[ \t]*场景旁白"
-    r"(?:[ \t]*[:：][ \t]*(?P<inline>[^\r\n]*))?"
-    r"[ \t]*\r?\n"
-    r"(?P<body>.*?)"
-    r"(?=^[ \t]*💡[ \t]*行动建议[ \t]*\r?$)",
+    rf"^[ \t]*(?:{_NARRATION_LABEL})(?P<body>.*?)"
+    rf"(?=^[ \t]*(?:{_SUGGESTIONS_LABEL}))",
     re.MULTILINE | re.DOTALL,
 )
+
+
+def _normalize_protocol_boundaries(text: str) -> str:
+    """只给已知协议标签补物理行边界，不改动字段内容。"""
+    positions = {match.start() for match in _PROTOCOL_BOUNDARY_RE.finditer(text)}
+
+    # 📍 本身没有固定文字标签，只允许最早的场景标记成为结构边界。若它位于角色、
+    # 旁白或建议之后，则视为普通正文 emoji，不参与拆分。
+    location = re.search(r"📍(?:\ufe0f)?", text)
+    if location and (not positions or location.start() < min(positions)):
+        positions.add(location.start())
+
+    if not positions:
+        return text
+
+    chunks: list[str] = []
+    cursor = 0
+    for position in sorted(positions):
+        chunks.append(text[cursor:position])
+        line_start = text.rfind("\n", 0, position) + 1
+        if text[line_start:position].strip():
+            chunks.append("\n")
+        cursor = position
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
+def _extract_field(block: str, label_pattern: str) -> str:
+    match = re.search(
+        rf"^[ \t]*(?:{label_pattern})(?P<value>.*?){_SECTION_END}",
+        block,
+        re.MULTILINE | re.DOTALL,
+    )
+    return match.group("value").strip() if match else ""
+
+
+def _strip_edge_separator(value: str) -> str:
+    return re.sub(r"[ \t]*[|｜][ \t]*$", "", value.strip())
+
+
+def _split_suggestions(value: str) -> list[str]:
+    text = value.strip()
+    if not text:
+        return []
+
+    # 单行截图式输出常把 1/2/3 三项压在一起。只识别行首或空白后的明确列表标记，
+    # 不按句中数字、标点或 emoji 任意拆分。
+    marker = re.compile(r"(?:^|(?<=\s))(?:[-*•][ \t]+|\d{1,2}[.、)][ \t]*)")
+    matches = list(marker.finditer(text))
+    if matches:
+        items = []
+        for index, match in enumerate(matches):
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            item = text[start:end].strip()
+            if item:
+                items.append(item)
+        if items:
+            return items[:5]
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [re.sub(r"^[-*•]\s*", "", line) for line in lines]
+    lines = [re.sub(r"^\d+[.、)]\s*", "", line) for line in lines]
+    return [line for line in lines if line][:5]
 
 
 def parse_response(raw: str) -> dict:
@@ -55,24 +163,34 @@ def parse_response(raw: str) -> dict:
         text = re.sub(r"^```\w*\n?", "", text)
         text = re.sub(r"\n?```\s*$", "", text)
 
-    text = text.strip()
+    text = _normalize_protocol_boundaries(text.strip())
 
     # 1. 解析场景元数据条（📍 开头到第一个 🎭 之前）
     scene_match = re.search(
-        r"📍.*?(?=🎭|📖|💡|$)",
+        rf"^[ \t]*📍(?:\ufe0f)?.*?"
+        rf"(?=^[ \t]*(?:{_ROLE_HEADER_START}|{_NARRATION_LABEL}|{_SUGGESTIONS_LABEL})|\Z)",
         text,
-        re.DOTALL,
+        re.MULTILINE | re.DOTALL,
     )
     if scene_match:
         scene_block = scene_match.group(0).strip()
         result["scene_meta"] = _parse_scene_meta(scene_block)
 
-    # 2. 解析每个角色的状态卡（🎭 ... 💬 ...）
-    # 用 🎭 作为分隔符切分
-    char_blocks = re.split(r"(?=🎭\s)", text)
-    for block in char_blocks:
-        if "🎭" not in block:
-            continue
+    # 2. 解析每个角色的状态卡。只有后方存在 💝 的 🎭 才会成为角色边界。
+    role_starts = [match.start() for match in re.finditer(_ROLE_HEADER_START, text)]
+    terminal_starts = [
+        match.start()
+        for match in re.finditer(
+            rf"^[ \t]*(?:{_NARRATION_LABEL}|{_SUGGESTIONS_LABEL})",
+            text,
+            re.MULTILINE,
+        )
+    ]
+    for index, start in enumerate(role_starts):
+        candidates = role_starts[index + 1:index + 2]
+        candidates.extend(position for position in terminal_starts if position > start)
+        end = min(candidates) if candidates else len(text)
+        block = text[start:end]
         char_data = _parse_character_block(block)
         if char_data:
             result["characters"].append(char_data)
@@ -80,33 +198,100 @@ def parse_response(raw: str) -> dict:
     # 3. 解析显式场景旁白。旁白范围必须由行动建议标签闭合，避免吞掉尾部文本。
     narration_match = _NARRATION_RE.search(text)
     if narration_match:
-        narration_parts = [
-            part.strip()
-            for part in (
-                narration_match.group("inline") or "",
-                narration_match.group("body") or "",
-            )
-            if part.strip()
-        ]
-        result["narration"] = "\n".join(narration_parts)
+        result["narration"] = narration_match.group("body").strip()
 
     # 4. 解析行动建议（💡 行动建议 之后的内容）
-    sug_match = re.search(
-        r"💡\s*行动建议\s*\n(.*?)(?=$|```)",
-        text,
-        re.DOTALL,
+    result["suggestions"] = _split_suggestions(
+        _extract_field(text, _SUGGESTIONS_LABEL)
     )
-    if sug_match:
-        sug_text = sug_match.group(1).strip()
-        # 按行分割，过滤空行
-        lines = [line.strip() for line in sug_text.split("\n") if line.strip()]
-        # 去掉 markdown 列表标记
-        lines = [re.sub(r"^[-*•]\s*", "", line) for line in lines]
-        # 去掉编号
-        lines = [re.sub(r"^\d+[.、)]\s*", "", line) for line in lines]
-        result["suggestions"] = lines[:5]  # 最多 5 个
 
     return result
+
+
+def build_response_presentation(
+    parsed: dict,
+    *,
+    previous_affinities: list[object] | None = None,
+    character_moods: list[object] | None = None,
+    scene_changes: list[dict] | None = None,
+) -> dict:
+    """生成可持久化的精简展示快照，不重复保存 raw 原文。"""
+    source = parsed if isinstance(parsed, dict) else {}
+    previous_values = previous_affinities or []
+    mood_values = character_moods or []
+    scene_source = source.get("scene_meta")
+    scene_meta = None
+    if isinstance(scene_source, dict):
+        scene_meta = {
+            key: value
+            for key in (
+                "location",
+                "time_weather",
+                "main_quest",
+                "current_scene",
+                "next_goal",
+                "user_line",
+            )
+            if isinstance((value := scene_source.get(key)), str)
+        }
+
+    characters = []
+    for index, character in enumerate(source.get("characters", [])):
+        if not isinstance(character, dict):
+            continue
+        item = {
+            key: value
+            for key in (
+                "name",
+                "inner_thought",
+                "outfit",
+                "posture",
+                "dialogue",
+                "expected_effect",
+            )
+            if isinstance((value := character.get(key)), str)
+        }
+        affinity = character.get("affinity")
+        if isinstance(affinity, (int, float)) and not isinstance(affinity, bool):
+            item["affinity"] = max(0, min(100, round(affinity)))
+        previous = previous_values[index] if index < len(previous_values) else None
+        if isinstance(previous, (int, float)) and not isinstance(previous, bool):
+            item["previous_affinity"] = max(0, min(100, round(previous)))
+        mood = mood_values[index] if index < len(mood_values) else None
+        if isinstance(mood, str) and mood.strip():
+            item["mood"] = mood.strip()
+        characters.append(item)
+
+    normalized_scene_changes = []
+    for change in scene_changes or []:
+        if not isinstance(change, dict):
+            continue
+        key = change.get("key")
+        value = change.get("value")
+        if key in {"location", "time", "weather"} and isinstance(value, str):
+            normalized_scene_changes.append({"key": key, "value": value})
+
+    return {
+        "schema_version": 1,
+        "scene_meta": scene_meta,
+        "characters": characters,
+        "narration": (
+            source.get("narration")
+            if isinstance(source.get("narration"), str)
+            else ""
+        ),
+        "suggestions": [
+            value
+            for value in source.get("suggestions", [])[:5]
+            if isinstance(value, str)
+        ] if isinstance(source.get("suggestions"), list) else [],
+        "warnings": [
+            value
+            for value in source.get("warnings", [])[:50]
+            if isinstance(value, str)
+        ] if isinstance(source.get("warnings"), list) else [],
+        "scene_changes": normalized_scene_changes[:3],
+    }
 
 
 def _parse_scene_meta(block: str) -> dict:
@@ -120,80 +305,76 @@ def _parse_scene_meta(block: str) -> dict:
         "user_line": "",
     }
 
-    # 📍 xxx | ⏱️ xxx
-    loc_match = re.search(r"📍\s*([^|\n]+)", block)
+    # 📍 xxx | ⏱️ xxx。时间标记是场景条内部字段，不作为全局协议边界。
+    loc_match = re.search(
+        rf"📍(?:\ufe0f)?[ \t]*(?:(?:场景|地点)[ \t]*[:：][ \t]*)?"
+        rf"(?P<value>.*?)(?=[ \t]*[|｜]?[ \t]*⏱(?:\ufe0f)?|"
+        rf"^[ \t]*{_PROTOCOL_BOUNDARY_PATTERN}|\Z)",
+        block,
+        re.MULTILINE | re.DOTALL,
+    )
     if loc_match:
-        meta["location"] = loc_match.group(1).strip()
+        meta["location"] = _strip_edge_separator(loc_match.group("value"))
 
-    time_match = re.search(r"⏱️\s*([^|\n]+)", block)
+    time_match = re.search(
+        rf"⏱(?:\ufe0f)?[ \t]*"
+        rf"(?:(?:时间(?:[ \t]*/[ \t]*天气)?|时间天气|天气)[ \t]*[:：][ \t]*)?"
+        rf"(?P<value>.*?)(?=^[ \t]*{_PROTOCOL_BOUNDARY_PATTERN}|\Z)",
+        block,
+        re.MULTILINE | re.DOTALL,
+    )
     if time_match:
-        meta["time_weather"] = time_match.group(1).strip()
+        meta["time_weather"] = _strip_edge_separator(time_match.group("value"))
 
-    quest_match = re.search(r"🎯\s*\[?主线\]?\s*任务名称[:：]\s*([^\n]+)", block)
-    if quest_match:
-        meta["main_quest"] = quest_match.group(1).strip()
-
-    scene_match = re.search(r"📌\s*当前场景[:：]\s*([^\n]+)", block)
-    if scene_match:
-        meta["current_scene"] = scene_match.group(1).strip()
-
-    goal_match = re.search(r"➡️\s*下一目标[:：]\s*([^\n]+)", block)
-    if goal_match:
-        meta["next_goal"] = goal_match.group(1).strip()
-
-    user_match = re.search(r"👤\s*([^\n]+)", block)
-    if user_match:
-        meta["user_line"] = user_match.group(1).strip()
+    meta["main_quest"] = _extract_field(block, _TASK_LABEL)
+    meta["current_scene"] = _extract_field(block, _CURRENT_SCENE_LABEL)
+    meta["next_goal"] = _extract_field(block, _NEXT_GOAL_LABEL)
+    meta["user_line"] = _extract_field(block, _USER_LABEL)
 
     return meta
 
 
 def _parse_character_block(block: str) -> Optional[dict]:
     """解析单个角色的状态卡"""
-    # 标准化：把换行拆开的格式压缩为单行
-    # 🎭 老李\n💝 ██ 60% → 🎭 老李 | 💝 ██ 60%
-    block_normalized = re.sub(r"\n\s*💝", " | 💝", block)
-    block_normalized = re.sub(r"\n\s*💭", "\n💭", block_normalized)
-    block_normalized = re.sub(r"\n\s*👗", "\n👗", block_normalized)
-    block_normalized = re.sub(r"\n\s*🧍", "\n🧍", block_normalized)
-    block_normalized = re.sub(r"\n\s*💬", "\n💬", block_normalized)
+    name_match = re.search(
+        r"🎭(?:\ufe0f)?[ \t]*"
+        r"(?:(?:出场)?角色(?:名)?(?:[ \t]*[:：][ \t]*|[ \t]+))?"
+        r"(?P<name>.*?)"
+        r"(?=[ \t]*(?:[|｜:：\-—][ \t]*)?(?:\r?\n[ \t]*)?💝|\r?$)",
+        block,
+        re.MULTILINE,
+    )
+    affinity_match = re.search(
+        r"💝(?:\ufe0f)?[ \t]*(?:好感度[ \t]*[:：]?[ \t]*)?"
+        r"[^\d+\-\r\n]{0,80}(?P<affinity>[+-]?\d+)[ \t]*%?",
+        block,
+    )
+    if not name_match or not affinity_match:
+        return None
+    name = name_match.group("name").strip().rstrip("|｜:：-— ")
+    affinity = int(affinity_match.group("affinity"))
 
-    # 角色名和好感度：🎭 xxx | 💝 ...
-    header_match = re.search(r"🎭\s*([^|\n]+?)\s*\|\s*💝\s*([█░▏▎▍▌▋▊▉\s]*?[█░▏▎▍▌▋▊▉]+\s*)([+-]?\d+)%?", block_normalized)
-    if not header_match:
-        # 退化：只匹配 🎭 xxx 后面某处有 💝 和数字
-        fallback_name = re.search(r"🎭\s*(\S[^\n|]*?)\s*$", block_normalized, re.MULTILINE)
-        fallback_aff = re.search(r"💝[^\d+\-]*?([+-]?\d+)%?", block_normalized)
-        if not fallback_name or not fallback_aff:
-            return None
-        name = fallback_name.group(1).strip()
-        affinity = int(fallback_aff.group(1)) if fallback_aff.group(1) else 0
-    else:
-        name = header_match.group(1).strip()
-        affinity = int(header_match.group(3)) if header_match.group(3) else 0
+    inner_thought = _extract_field(block, _INNER_LABEL)
+    outfit_str = _extract_field(block, _OUTFIT_LABEL)
+    posture_str = _extract_field(block, _POSTURE_LABEL)
 
-    # 内心
-    inner = re.search(r"💭\s*内心想法[:：]\s*([^\n]+(?:\n(?!👗)[^\n]+)*)", block)
-    inner_thought = inner.group(1).strip() if inner else ""
+    dialogue_str = _extract_field(block, _DIALOGUE_LABEL)
+    effect_str = ""
+    effect_match = re.search(
+        r"[ \t]*[（(][ \t]*预期影响[ \t]*[:：][ \t]*"
+        r"(?P<effect>.*?)[ \t]*[）)][ \t]*$",
+        dialogue_str,
+        re.DOTALL,
+    )
+    if effect_match:
+        effect_str = effect_match.group("effect").strip()
+        dialogue_str = dialogue_str[:effect_match.start()].strip()
 
-    # 穿着
-    outfit = re.search(r"👗\s*穿着[:：]\s*([^\n]+)", block)
-    outfit_str = outfit.group(1).strip() if outfit else ""
-
-    # 姿势
-    posture = re.search(r"🧍\s*当前姿势[:：]\s*([^\n]+)", block)
-    posture_str = posture.group(1).strip() if posture else ""
-
-    # 对白 + 预期影响
-    dialogue = re.search(r'💬\s*对白[:：]\s*"([^"]+)"(?:\s*\(预期影响[:：]\s*([^\)]+)\))?', block)
-    if dialogue:
-        dialogue_str = dialogue.group(1).strip()
-        effect_str = dialogue.group(2).strip() if dialogue.group(2) else ""
-    else:
-        # 退化：💬 对白：xxx（无引号）
-        dialogue2 = re.search(r"💬\s*对白[:：]\s*([^\n]+)", block)
-        dialogue_str = dialogue2.group(1).strip() if dialogue2 else ""
-        effect_str = ""
+    quote_pairs = (("\"", "\""), ("“", "”"), ("'", "'"), ("‘", "’"))
+    for opening, closing in quote_pairs:
+        if dialogue_str.startswith(opening) and dialogue_str.endswith(closing):
+            dialogue_str = dialogue_str[len(opening):-len(closing)].strip()
+            break
 
     if not name:
         return None
