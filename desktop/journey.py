@@ -422,19 +422,24 @@ def journey_probe_script(stage: str) -> str:
                 }}, `save_switch_failed_${{save}}`);
             }};
             const completeOnboarding = async () => {{
-                const backdrop = document.getElementById('modal-backdrop');
-                if (!backdrop || backdrop.classList.contains('hidden')) return;
-                const title = document.getElementById('modal-title');
-                if (!title || title.textContent.trim() !== '欢迎使用本地酒馆') {{
-                    throw new Error('unexpected_blocking_modal');
-                }}
-                const chooseLocal = document.querySelector(
-                    '.onboarding-card.recommended .primary-btn',
-                );
-                if (!chooseLocal) throw new Error('onboarding_local_action_missing');
-                chooseLocal.click();
+                const onboarding = await waitUntil(() => {{
+                    const backdrop = document.getElementById('modal-backdrop');
+                    const title = document.getElementById('modal-title');
+                    const chooseLocal = document.querySelector(
+                        '.onboarding-card.recommended .primary-btn',
+                    );
+                    if (
+                        !backdrop
+                        || backdrop.classList.contains('hidden')
+                        || !title
+                        || title.textContent.trim() !== '欢迎使用本地酒馆'
+                        || !chooseLocal
+                    ) return null;
+                    return {{ backdrop, chooseLocal }};
+                }}, 'onboarding_not_ready', 300);
+                onboarding.chooseLocal.click();
                 await waitUntil(
-                    () => backdrop.classList.contains('hidden'),
+                    () => onboarding.backdrop.classList.contains('hidden'),
                     'onboarding_close_failed',
                     100,
                 );
