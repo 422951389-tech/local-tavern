@@ -493,22 +493,15 @@ def test_production_prompt_uses_only_the_zero_one_or_many_real_characters(charac
         assert "无活跃角色" in content
 
 
-def test_current_and_latest_default_production_templates_have_no_named_ghosts():
+def test_current_and_canonical_default_templates_have_no_named_ghosts():
     prompt_dir = REPO_ROOT / "prompts"
-    paths = [
-        prompt_dir / "system.md",
-        prompt_dir / "group_chat.md",
-        prompt_dir / "summary.md",
-    ]
+    paths = []
     for name in ("system", "group_chat", "summary"):
-        backups = sorted((prompt_dir / ".default").glob(f"{name}.md.v*-bak"))
-        assert backups, f"{name} 缺少版本化默认模板"
-        paths.append(backups[-1])
-        assert (prompt_dir / f"{name}.md").read_bytes() == backups[-1].read_bytes()
-
-    group_plain_default = prompt_dir / ".default" / "group_chat.md"
-    assert (prompt_dir / "group_chat.md").read_bytes() == group_plain_default.read_bytes()
-    paths.append(group_plain_default)
+        current = prompt_dir / f"{name}.md"
+        canonical_default = prompt_dir / ".default" / f"{name}.md"
+        assert canonical_default.is_file(), f"{name} 缺少正式默认模板"
+        assert current.read_bytes() == canonical_default.read_bytes()
+        paths.extend((current, canonical_default))
 
     for path in paths:
         content = path.read_text(encoding="utf-8")
