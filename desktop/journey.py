@@ -421,6 +421,27 @@ def journey_probe_script(stage: str) -> str:
                     return label && label.textContent.includes(save);
                 }}, `save_switch_failed_${{save}}`);
             }};
+            const completeOnboarding = async () => {{
+                const backdrop = document.getElementById('modal-backdrop');
+                if (!backdrop || backdrop.classList.contains('hidden')) return;
+                const title = document.getElementById('modal-title');
+                if (!title || title.textContent.trim() !== '欢迎使用本地酒馆') {{
+                    throw new Error('unexpected_blocking_modal');
+                }}
+                const chooseLocal = document.querySelector(
+                    '.onboarding-card.recommended .primary-btn',
+                );
+                if (!chooseLocal) throw new Error('onboarding_local_action_missing');
+                chooseLocal.click();
+                await waitUntil(
+                    () => backdrop.classList.contains('hidden'),
+                    'onboarding_close_failed',
+                    100,
+                );
+                if (localStorage.getItem('local-tavern.onboarding.v1') !== 'complete') {{
+                    throw new Error('onboarding_completion_missing');
+                }}
+            }};
             const verifyUi = async () => {{
                 await waitUntil(() => {{
                     const label = document.getElementById('current-session-label');
@@ -461,6 +482,7 @@ def journey_probe_script(stage: str) -> str:
                     return;
                 }}
                 const messageCount = await verifyBackend();
+                await completeOnboarding();
                 await verifyUi();
                 await new Promise(resolve => requestAnimationFrame(
                     () => requestAnimationFrame(resolve),

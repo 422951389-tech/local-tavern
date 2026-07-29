@@ -186,6 +186,8 @@ def test_injected_script_drives_formal_api_refresh_and_ui_save_switch():
         "location.reload()",
         "save_switch_verified",
         "current-session-label",
+        "onboarding-card.recommended .primary-btn",
+        "local-tavern.onboarding.v1",
     ):
         assert required in source
     assert "http://" not in source
