@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-JOURNEY_SCHEMA_VERSION = 1
+JOURNEY_SCHEMA_VERSION = 2
 JOURNEY_TIMEOUT_MS = 90_000
 JOURNEY_TITLE_PREFIX = "__LOCAL_TAVERN_JOURNEY_V1__"
 JOURNEY_ENVIRONMENT_FLAG = "TAVERN_DESKTOP_JOURNEY_TEST"
@@ -277,6 +277,7 @@ def base_journey_result(stage: str) -> dict[str, Any]:
         "chat_completed": False,
         "refresh_verified": False,
         "save_switch_verified": False,
+        "layout_verified": False,
         "persistence_verified": False,
         "message_count": 0,
         "screenshot_saved": False,
@@ -459,6 +460,48 @@ def journey_probe_script(stage: str) -> str:
                     return stream && stream.textContent.includes(cfg.assistantMarker);
                 }}, 'chat_not_rendered');
             }};
+            const verifyLayout = () => {{
+                const center = document.querySelector('.workspace-center');
+                const heading = document.querySelector('.composer-heading');
+                const composer = document.querySelector('.composer-row');
+                const send = document.getElementById('send-btn');
+                const sendLabel = send?.querySelector('span:last-child');
+                if (!center || !heading || !composer || !send || !sendLabel) {{
+                    throw new Error('composer_layout_missing');
+                }}
+                const centerRect = center.getBoundingClientRect();
+                const headingRect = heading.getBoundingClientRect();
+                const composerRect = composer.getBoundingClientRect();
+                const sendRect = send.getBoundingClientRect();
+                const labelRect = sendLabel.getBoundingClientRect();
+                const sendStyle = getComputedStyle(send);
+                const paddingRight = Number.parseFloat(sendStyle.paddingRight) || 0;
+                const rightHit = document.elementFromPoint(
+                    Math.max(sendRect.left + 1, sendRect.right - 3),
+                    sendRect.top + (sendRect.height / 2),
+                );
+                const round = value => Math.round(value * 10) / 10;
+                const clipped = (
+                    headingRect.right > centerRect.right + 0.5
+                    || composerRect.right > centerRect.right + 0.5
+                    || sendRect.right > composerRect.right + 0.5
+                    || send.scrollWidth > send.clientWidth + 1
+                    || labelRect.right > sendRect.right - paddingRight + 0.5
+                    || !(rightHit === send || send.contains(rightHit))
+                );
+                if (clipped) {{
+                    throw new Error([
+                        'composer_layout_clipped',
+                        round(centerRect.right),
+                        round(headingRect.right),
+                        round(composerRect.right),
+                        round(sendRect.right),
+                        send.clientWidth,
+                        send.scrollWidth,
+                    ].join(':'));
+                }}
+                return true;
+            }};
             const run = async () => {{
                 await waitUntil(
                     () => globalThis.TavernDesktopTransport
@@ -493,6 +536,7 @@ def journey_probe_script(stage: str) -> str:
                     () => requestAnimationFrame(resolve),
                 ));
                 await sleep(100);
+                const layoutVerified = verifyLayout();
                 report({{
                     ok: true,
                     api_live: true,
@@ -501,6 +545,7 @@ def journey_probe_script(stage: str) -> str:
                     chat_completed: true,
                     refresh_verified: true,
                     save_switch_verified: true,
+                    layout_verified: layoutVerified,
                     persistence_verified: cfg.stage === 'verify',
                     message_count: messageCount,
                     error: '',
@@ -598,6 +643,7 @@ class JourneyController:
             "chat_completed": bool(page_result.get("chat_completed")),
             "refresh_verified": bool(page_result.get("refresh_verified")),
             "save_switch_verified": bool(page_result.get("save_switch_verified")),
+            "layout_verified": bool(page_result.get("layout_verified")),
             "persistence_verified": bool(page_result.get("persistence_verified")),
             "message_count": int(page_result.get("message_count", 0) or 0),
             "screenshot_saved": screenshot_saved,

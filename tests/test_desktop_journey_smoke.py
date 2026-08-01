@@ -34,7 +34,7 @@ def _isolated_root() -> tempfile.TemporaryDirectory[str]:
 
 def _valid_result(pid: int, stage: str) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "pid": pid,
         "stage": stage,
         "ready": True,
@@ -45,6 +45,7 @@ def _valid_result(pid: int, stage: str) -> dict:
         "chat_completed": True,
         "refresh_verified": True,
         "save_switch_verified": True,
+        "layout_verified": True,
         "persistence_verified": stage == "verify",
         "message_count": 2,
         "screenshot_saved": True,
@@ -143,6 +144,11 @@ def test_result_contract_requires_refresh_save_switch_restart_and_no_tcp():
     with pytest.raises(DesktopJourneySmokeError, match="save_switch_verified"):
         _validate_result(failed, pid=4242, stage="seed")
 
+    clipped = _valid_result(4242, "seed")
+    clipped["layout_verified"] = False
+    with pytest.raises(DesktopJourneySmokeError, match="layout_verified"):
+        _validate_result(clipped, pid=4242, stage="seed")
+
     reported = _valid_result(4242, "seed")
     reported["ready"] = False
     reported["error"] = "http_500"
@@ -188,6 +194,8 @@ def test_injected_script_drives_formal_api_refresh_and_ui_save_switch():
         "current-session-label",
         "onboarding-card.recommended .primary-btn",
         "local-tavern.onboarding.v1",
+        "composer_layout_clipped",
+        "elementFromPoint",
     ):
         assert required in source
     assert "http://" not in source
@@ -221,6 +229,7 @@ def test_two_stage_runner_reuses_one_isolated_root_and_preserves_screenshots(
             "message_count": 2,
             "refresh_verified": True,
             "save_switch_verified": True,
+            "layout_verified": True,
             "persistence_verified": stage == "verify",
             "tcp_listener_samples": [[], []],
             "process_exited": True,

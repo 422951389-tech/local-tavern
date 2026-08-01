@@ -687,8 +687,11 @@ async function measureBrowserPerformance(browserInstance, browserVersion) {
 async function auditViewports(page) {
     const failures = [];
     const layouts = [];
-    for (const width of [375, 768, 899, 1024, 1440]) {
+    for (const width of [375, 768, 899, 1024, 1366, 1424, 1440]) {
         await page.setViewportSize({ width, height: width === 375 ? 812 : 900 });
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve),
+        )));
         const layout = await page.evaluate(() => {
             const viewportWidth = document.documentElement.clientWidth;
             const compact = viewportWidth <= 899;
@@ -722,6 +725,29 @@ async function auditViewports(page) {
                         ? Number.parseFloat(normalized)
                         : Number.parseFloat(normalized) * 1000;
                 });
+            const send = document.querySelector('#send-btn');
+            const sendLabel = send?.querySelector('span:last-child');
+            const sendRect = send?.getBoundingClientRect();
+            const labelRect = sendLabel?.getBoundingClientRect();
+            const sendStyle = send ? getComputedStyle(send) : null;
+            const paddingRight = Number.parseFloat(sendStyle?.paddingRight || '0') || 0;
+            const rightHit = sendRect ? document.elementFromPoint(
+                Math.max(sendRect.left + 1, sendRect.right - 3),
+                sendRect.top + (sendRect.height / 2),
+            ) : null;
+            const composerSendAudit = {
+                missing: !send || !sendLabel || !sendRect || !labelRect,
+                contentOverflow: Boolean(send && send.scrollWidth > send.clientWidth + 1),
+                labelOverflow: Boolean(
+                    sendRect && labelRect
+                    && labelRect.width > 0
+                    && labelRect.right > sendRect.right - paddingRight + 0.5
+                ),
+                rightEdgeOccluded: Boolean(
+                    send && !(rightHit === send || send.contains(rightHit))
+                ),
+                rightHit: rightHit?.id || rightHit?.className || rightHit?.tagName || '',
+            };
             return {
                 width: viewportWidth,
                 horizontalOverflow: document.documentElement.scrollWidth - viewportWidth,
@@ -736,6 +762,11 @@ async function auditViewports(page) {
                     pointerEvents: actionGroupStyle?.pointerEvents || '',
                 } : null,
                 reducedMotionMaxMs: Math.max(...transitionDurations),
+                composerSendAudit,
+                composerSendClipped: composerSendAudit.missing
+                    || composerSendAudit.contentOverflow
+                    || composerSendAudit.labelOverflow
+                    || composerSendAudit.rightEdgeOccluded,
             };
         });
         layouts.push(layout);
@@ -749,6 +780,7 @@ async function auditViewports(page) {
             && layout.coarseAction.pointerEvents === 'auto'
         ), true, JSON.stringify(layout));
         assert.equal(layout.reducedMotionMaxMs <= 0.02, true, JSON.stringify(layout));
+        assert.equal(layout.composerSendClipped, false, JSON.stringify(layout));
         if (width <= 899) {
             for (const [buttonSelector, menuSelector] of [
                 ['#nav-more-btn', '#nav-more-menu'],

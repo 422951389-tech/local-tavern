@@ -64,6 +64,7 @@ _RESULT_KEYS = {
     "chat_completed",
     "refresh_verified",
     "save_switch_verified",
+    "layout_verified",
     "persistence_verified",
     "message_count",
     "screenshot_saved",
@@ -184,6 +185,7 @@ def _validate_result(result: dict, *, pid: int, stage: str) -> None:
         "chat_completed",
         "refresh_verified",
         "save_switch_verified",
+        "layout_verified",
         "screenshot_saved",
         "off_the_record",
     ):
@@ -318,6 +320,7 @@ def _launch_stage(
             "message_count": result["message_count"],
             "refresh_verified": result["refresh_verified"],
             "save_switch_verified": result["save_switch_verified"],
+            "layout_verified": result["layout_verified"],
             "persistence_verified": result["persistence_verified"],
             "tcp_listener_samples": samples,
             "process_exited": True,

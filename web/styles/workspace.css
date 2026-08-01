@@ -1478,6 +1478,7 @@ textarea:disabled {
 
 #input-bar {
     display: grid;
+    min-width: 0;
     gap: 8px;
     padding: 12px 24px 18px;
     background: #151310;
@@ -1486,7 +1487,9 @@ textarea:disabled {
 
 .composer-heading,
 .composer-row {
-    width: min(100%, 800px);
+    width: 100%;
+    min-width: 0;
+    max-width: 800px;
     margin-right: auto;
     margin-left: auto;
 }
@@ -2463,8 +2466,8 @@ textarea:disabled {
     outline-offset: 2px;
 }
 
-/* 900–1365：压缩左栏，保留角色检视器。 */
-@media (min-width: 900px) and (max-width: 1365px) {
+/* 900–1439：压缩左栏，给窗口边框与高 DPI 舍入留出叙事区余量。 */
+@media (min-width: 900px) and (max-width: 1439px) {
     .workspace-shell {
         grid-template-columns: 88px minmax(0, 1fr) minmax(260px, 30vw);
     }
