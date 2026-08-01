@@ -54,7 +54,7 @@ test('沉浸式工作台保留三栏、抽屉、响应式与无障碍契约', ()
     assert.match(css, /grid-template-columns:\s*248px minmax\(720px, 1fr\) minmax\(320px, 380px\)/);
     assert.match(css, /\.workspace-shell\.inspector-collapsed\s*\{[\s\S]*grid-template-columns:\s*248px minmax\(720px, 1fr\) 0/);
     assert.match(css, /\.chat-stream > \.msg\s*\{[\s\S]*max-width:\s*800px/);
-    assert.match(css, /@media \(min-width: 900px\) and \(max-width: 1365px\)/);
+    assert.match(css, /@media \(min-width: 900px\) and \(max-width: 1439px\)/);
     assert.match(css, /@media \(max-width: 899px\)/);
     assert.match(css, /@media \(max-width: 600px\)/);
     assert.match(css, /@media \(hover: none\), \(pointer: coarse\)[\s\S]*\.msg-action-btn\s*\{[\s\S]*min-width:\s*44px[\s\S]*min-height:\s*44px/);
@@ -69,6 +69,7 @@ test('沉浸式工作台保留三栏、抽屉、响应式与无障碍契约', ()
     assert.match(css, /\.affinity-meter\s*\{[\s\S]*height:\s*6px/);
     assert.match(css, /\.character-state-details\s*\{/);
     assert.match(css, /\.scene-meta:not\(\[open\]\) > \.scene-details\s*\{[\s\S]*display:\s*none/);
+    assert.match(css, /#input-bar\s*\{[\s\S]*min-width:\s*0/);
     assert.doesNotMatch(css, /backdrop-filter|font-face|https?:\/\//i);
 });
 
@@ -141,7 +142,8 @@ test('浏览器 E2E 输出 performance_budget 可直接校验的三类性能样�
     assert.match(browserE2e, /message_count:\s*1000/);
     assert.match(browserE2e, /for \(let index = 0; index < 4; index \+= 1\)/);
     assert.match(browserE2e, /createMessageElement, mountMessageHistory/);
-    assert.match(browserE2e, /\[375, 768, 899, 1024, 1440\]/);
+    assert.match(browserE2e, /\[375, 768, 899, 1024, 1366, 1424, 1440\]/);
+    assert.match(browserE2e, /composerSendClipped/);
     assert.match(browserE2e, /screenshotSibling\(`main-\$\{width\}`\)/);
     assert.match(browserE2e, /environment:\s*\{[\s\S]*os:[\s\S]*python:[\s\S]*node:[\s\S]*browser:[\s\S]*source_commit:/);
 });
