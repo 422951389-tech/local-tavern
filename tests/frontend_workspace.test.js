@@ -52,6 +52,7 @@ test('沉浸式工作台保留三栏、抽屉、响应式与无障碍契约', ()
     assert.doesNotMatch(html, /[\u{1F300}-\u{1FAFF}]/u);
 
     assert.match(css, /grid-template-columns:\s*248px minmax\(720px, 1fr\) minmax\(320px, 380px\)/);
+    assert.match(css, /\.workspace-center\s*\{[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\)/);
     assert.match(css, /\.workspace-shell\.inspector-collapsed\s*\{[\s\S]*grid-template-columns:\s*248px minmax\(720px, 1fr\) 0/);
     assert.match(css, /\.chat-stream > \.msg\s*\{[\s\S]*max-width:\s*800px/);
     assert.match(css, /@media \(min-width: 900px\) and \(max-width: 1439px\)/);

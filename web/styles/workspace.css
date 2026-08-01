@@ -372,6 +372,7 @@ textarea:disabled {
     position: relative;
     z-index: 10;
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto auto minmax(0, 1fr) auto auto 0 0;
     min-width: 0;
     min-height: 0;

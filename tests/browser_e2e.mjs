@@ -689,9 +689,17 @@ async function auditViewports(page) {
     const layouts = [];
     for (const width of [375, 768, 899, 1024, 1366, 1424, 1440]) {
         await page.setViewportSize({ width, height: width === 375 ? 812 : 900 });
-        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(
-            () => requestAnimationFrame(resolve),
-        )));
+        const expectedShellMode = width >= 1440 ? 'full' : (width >= 900 ? 'rail' : 'single');
+        await page.waitForFunction(expectedMode => {
+            const shell = document.querySelector('.workspace-shell');
+            if (!shell) return false;
+            const columns = getComputedStyle(shell).gridTemplateColumns
+                .split(/\s+/).filter(Boolean).map(Number.parseFloat);
+            if (expectedMode === 'single') return columns.length === 1;
+            if (columns.length !== 3) return false;
+            return expectedMode === 'full' ? columns[0] >= 240 : columns[0] <= 100;
+        }, expectedShellMode);
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
         const layout = await page.evaluate(() => {
             const viewportWidth = document.documentElement.clientWidth;
             const compact = viewportWidth <= 899;
@@ -748,6 +756,14 @@ async function auditViewports(page) {
                 ),
                 rightHit: rightHit?.id || rightHit?.className || rightHit?.tagName || '',
             };
+            const bounds = selector => {
+                const rect = document.querySelector(selector)?.getBoundingClientRect();
+                return rect ? {
+                    left: Math.round(rect.left * 10) / 10,
+                    right: Math.round(rect.right * 10) / 10,
+                    width: Math.round(rect.width * 10) / 10,
+                } : null;
+            };
             return {
                 width: viewportWidth,
                 horizontalOverflow: document.documentElement.scrollWidth - viewportWidth,
@@ -763,6 +779,15 @@ async function auditViewports(page) {
                 } : null,
                 reducedMotionMaxMs: Math.max(...transitionDurations),
                 composerSendAudit,
+                composerGeometry: {
+                    shellColumns: getComputedStyle(document.querySelector('.workspace-shell'))
+                        .gridTemplateColumns,
+                    center: bounds('.workspace-center'),
+                    inputBar: bounds('#input-bar'),
+                    heading: bounds('.composer-heading'),
+                    row: bounds('.composer-row'),
+                    send: bounds('#send-btn'),
+                },
                 composerSendClipped: composerSendAudit.missing
                     || composerSendAudit.contentOverflow
                     || composerSendAudit.labelOverflow
