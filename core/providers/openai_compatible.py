@@ -97,7 +97,9 @@ class OpenAICompatibleProvider(HTTPProviderBase):
                 if not 200 <= response.status_code < 300:
                     yield stream_error_event(self._http_error(response.status_code))
                     return
-                async for event_name, data in iter_sse_records(response.aiter_lines()):
+                async for event_name, data in iter_sse_records(
+                    self.iter_bounded_sse_lines(response)
+                ):
                     if event_name in {"keepalive", "ping"}:
                         yield {"type": "keepalive", "content": ""}
                         continue
@@ -126,6 +128,9 @@ class OpenAICompatibleProvider(HTTPProviderBase):
                                 yield {"type": "content", "content": content}
                         if choice.get("finish_reason") is not None:
                             saw_finish = True
+        except ProviderError as exc:
+            yield stream_error_event(exc)
+            return
         except httpx.RequestError as exc:
             yield stream_error_event(self._network_error(exc))
             return

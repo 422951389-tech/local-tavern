@@ -198,7 +198,14 @@
                 { ...options, schema: validateTurn },
             );
             this.cancelRequests.set(turnId, request);
-            request.catch(() => this.cancelRequests.delete(turnId));
+            const release = () => {
+                if (this.cancelRequests.get(turnId) === request) {
+                    this.cancelRequests.delete(turnId);
+                }
+            };
+            // 只合并仍在进行的取消请求；成功与失败都必须释放，避免每次取消永久占用 Map。
+            // 同时提供 rejection handler，避免仅用于清理的派生 Promise 产生未处理拒绝。
+            request.then(release, release);
             return request;
         }
 

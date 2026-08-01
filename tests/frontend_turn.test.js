@@ -147,4 +147,49 @@ test('TurnClient coalesces double cancel and respects completed winning the race
     assert.equal(calls, 1);
     assert.equal(left.status, 'completed');
     assert.equal(right.status, 'completed');
+    assert.equal(client.cancelRequests.size, 0);
+
+    const third = client.cancel('turn-a');
+    assert.notStrictEqual(third, first);
+    assert.equal(calls, 2);
+    assert.equal((await third).status, 'completed');
+    assert.equal(client.cancelRequests.size, 0);
+});
+
+test('TurnClient releases failed cancel single-flight and permits an immediate retry', async () => {
+    const pending = [];
+    const api = {
+        request() {
+            throw new Error('本测试只允许调用 post');
+        },
+        post() {
+            let resolve;
+            let reject;
+            const promise = new Promise((onResolve, onReject) => {
+                resolve = onResolve;
+                reject = onReject;
+            });
+            pending.push({ promise, resolve, reject });
+            return promise;
+        },
+    };
+    const client = new TurnClient(api);
+
+    const first = client.cancel('turn-failed');
+    const duplicate = client.cancel('turn-failed');
+    assert.strictEqual(duplicate, first);
+    assert.equal(pending.length, 1);
+    assert.equal(client.cancelRequests.size, 1);
+
+    pending[0].reject(new Error('cancel request failed'));
+    await assert.rejects(first, /cancel request failed/);
+    await Promise.resolve();
+    assert.equal(client.cancelRequests.size, 0);
+
+    const retry = client.cancel('turn-failed');
+    assert.notStrictEqual(retry, first);
+    assert.equal(pending.length, 2);
+    pending[1].resolve(publicTurn({ status: 'cancelled' }));
+    assert.equal((await retry).status, 'cancelled');
+    assert.equal(client.cancelRequests.size, 0);
 });

@@ -119,7 +119,9 @@ class AnthropicProvider(HTTPProviderBase):
                 if not 200 <= response.status_code < 300:
                     yield stream_error_event(self._http_error(response.status_code))
                     return
-                async for event_name, data in iter_sse_records(response.aiter_lines()):
+                async for event_name, data in iter_sse_records(
+                    self.iter_bounded_sse_lines(response)
+                ):
                     if event_name in {"keepalive", "ping"}:
                         yield {"type": "keepalive", "content": ""}
                         continue
@@ -151,6 +153,8 @@ class AnthropicProvider(HTTPProviderBase):
                         text = delta.get("text")
                         if isinstance(text, str) and text:
                             yield {"type": "content", "content": text}
+        except ProviderError as exc:
+            yield stream_error_event(exc)
         except httpx.RequestError as exc:
             yield stream_error_event(self._network_error(exc))
 

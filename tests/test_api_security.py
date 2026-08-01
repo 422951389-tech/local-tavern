@@ -99,7 +99,8 @@ class ApiSecurityTests(unittest.IsolatedAsyncioTestCase):
     async def test_chinese_project_name_and_normalization_collision(self):
         created = await self.client.post("/api/projects", json={"name": "中文 世界"})
         self.assertEqual(created.status_code, 200, created.text)
-        self.assertEqual(created.json()["name"], "中文_世界")
+        self.assertEqual(created.json(), {"name": "中文_世界"})
+        self.assertNotIn(str(self.test_root), created.text)
         self.assertTrue((self.test_root / "中文_世界" / "saves" / "默认存档.json").exists())
 
         collision = await self.client.post("/api/projects", json={"name": "中文　世界"})

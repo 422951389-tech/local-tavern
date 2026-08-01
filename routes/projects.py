@@ -91,8 +91,8 @@ async def api_create_project(req: ProjectRequest):
         raise HTTPException(
             409, f"项目 ID {name} 已存在；请使用不会产生规范化碰撞的名称"
         )
-    d = await asyncio.to_thread(ensure_project, name)
-    return {"name": name, "path": str(d)}
+    await asyncio.to_thread(ensure_project, name)
+    return {"name": name}
 
 
 @router.delete("/api/projects")

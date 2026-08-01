@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import threading
 
@@ -9,8 +10,10 @@ import pytest
 
 import core.ollama_client as ollama_module
 import core.provider_registry as provider_registry_module
+import core.providers.http_base as http_base_module
 from core.model_provider import (
     ModelProvider,
+    ProviderError,
     ProviderValidationError,
     validate_cloud_base_url,
 )
@@ -111,6 +114,79 @@ def test_cloud_url_validation_blocks_ssrf_and_ambiguous_components():
         "https://API.EXAMPLE.com/v1/",
         resolver=PUBLIC_RESOLVER,
     ) == "https://api.example.com/v1"
+
+
+@pytest.mark.asyncio
+async def test_connect_phase_rebinding_is_rejected_before_transport_or_credentials(
+    monkeypatch,
+):
+    resolutions = iter((
+        ("93.184.216.34",),
+        ("127.0.0.1",),
+    ))
+    resolver_calls: list[str] = []
+    transport_calls: list[tuple] = []
+
+    def rebinding_resolver(host: str) -> tuple[str, ...]:
+        resolver_calls.append(host)
+        return next(resolutions)
+
+    def reject_transport(*args, **kwargs):
+        transport_calls.append((args, kwargs))
+        raise AssertionError("私网二次解析后不得创建底层 transport")
+
+    monkeypatch.setattr(
+        http_base_module,
+        "_PinnedAsyncHTTPTransport",
+        reject_transport,
+    )
+    credential = "sk-must-not-reach-connect"
+    provider = OpenAICompatibleProvider(
+        "https://rebinding.example/v1",
+        credential,
+        resolver=rebinding_resolver,
+    )
+
+    with pytest.raises(ProviderValidationError) as raised:
+        await provider.list_models()
+
+    assert raised.value.code == "provider_url_private_forbidden"
+    assert credential not in str(raised.value)
+    assert resolver_calls == ["rebinding.example", "rebinding.example"]
+    assert transport_calls == []
+    assert provider._client is None
+
+
+@pytest.mark.asyncio
+async def test_pinned_transport_preserves_port_host_and_tls_sni():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    transport = http_base_module._PinnedAsyncHTTPTransport(
+        "api.example.com",
+        ("93.184.216.34",),
+    )
+    original = transport._transport
+    await original.aclose()
+    transport._transport = httpx.MockTransport(handler)
+    try:
+        response = await transport.handle_async_request(httpx.Request(
+            "GET",
+            "https://api.example.com:8443/v1",
+            headers={"Authorization": "Bearer credential"},
+        ))
+        assert response.status_code == 200
+    finally:
+        await transport.aclose()
+
+    assert len(captured) == 1
+    request = captured[0]
+    assert str(request.url) == "https://93.184.216.34:8443/v1"
+    assert request.headers["host"] == "api.example.com:8443"
+    assert request.extensions["sni_hostname"] == "api.example.com"
 
 
 def test_secret_store_is_external_atomic_and_never_writes_plaintext(tmp_path, monkeypatch):
@@ -306,6 +382,137 @@ async def test_openai_error_is_redacted_and_redirect_is_not_followed():
     assert events[0]["http_status"] == 307
     assert "SECRET" not in json.dumps(events, ensure_ascii=False)
     assert "sk-private" not in json.dumps(events, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_json_response_declared_and_decompressed_limits_share_stable_error_code():
+    declared_limit = http_base_module.PROVIDER_RESPONSE_MAX_BYTES + 1
+
+    def declared_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-length": str(declared_limit),
+            },
+            content=b"{}",
+        )
+
+    declared = OpenAICompatibleProvider(
+        "https://api.example.com/v1",
+        "sk-private",
+        resolver=PUBLIC_RESOLVER,
+        transport=httpx.MockTransport(declared_handler),
+    )
+    try:
+        with pytest.raises(ProviderError) as raised_declared:
+            await declared.list_models()
+    finally:
+        await declared.close()
+    assert raised_declared.value.code == "provider_response_too_large"
+
+    raw = json.dumps(
+        {"data": [], "padding": "x" * http_base_module.PROVIDER_RESPONSE_MAX_BYTES},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    compressed = gzip.compress(raw)
+    assert len(compressed) < http_base_module.PROVIDER_RESPONSE_MAX_BYTES
+
+    def compressed_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+                "content-length": str(len(compressed)),
+            },
+            content=compressed,
+        )
+
+    decompressed = OpenAICompatibleProvider(
+        "https://api.example.com/v1",
+        "sk-private",
+        resolver=PUBLIC_RESOLVER,
+        transport=httpx.MockTransport(compressed_handler),
+    )
+    try:
+        with pytest.raises(ProviderError) as raised_decompressed:
+            await decompressed.list_models()
+    finally:
+        await decompressed.close()
+    assert raised_decompressed.value.code == "provider_response_too_large"
+
+
+@pytest.mark.asyncio
+async def test_sse_oversized_line_and_total_emit_provider_response_too_large():
+    oversized_line = (
+        b"data: "
+        + b"x" * (http_base_module.PROVIDER_SSE_LINE_MAX_BYTES + 1)
+        + b"\n\n"
+    )
+
+    def line_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=oversized_line,
+        )
+
+    openai = OpenAICompatibleProvider(
+        "https://api.example.com/v1",
+        "sk-private",
+        resolver=PUBLIC_RESOLVER,
+        transport=httpx.MockTransport(line_handler),
+    )
+    try:
+        line_events = [
+            event
+            async for event in openai.chat_stream(
+                "gpt-test",
+                [{"role": "user", "content": "test"}],
+            )
+        ]
+    finally:
+        await openai.close()
+    assert line_events == [{
+        "type": "error",
+        "code": "provider_response_too_large",
+        "content": "Provider 响应超过本地安全上限",
+    }]
+
+    record = b"event: ping\ndata: {}\n\n"
+    oversized_total = record * (
+        http_base_module.PROVIDER_RESPONSE_MAX_BYTES // len(record) + 1
+    )
+
+    def total_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=oversized_total,
+        )
+
+    anthropic = AnthropicProvider(
+        "https://api.anthropic.example",
+        "anthropic-private",
+        resolver=PUBLIC_RESOLVER,
+        transport=httpx.MockTransport(total_handler),
+    )
+    try:
+        total_events = [
+            event
+            async for event in anthropic.chat_stream(
+                "claude-test",
+                [{"role": "user", "content": "test"}],
+            )
+        ]
+    finally:
+        await anthropic.close()
+    assert total_events == [{
+        "type": "error",
+        "code": "provider_response_too_large",
+        "content": "Provider 响应超过本地安全上限",
+    }]
 
 
 @pytest.mark.asyncio

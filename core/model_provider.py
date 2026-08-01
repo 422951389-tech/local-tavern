@@ -104,11 +104,47 @@ def _system_resolver(host: str) -> tuple[str, ...]:
     return tuple(sorted({record[4][0].split("%", 1)[0] for record in records}))
 
 
-def _is_public_address(value: str) -> bool:
+def resolve_public_addresses(
+    host: str,
+    *,
+    resolver: DNSResolver | None = None,
+) -> tuple[str, ...]:
+    """解析并规范化公网地址，供校验与实际连接共用。
+
+    返回值可直接作为连接目标，避免先验证域名、随后由 HTTP 栈再次解析而
+    留下 DNS rebinding 时间差。任一解析结果不是公网地址时整组拒绝，禁止
+    公网与私网混合应答借由地址轮换绕过边界。
+    """
+
     try:
-        return ipaddress.ip_address(value.split("%", 1)[0]).is_global
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError:
-        return False
+        raw_addresses = tuple((resolver or _system_resolver)(host))
+    else:
+        raw_addresses = (str(literal),)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for address in raw_addresses:
+        try:
+            parsed = ipaddress.ip_address(str(address).split("%", 1)[0])
+        except ValueError:
+            parsed = None
+        if parsed is None or not parsed.is_global:
+            raise ProviderValidationError(
+                "provider_url_private_forbidden",
+                "Provider URL 必须指向公网主机",
+            )
+        rendered = str(parsed)
+        if rendered not in seen:
+            seen.add(rendered)
+            normalized.append(rendered)
+    if not normalized:
+        raise ProviderValidationError(
+            "provider_url_private_forbidden",
+            "Provider URL 必须指向公网主机",
+        )
+    return tuple(normalized)
 
 
 def validate_cloud_base_url(
@@ -171,12 +207,7 @@ def validate_cloud_base_url(
         literal = ipaddress.ip_address(ascii_host.split("%", 1)[0])
     except ValueError:
         if resolve_dns:
-            addresses = tuple((resolver or _system_resolver)(ascii_host))
-            if not addresses or any(not _is_public_address(address) for address in addresses):
-                raise ProviderValidationError(
-                    "provider_url_private_forbidden",
-                    "Provider URL 必须指向公网主机",
-                )
+            resolve_public_addresses(ascii_host, resolver=resolver)
     else:
         if not literal.is_global:
             raise ProviderValidationError(

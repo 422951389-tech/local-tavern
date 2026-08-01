@@ -60,10 +60,23 @@ export function createOnboardingController(options) {
             hideModal();
             showToast('已选择本地优先；可在顶部“模型来源”切换');
         });
-        chooseCloud.addEventListener('click', () => {
-            complete();
-            hideModal({ restoreFocus: false });
-            void showProviderSettings();
+        chooseCloud.addEventListener('click', async () => {
+            let opened = false;
+            chooseCloud.disabled = true;
+            chooseCloud.setAttribute('aria-busy', 'true');
+            chooseLocal.disabled = true;
+            try {
+                opened = await showProviderSettings() === true;
+                if (opened) complete();
+                else showToast('模型来源设置未打开，请检查提示后重试');
+            } catch (_error) {
+                showToast('模型来源设置未能打开，请稍后重试');
+            } finally {
+                chooseCloud.disabled = false;
+                chooseCloud.setAttribute('aria-busy', 'false');
+                chooseLocal.disabled = false;
+                if (!opened && chooseCloud.isConnected) chooseCloud.focus();
+            }
         });
         showModal({ title: '欢迎使用本地酒馆', body });
         return true;

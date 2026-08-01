@@ -985,8 +985,26 @@ try {
     await auditReadOnlyModals(page);
     await exerciseProductTools(page);
 
-    // 慢流取消：必须由服务端 turn 终态收口。
+    // 事件流连续失败并耗尽重连后，取消仍须主动同步终态并在当前页面解锁。
     setControl(controlFile, 'slow', { hold_ms: 60_000 });
+    const disconnectPageToken = await page.evaluate(() => {
+        globalThis.__localTavernDisconnectPageToken = crypto.randomUUID();
+        return globalThis.__localTavernDisconnectPageToken;
+    });
+    const turnEventsPattern = /\/api\/chat\/turns\/[^/]+\/events(?:\?.*)?$/;
+    let blockedTurnEventStreams = 0;
+    const blockTurnEvents = async route => {
+        blockedTurnEventStreams += 1;
+        await route.fulfill({
+            status: 503,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                error: { code: 'e2e_turn_events_unavailable', message: '受控断流' },
+            }),
+        });
+    };
+    await page.route(turnEventsPattern, blockTurnEvents);
+    expectedHttpFailure = true;
     await page.locator('#user-input').fill('继续验证');
     await page.locator('#send-btn').click();
     await page.locator('#send-cancel-btn').waitFor({ state: 'visible' });
@@ -994,9 +1012,25 @@ try {
         const session = await currentSession();
         return ['pending', 'streaming'].includes(session.message_history.at(-1)?.status);
     }, '服务端 turn 登记');
+    await waitUntil(async () => (
+        blockedTurnEventStreams >= 6
+        && await page.evaluate(() => (
+            document.querySelector('#toast-msg')?.textContent?.includes('连接已中断') === true
+        ))
+    ), 'turn 事件流重连耗尽');
     await page.locator('#send-cancel-btn').click();
     await page.waitForFunction(() => document.querySelector('#app-status')?.textContent.includes('生成已取消'));
     await page.locator('#send-cancel-btn').waitFor({ state: 'hidden' });
+    await page.unroute(turnEventsPattern, blockTurnEvents);
+    expectedHttpFailure = false;
+    assert.equal(blockedTurnEventStreams, 6);
+    assert.equal(
+        await page.evaluate(() => globalThis.__localTavernDisconnectPageToken),
+        disconnectPageToken,
+        '取消解锁不得依赖刷新页面',
+    );
+    assert.equal(await page.locator('#send-btn').isEnabled(), true);
+    assert.equal(await page.locator('#user-input').isEnabled(), true);
     const cancelled = await currentSession();
     assert.equal(cancelled.message_history.at(-1).status, 'cancelled');
 
@@ -1515,6 +1549,7 @@ try {
             'message_generation_details',
             'reply_alternative_switch', 'historical_reply_state_preservation',
             'historical_regeneration_guard',
+            'disconnect_exhaustion_cancel_unlock',
         ],
         axe_serious_critical: skipAxe ? null : viewportAudit.failures.length,
         audited_views: auditedViews,

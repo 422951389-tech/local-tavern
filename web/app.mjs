@@ -2690,18 +2690,22 @@ async function resumePersistedTurn(pointer = readPersistedTurnPointer()) {
 async function cancelActiveTurn() {
     const active = state.activeTurn;
     if (!active || !active.turnId || active.terminal || active.cancelling) return;
+    const turnId = active.turnId;
     flushActiveTurnFrame();
     cancelActiveTurnFrame();
     state.activeTurn = { ...active, cancelling: true };
     setTurnUiState(true, true);
     try {
-        const meta = await turnClient.cancel(active.turnId);
-        updateActiveTurnFromMeta(meta);
-        if (state.activeTurn && state.activeTurn.terminal && state.activeTurn.controller) {
-            state.activeTurn.controller.abort();
+        const meta = await turnClient.cancel(turnId);
+        if (!updateActiveTurnFromMeta(meta)) return;
+        const current = state.activeTurn;
+        if (current && current.turnId === turnId && current.terminal) {
+            if (current.controller && !current.controller.signal.aborted) current.controller.abort();
+            // consumeActiveTurn 在重连耗尽后已经退出，不能依赖它再次触发终态同步。
+            await finalizeActiveTurn(turnId);
         }
     } catch (error) {
-        if (state.activeTurn && state.activeTurn.turnId === active.turnId) {
+        if (state.activeTurn && state.activeTurn.turnId === turnId) {
             state.activeTurn = { ...state.activeTurn, cancelling: false };
             setTurnUiState(true, false);
         }
@@ -4207,7 +4211,7 @@ function showGlobalSearch() {
 async function showProviderSettings() {
     if (state.navigationBusy || isTurnActiveForRef(committedSessionRef)) {
         showToast('当前正在切换或生成，请稍候');
-        return;
+        return false;
     }
     const requestRef = captureSessionRef();
     let initial;
@@ -4219,50 +4223,55 @@ async function showProviderSettings() {
         ]);
     } catch (error) {
         showToast(`读取模型来源失败：${errorDetail(error)}`, 3500);
-        return;
+        return false;
     }
-    if (!isCurrentSessionRef(requestRef)) return;
-    state.providerPresets = presets;
-    handleProviderSnapshotChanged(initial);
-    const view = createProviderSettingsView({
-        documentRef: document,
-        service: providerService,
-        initial,
-        presets,
-        currentProvider: state.activeProvider,
-        currentModel: (state.session && state.session.current_model) || '',
-        onPendingChange: pending => modalController.setPending(pending),
-        onChanged: snapshot => handleProviderSnapshotChanged(snapshot),
-        confirmCredentialDelete: provider => confirm(
-            `删除「${provider.name}」的本机密钥？删除后该来源将无法调用，除非重新保存密钥。`,
-        ),
-        confirmProviderDelete: provider => {
-            if (provider.id === state.activeProvider) {
-                showToast('请先切换到其他模型来源，再删除当前配置');
-                return false;
-            }
-            return confirm(`删除模型来源「${provider.name}」及其本机密钥？此操作无法撤销。`);
-        },
-        onActivate: async ({ provider, model }) => {
-            if (!isCurrentSessionRef(requestRef)) throw new Error('当前项目或存档已切换，请重新打开设置');
-            const token = modelSwitchGate.acquire();
-            if (token === null) throw new Error('另一个模型切换仍在进行');
-            try {
-                const result = await sessionWrite(API.switchModel, 'POST', {
-                    project: requestRef.project,
-                    save: requestRef.save,
-                    provider,
-                    model,
-                }, '切换模型来源');
-                if (state.session) await syncModelsFromSession(state.session);
-                showToast(`已切换到「${providerFromSnapshot(provider)?.name || provider}」`);
-                return result;
-            } finally {
-                modelSwitchGate.release(token);
-            }
-        },
-    });
-    showModal({ title: '模型来源与连接', body: view.root });
+    if (!isCurrentSessionRef(requestRef)) return false;
+    try {
+        state.providerPresets = presets;
+        handleProviderSnapshotChanged(initial);
+        const view = createProviderSettingsView({
+            documentRef: document,
+            service: providerService,
+            initial,
+            presets,
+            currentProvider: state.activeProvider,
+            currentModel: (state.session && state.session.current_model) || '',
+            onPendingChange: pending => modalController.setPending(pending),
+            onChanged: snapshot => handleProviderSnapshotChanged(snapshot),
+            confirmCredentialDelete: provider => confirm(
+                `删除「${provider.name}」的本机密钥？删除后该来源将无法调用，除非重新保存密钥。`,
+            ),
+            confirmProviderDelete: provider => {
+                if (provider.id === state.activeProvider) {
+                    showToast('请先切换到其他模型来源，再删除当前配置');
+                    return false;
+                }
+                return confirm(`删除模型来源「${provider.name}」及其本机密钥？此操作无法撤销。`);
+            },
+            onActivate: async ({ provider, model }) => {
+                if (!isCurrentSessionRef(requestRef)) throw new Error('当前项目或存档已切换，请重新打开设置');
+                const token = modelSwitchGate.acquire();
+                if (token === null) throw new Error('另一个模型切换仍在进行');
+                try {
+                    const result = await sessionWrite(API.switchModel, 'POST', {
+                        project: requestRef.project,
+                        save: requestRef.save,
+                        provider,
+                        model,
+                    }, '切换模型来源');
+                    if (state.session) await syncModelsFromSession(state.session);
+                    showToast(`已切换到「${providerFromSnapshot(provider)?.name || provider}」`);
+                    return result;
+                } finally {
+                    modelSwitchGate.release(token);
+                }
+            },
+        });
+        return showModal({ title: '模型来源与连接', body: view.root }) === true;
+    } catch (error) {
+        showToast(`打开模型来源失败：${errorDetail(error)}`, 3500);
+        return false;
+    }
 }
 
 function setResponsiveMenuOpen(button, menu, open, { restoreFocus = false } = {}) {
