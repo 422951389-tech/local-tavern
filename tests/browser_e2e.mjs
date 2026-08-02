@@ -276,17 +276,17 @@ async function createSnapshot() {
     );
 }
 
-async function openSaveDropdown(page) {
+async function openSaveManager(page) {
     await page.locator('#tab-saves').click();
-    await page.locator('#save-dropdown').waitFor({ state: 'visible' });
+    await page.locator('.save-manager').waitFor({ state: 'visible' });
 }
 
 async function switchSave(page, save) {
-    await openSaveDropdown(page);
-    await page.locator(`.dropdown-item[data-save="${save}"]`).click();
-    await page.waitForFunction(target => (
-        document.querySelector(`.dropdown-item[data-save="${target}"]`)?.classList.contains('active')
-    ), save);
+    await openSaveManager(page);
+    await page.locator('.save-manager-card').filter({ hasText: save })
+        .getByRole('button', { name: '切换到这个存档' }).click();
+    await page.locator('#current-session-label').filter({ hasText: save }).waitFor();
+    await closeModalAfterAudit(page);
 }
 
 async function switchProject(page, project) {
@@ -423,6 +423,33 @@ async function closeModalAfterAudit(page) {
     await page.locator('#modal-backdrop').waitFor({ state: 'hidden' });
 }
 
+async function assertWorldWorkspaceLayout(page, name) {
+    const layout = await page.evaluate(() => {
+        const modal = document.querySelector('#modal');
+        const body = document.querySelector('#modal-body');
+        const workspace = document.querySelector('.world-workspace');
+        const rect = element => element?.getBoundingClientRect();
+        const modalRect = rect(modal);
+        const bodyRect = rect(body);
+        const workspaceRect = rect(workspace);
+        return {
+            pageOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+            bodyOverflow: body ? body.scrollWidth - body.clientWidth : null,
+            workspaceOverflow: workspace ? workspace.scrollWidth - workspace.clientWidth : null,
+            unusedBottom: modalRect && bodyRect ? Math.round((modalRect.bottom - bodyRect.bottom) * 10) / 10 : null,
+            workspaceFillsBody: Boolean(
+                bodyRect && workspaceRect
+                && Math.abs(bodyRect.height - workspaceRect.height) <= 1
+            ),
+        };
+    });
+    assert.equal(layout.pageOverflow <= 0, true, `${name}: 页面横向溢出`);
+    assert.equal(layout.bodyOverflow <= 0, true, `${name}: 工作台容器横向溢出`);
+    assert.equal(layout.workspaceOverflow <= 0, true, `${name}: 世界工作台横向溢出`);
+    assert.equal(layout.unusedBottom <= 1, true, `${name}: 工作台底部存在无效空白`);
+    assert.equal(layout.workspaceFillsBody, true, `${name}: 工作台没有填满可用高度`);
+}
+
 async function auditReadOnlyModals(page) {
     await clickTopbarTool(page, '#model-params-btn');
     await auditOpenModal(page, 'model_params');
@@ -445,21 +472,14 @@ async function auditReadOnlyModals(page) {
     });
     await closeModalAfterAudit(page);
 
-    await openSaveDropdown(page);
-    await page.locator('#save-new-inline').click();
-    await auditOpenModal(page, 'new_save');
-    await closeModalAfterAudit(page);
-
-    await openSaveDropdown(page);
-    await page.locator('#save-rename-inline').click();
-    await auditOpenModal(page, 'rename_save');
-    await closeModalAfterAudit(page);
-
-    await openSaveDropdown(page);
-    const chooserPromise = page.waitForEvent('filechooser');
-    await page.locator('#save-import-inline').click();
-    await chooserPromise;
-    await auditOpenModal(page, 'import_save', { statusSelectors: ['#save-import-status'] });
+    await openSaveManager(page);
+    assert.match(await page.locator('.save-manager').textContent(), /新建存档.*导入存档.*当前存档.*存档名称.*保存名称.*导出备份/s);
+    await auditOpenModal(page, 'save_manager', { statusSelectors: ['.save-manager-status'] });
+    if (screenshotPath) {
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await page.screenshot({ path: screenshotSibling('module-saves-1440'), animations: 'disabled' });
+        await page.setViewportSize({ width: 375, height: 812 });
+    }
     await closeModalAfterAudit(page);
 
     await clickTopbarTool(page, '#history-btn');
@@ -470,18 +490,127 @@ async function auditReadOnlyModals(page) {
     await clickNavTool(page, '#tab-chars');
     await page.locator('#ce-status').waitFor({ state: 'attached' });
     await auditOpenModal(page, 'character_cards', { statusSelectors: ['#ce-status'] });
+    if (screenshotPath) {
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await page.screenshot({ path: screenshotSibling('module-characters-1440'), animations: 'disabled' });
+        await page.setViewportSize({ width: 375, height: 812 });
+    }
+    await closeModalAfterAudit(page);
+
+    await clickNavTool(page, '#tab-relations');
+    await page.locator('.relationship-editor').waitFor({ state: 'visible' });
+    await auditOpenModal(page, 'relationships');
+    if (screenshotPath) {
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await page.screenshot({ path: screenshotSibling('module-relationships-1440'), animations: 'disabled' });
+        await page.setViewportSize({ width: 375, height: 812 });
+    }
+    await closeModalAfterAudit(page);
+
+    await clickNavTool(page, '#tab-user');
+    await page.locator('.card-editor-user').waitFor({ state: 'visible' });
+    await auditOpenModal(page, 'user_profile', { statusSelectors: ['#ce-status'] });
+    if (screenshotPath) {
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await page.screenshot({ path: screenshotSibling('module-user-1440'), animations: 'disabled' });
+        await page.setViewportSize({ width: 375, height: 812 });
+    }
     await closeModalAfterAudit(page);
 }
 
 async function exerciseProductTools(page) {
     await clickTopbarTool(page, '#diagnostics-center-btn');
     await page.locator('.diagnostics-snapshot').waitFor();
-    assert.match(await page.locator('.diagnostics-center').textContent(), /整体状态.*健康检查.*不包含 API Key/s);
+    assert.match(await page.locator('.diagnostics-center').textContent(), /整体状态.*健康检查.*不包含.*API Key/s);
     if (screenshotPath) await page.screenshot({ path: screenshotSibling('diagnostics'), animations: 'disabled' });
+    await page.locator('.diagnostics-center').getByRole('button', { name: '预览故障报告' }).click();
+    await page.locator('.fault-report-preview').waitFor({ state: 'visible' });
+    assert.match(await page.locator('.fault-report-preview').textContent(), /故障报告预览.*没有对话、设定正文和凭据/s);
     const downloadPromise = page.waitForEvent('download');
-    await page.locator('.diagnostics-center').getByRole('button', { name: '下载脱敏支持包' }).click();
+    await page.locator('.fault-report-preview').getByRole('button', { name: '导出故障报告（JSON）' }).click();
     const download = await downloadPromise;
-    assert.match(download.suggestedFilename(), /^local-tavern-support-\d{4}-\d{2}-\d{2}\.json$/);
+    assert.match(download.suggestedFilename(), /^local-tavern-fault-report-\d{4}-\d{2}-\d{2}\.json$/);
+    await closeModalAfterAudit(page);
+
+    await page.locator('#world-context-bar').click();
+    await page.locator('.world-workspace').waitFor();
+    assert.match(await page.locator('.world-workspace').textContent(), /世界设定.*当前世界变化.*设定关联/s);
+    await page.locator('.world-state-workspace').waitFor();
+    await page.locator('.world-workspace-mode', { hasText: '世界设定' }).click();
+    await page.locator('.worldbook-editor').waitFor();
+    assert.match(await page.locator('.worldbook-editor').textContent(), /整个项目中共用.*基本内容.*详细设定.*什么时候参考.*谁知道这件事.*关联角色与其他设定.*专业设置/s);
+    if (await page.locator('.worldbook-entry-row').count() === 0) {
+        const worldbook = page.locator('.worldbook-editor');
+        await worldbook.getByLabel('设定名称').fill('琉璃宫');
+        await worldbook.getByLabel('一句话介绍（可选）').fill('帝都权力中心');
+        await worldbook.getByLabel('设定类型', { exact: true }).selectOption('location');
+        await worldbook.getByLabel('详细内容').fill('琉璃宫是帝都的权力中心。');
+        await worldbook.getByRole('button', { name: '保存设定' }).click();
+        await page.locator('.worldbook-entry-row').filter({ hasText: '琉璃宫' }).waitFor();
+
+        await worldbook.getByRole('button', { name: '新建设定' }).click();
+        await worldbook.getByLabel('设定名称').fill('花园');
+        await worldbook.getByLabel('一句话介绍（可选）').fill('琉璃宫内的会面地点');
+        await worldbook.getByLabel('设定类型', { exact: true }).selectOption('location');
+        await worldbook.getByLabel('详细内容').fill('花园位于琉璃宫内。');
+        await worldbook.getByText('关联角色与其他设定', { exact: true }).click();
+        await worldbook.getByLabel('搜索关联世界设定').fill('琉璃宫');
+        await worldbook.locator('.worldbook-field-linked_entry_ids .worldbook-entity-choice').filter({ hasText: '琉璃宫' }).locator('input').check();
+        await worldbook.getByRole('button', { name: '保存设定' }).click();
+        await page.locator('.worldbook-entry-row').filter({ hasText: '花园' }).waitFor();
+    }
+    await page.locator('.worldbook-entry-row').filter({ hasText: '花园' }).getByRole('button').first().click();
+    const gardenLinkState = await page.evaluate(() => ({
+        inspector: document.querySelector('.worldbook-selection-inspector')?.textContent || '',
+        checked: [...document.querySelectorAll('.worldbook-field-linked_entry_ids input[type="checkbox"]:checked')]
+            .map(input => input.value),
+    }));
+    assert.match(gardenLinkState.inspector, /世界设定 1/, JSON.stringify(gardenLinkState));
+    assert.equal(gardenLinkState.checked.length, 1, JSON.stringify(gardenLinkState));
+    await page.locator('.worldbook-editor').getByText('关联角色与其他设定', { exact: true }).click();
+    await page.getByRole('button', { name: '＋ 新建关联设定' }).waitFor();
+    await page.locator('.world-workspace-mode', { hasText: '设定关联' }).click();
+    await page.locator('.world-relations-workspace').waitFor();
+    await page.locator('.world-relation-node').first().waitFor();
+    await page.locator('.world-workspace-mode', { hasText: '当前世界变化' }).click();
+    await page.locator('.world-state-sidebar').getByRole('button', { name: '＋ 记录变化' }).click();
+    await page.locator('.world-change-editor').waitFor();
+    await page.locator('.world-change-editor').getByLabel('变化标题').fill('浏览器世界变化');
+    await page.locator('.world-change-editor').getByLabel('影响与结果').fill('用于验证新增、编辑、状态流转和删除。');
+    await page.locator('.world-change-editor').getByLabel('类型').selectOption('event');
+    const relatedChoice = page.locator('.world-change-editor .world-picker').filter({ hasText: '关联世界设定' }).locator('input[type="checkbox"]').first();
+    if (await relatedChoice.count()) await relatedChoice.check();
+    await page.locator('.world-change-editor').getByRole('button', { name: '记录并应用' }).click();
+    const browserChange = page.locator('.world-change-timeline-card').filter({ hasText: '浏览器世界变化' });
+    await browserChange.waitFor({ state: 'attached' });
+    await page.locator('.world-change-editor').getByLabel('状态').selectOption('resolved');
+    await page.locator('.world-change-editor').getByRole('button', { name: '保存并应用' }).click();
+    await page.waitForFunction(() => document.querySelector('.world-change-timeline-card.active .world-change-status')?.textContent === '已解决');
+    await assertWorldWorkspaceLayout(page, 'world_state_375');
+    if (screenshotPath) {
+        await page.screenshot({ path: screenshotSibling('world_context-375'), animations: 'disabled' });
+        await page.setViewportSize({ width: 1440, height: 900 });
+        await page.locator('.world-workspace-mode', { hasText: '世界设定' }).click();
+        await page.locator('.worldbook-editor').waitFor();
+        await assertWorldWorkspaceLayout(page, 'world_library_1440');
+        await page.screenshot({ path: screenshotSibling('world_library-1440'), animations: 'disabled' });
+        await page.locator('.world-workspace-mode', { hasText: '设定关联' }).click();
+        await page.locator('.world-relations-workspace').waitFor();
+        await assertWorldWorkspaceLayout(page, 'world_relations_1440');
+        await page.screenshot({ path: screenshotSibling('world_relations-1440'), animations: 'disabled' });
+        await page.setViewportSize({ width: 768, height: 900 });
+        await assertWorldWorkspaceLayout(page, 'world_relations_768');
+        await page.screenshot({ path: screenshotSibling('world_relations-768'), animations: 'disabled' });
+        await page.locator('.world-workspace-mode', { hasText: '当前世界变化' }).click();
+        await page.locator('.world-state-workspace').waitFor();
+        await browserChange.click();
+        await page.locator('.world-change-editor').getByRole('button', { name: '删除记录' }).waitFor();
+        await assertWorldWorkspaceLayout(page, 'world_state_768');
+        await page.screenshot({ path: screenshotSibling('world_state-768'), animations: 'disabled' });
+        await page.setViewportSize({ width: 375, height: 760 });
+    }
+    await page.locator('.world-change-editor').getByRole('button', { name: '删除记录' }).click();
+    await browserChange.waitFor({ state: 'detached' });
     await closeModalAfterAudit(page);
 
     await clickTopbarTool(page, '#backup-center-btn');
@@ -1449,24 +1578,21 @@ try {
 
     // 恶意导入不得生成可执行 DOM，错误只以文本呈现。
     await page.evaluate(() => { window.__tavernE2eXss = 0; });
-    await openSaveDropdown(page);
-    const chooserPromise = page.waitForEvent('filechooser');
-    await page.locator('#save-import-inline').click();
-    const chooser = await chooserPromise;
+    await openSaveManager(page);
     expectedHttpFailure = true;
-    await chooser.setFiles({
+    await page.locator('#save-manager-import-file').setInputFiles({
         name: 'malicious.json',
         mimeType: 'application/json',
         buffer: Buffer.from('<img src=x onerror="window.__tavernE2eXss=1">', 'utf8'),
     });
-    await page.waitForFunction(() => document.querySelector('#save-import-status')?.textContent.includes('导入失败'));
+    await page.waitForFunction(() => document.querySelector('.save-manager-status')?.textContent.includes('操作失败'));
     expectedHttpFailure = false;
     const importSafety = await page.evaluate(() => ({
-        status: document.querySelector('#save-import-status')?.textContent || '',
+        status: document.querySelector('.save-manager-status')?.textContent || '',
         executableNodes: document.querySelectorAll('#modal-body script,#modal-body img').length,
         xss: window.__tavernE2eXss,
     }));
-    assert.match(importSafety.status, /^导入失败：/);
+    assert.match(importSafety.status, /^操作失败：/);
     assert.equal(importSafety.executableNodes, 0);
     assert.equal(importSafety.xss, 0);
     await page.locator('#modal-close').click();

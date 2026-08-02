@@ -29,6 +29,7 @@ SMOKE_SCHEMA_VERSION = 1
 SMOKE_TIMEOUT_MS = 60_000
 SMOKE_TITLE_PREFIX = "__LOCAL_TAVERN_SMOKE_V1__"
 LEGACY_ROOT = Path("C:/local-tavern")
+DESKTOP_RENDERERS = frozenset({"software", "hardware"})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,8 +98,54 @@ def _base_smoke_result() -> dict[str, Any]:
         "scheme": "tavern://app",
         "tcp_listener_started": False,
         "off_the_record": False,
+        "desktop_renderer": os.environ.get(
+            "TAVERN_DESKTOP_RENDERER_ACTIVE",
+            "software",
+        ),
         "error": "",
     }
+
+
+def _resolve_desktop_renderer(
+    settings_path: Path,
+    environment: dict[str, str] | None = None,
+) -> str:
+    """在导入 QtWebEngine 前确定渲染器；异常配置安全回退到软件模式。"""
+
+    env = os.environ if environment is None else environment
+    override = str(env.get("TAVERN_DESKTOP_RENDERER", "")).strip().casefold()
+    if override in DESKTOP_RENDERERS:
+        return override
+    try:
+        payload = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return "software"
+    configured = (
+        str(payload.get("desktop_renderer", "")).strip().casefold()
+        if isinstance(payload, dict)
+        else ""
+    )
+    return configured if configured in DESKTOP_RENDERERS else "software"
+
+
+def _configure_desktop_renderer(
+    settings_path: Path,
+    environment: dict[str, str] | None = None,
+) -> str:
+    """写入 Qt WebEngine 启动标志，必须在任何 QtWebEngine 导入前调用。"""
+
+    env = os.environ if environment is None else environment
+    mode = _resolve_desktop_renderer(settings_path, env)
+    flags = [
+        flag
+        for flag in str(env.get("QTWEBENGINE_CHROMIUM_FLAGS", "")).split()
+        if flag != "--disable-gpu"
+    ]
+    if mode == "software":
+        flags.append("--disable-gpu")
+    env["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags)
+    env["TAVERN_DESKTOP_RENDERER_ACTIVE"] = mode
+    return mode
 
 
 def _append_bootstrap_log(stage: str, exc: BaseException) -> Path | None:
@@ -218,6 +265,13 @@ def main(argv: list[str] | None = None) -> int:
             resource_root,
             defer_storage_initialization=True,
         )
+        settings_path = Path(
+            os.environ.get(
+                "TAVERN_SETTINGS_PATH",
+                str(paths.user_root / "data" / "settings.json"),
+            )
+        )
+        _configure_desktop_renderer(settings_path)
     except Exception as exc:  # noqa: BLE001 - Qt 前必须稳定落盘并退出
         if journey_requested:
             from .journey import write_journey_failure

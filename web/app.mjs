@@ -9,6 +9,7 @@ import {
 } from './card-editor.mjs';
 import { createProjectService } from './projects.mjs';
 import { createSaveService } from './saves.mjs';
+import { createSaveManager } from './save-manager.mjs';
 import { createTurnPayload, createTurnPersistence } from './chat.mjs';
 import { createSummaryService, summaryPatchFromForm } from './summaries.mjs';
 import { renderSummaryPanelView } from './summary-panel.mjs';
@@ -74,6 +75,10 @@ import { createBackupController } from './backup-controller.mjs';
 import { createDiagnosticsController } from './diagnostics-controller.mjs';
 import { createMemoryController } from './memory-controller.mjs';
 import { createOnboardingController } from './onboarding-controller.mjs';
+import {
+    appendMessageWorldEffects,
+    createWorldContextController,
+} from './world-context.mjs?v=workspace-20260802-world3';
 
 // 本地酒馆 — 前端逻辑 v2（项目+存档双层架构）
 // 流式对话、角色卡渲染、行动建议、会话管理、提示词编辑
@@ -140,6 +145,10 @@ const API = {
     worldbookSave: (id) => `/api/worldbook/${encodeURIComponent(id)}`,
     worldbookDelete: (id) => `/api/worldbook/${encodeURIComponent(id)}`,
     worldbookManual: '/api/session/worldbook/manual',
+    worldDiscoveries: '/api/session/world-state/discoveries',
+    worldChanges: '/api/session/world-state/changes',
+    worldChangeUpdate: id => `/api/session/world-state/changes/${encodeURIComponent(id)}`,
+    worldChangeDelete: id => `/api/session/world-state/changes/${encodeURIComponent(id)}`,
     roleplaySilence: (id) => `/api/session/characters/${encodeURIComponent(id)}/silence`,
     roleplayPolicy: '/api/session/roleplay-policy',
     relationships: '/api/session/relationships',
@@ -229,6 +238,7 @@ let unreadChatUpdates = 0;
 let inspectorRestoreFocus = null;
 let uiBound = false;
 let initializationInFlight = false;
+let worldContextController = null;
 
 const backupController = createBackupController({
     documentRef: document,
@@ -268,6 +278,27 @@ const onboardingController = createOnboardingController({
     hideModal,
     showToast,
     showProviderSettings,
+});
+worldContextController = createWorldContextController({
+    documentRef: document,
+    showModal,
+    hideModal,
+    listEntries: () => worldbookService.list(captureSessionRef().project),
+    getSession: () => state.session,
+    getCharacters: () => state.characters,
+    getDiagnostics: () => ({ worldbook_matches: worldbookDiagnosticsForRef(captureSessionRef()) }),
+    sessionWrite,
+    endpoints: {
+        discoveries: API.worldDiscoveries,
+        changes: API.worldChanges,
+        updateChange: API.worldChangeUpdate,
+        removeChange: API.worldChangeDelete,
+    },
+    buildLibraryEditor: buildWorldbookEditor,
+    onLocateMessage: messageId => locateMessageForSearch(messageId),
+    showToast,
+    confirmAction: message => confirm(message),
+    errorDetail,
 });
 
 function sessionIdentity(ref) {
@@ -433,6 +464,7 @@ function rememberWorldbookDiagnostics(ref, promptDiagnostics) {
         epoch: ref.epoch,
         entries: Object.freeze(entries),
     });
+    if (worldContextController) worldContextController.render();
     return entries;
 }
 
@@ -686,7 +718,7 @@ async function renderProjectDropdown(requestRef = captureSessionRef()) {
             'span',
             'project-item-stats',
             `角色 ${projectStatValue(st, 'characters', 'characters_unavailable')} · `
-                + `世界书 ${projectStatValue(st, 'worldbook', 'worldbook_unavailable')} · `
+                + `世界设定 ${projectStatValue(st, 'worldbook', 'worldbook_unavailable')} · `
                 + `存档 ${projectStatValue(st, 'saves', 'sessions_unavailable')}`,
         ));
         listEl.appendChild(item);
@@ -705,7 +737,7 @@ function updateProjectButton(statsMap) {
         const st = statsMap[state.currentProject] || { characters:0, worldbook:0, saves:0 };
         statsEl.replaceChildren(
             domElement('span', 'stat', `角色 ${projectStatValue(st, 'characters', 'characters_unavailable')}`),
-            domElement('span', 'stat', `世界书 ${projectStatValue(st, 'worldbook', 'worldbook_unavailable')}`),
+            domElement('span', 'stat', `世界设定 ${projectStatValue(st, 'worldbook', 'worldbook_unavailable')}`),
             domElement('span', 'stat', `存档 ${projectStatValue(st, 'saves', 'sessions_unavailable')}`),
         );
     }
@@ -1297,15 +1329,15 @@ async function renameCurrentSave(newName) {
 }
 
 async function deleteCurrentSave() {
-    if (!state.currentSave) return;
+    if (!state.currentSave) return false;
     if (state.saveList.length <= 1) {
         alert('至少保留 1 个存档');
-        return;
+        return false;
     }
     const requestRef = captureSessionRef();
     const s = state.saveList.find(x => x.session_id === state.currentSave);
     const name = s ? s.name : state.currentSave;
-    if (!confirm(`确认删除存档「${name}」？删除后将移入回收区，可以恢复。`)) return;
+    if (!confirm(`确认删除存档「${name}」？删除后将移入回收区，可以恢复。`)) return false;
 
     let body;
     try {
@@ -1318,29 +1350,32 @@ async function deleteCurrentSave() {
         }
     } catch (error) {
         alert('删除失败：' + error.message);
-        return;
+        return false;
     }
-    if (!isCurrentSessionRef(requestRef)) return;
+    if (!isCurrentSessionRef(requestRef)) return false;
     writeComposerDraft(requestRef, '');
     showToast('存档已移入回收区，可恢复');
     try {
         await loadProjectContext(requestRef.project);
     } catch (error) {
         showToast(`刷新剩余存档失败：${errorDetail(error)}`, 3000);
+        return false;
     }
+    return true;
 }
 
 async function exportCurrentSave() {
-    if (!state.currentSave) return;
+    if (!state.currentSave) return false;
     const requestRef = captureSessionRef();
     const data = await saveService.exportJson(requestRef.project, requestRef.save);
-    if (!isCurrentSessionRef(requestRef)) return;
+    if (!isCurrentSessionRef(requestRef)) return false;
     const blob = new Blob([data.json_str], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `${state.session.name || state.currentSave}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
+    return true;
 }
 
 async function importSave(file) {
@@ -1352,6 +1387,35 @@ async function importSave(file) {
     if (!isCurrentSessionRef(requestRef)) return false;
     await loadSaveList(requestRef);
     return true;
+}
+
+function showSaveManager() {
+    if (state.navigationBusy || isTurnActiveForRef(committedSessionRef)) {
+        showToast('当前正在切换或生成，请稍候');
+        return;
+    }
+    const manager = createSaveManager({
+        documentRef: document,
+        getState: () => ({
+            project: state.currentProject,
+            currentSaveId: state.currentSave,
+            currentModel: state.session && state.session.current_model,
+            saves: state.saveList,
+        }),
+        onSwitch: switchSave,
+        onCreate: createNewSave,
+        onRename: renameCurrentSave,
+        onDelete: deleteCurrentSave,
+        onExport: exportCurrentSave,
+        onImport: importSave,
+        onPendingChange: pending => modalController.setPending(pending),
+    });
+    showModal({
+        title: '故事存档',
+        body: manager.root,
+        dialogClass: 'story-module-dialog save-manager-dialog',
+        onBeforeClose: () => !manager.isPending(),
+    });
 }
 
 async function switchProject(newProject) {
@@ -1410,6 +1474,7 @@ function renderSession(session) {
         `${user.name || '未命名'} · ${user.identity || '身份未设定'} · ${user.condition || '状态未设定'}`
         + `${(user.abilities || []).length ? ` · 能力：${user.abilities.join('、')}` : ''}`;
     renderCharacterPanel(session);
+    if (worldContextController) worldContextController.render(session);
 }
 
 function renderCharacterPanel(session) {
@@ -1561,7 +1626,7 @@ function showMessageGenerationDetails(message) {
         context.appendChild(metrics);
         const note = domElement(
             'p', 'product-help',
-            `估算器：${details.context.estimator || '未记录'} · 来源：${details.context.contextLimitSource || '未记录'} · 世界书命中：${details.context.worldbookMatchCount}`,
+            `估算器：${details.context.estimator || '未记录'} · 来源：${details.context.contextLimitSource || '未记录'} · 世界设定使用：${details.context.worldbookMatchCount}`,
         );
         context.appendChild(note);
         if (details.context.sources.length) {
@@ -1703,6 +1768,17 @@ function buildAssistantMessage(content, thinking = '', msgData = null) {
             scroll: false,
         });
     }
+    appendMessageWorldEffects(
+        document,
+        div,
+        msgData || {},
+        entryId => {
+            if (worldContextController) void worldContextController.showWorkbench('library', { entryId });
+        },
+        intent => {
+            if (worldContextController) void worldContextController.showWorkbench('state', intent);
+        },
+    );
     const actions = div.querySelector('.msg-actions');
     if (actions) {
         const detailsButton = domElement('button', 'msg-action-btn details');
@@ -2840,6 +2916,16 @@ async function sendMessage(text = null) {
 //   prefix:      CSS class 前缀（cf/wf/uf）— 防止冲突
 // ============================================================
 
+function generatedEntityId(prefix, items, idField) {
+    const safePrefix = String(prefix || 'entry').replace(/[^a-z0-9_-]/gi, '').toLowerCase() || 'entry';
+    const used = new Set((items || []).map(item => String(item && item[idField] || '')));
+    const base = `${safePrefix}_${Date.now().toString(36)}`;
+    let candidate = base;
+    let suffix = 2;
+    while (used.has(candidate)) candidate = `${base}_${suffix++}`;
+    return candidate;
+}
+
 async function createCardEditor(config) {
     const editorRef = config.sessionRef || captureSessionRef();
     config.sessionRef = editorRef;
@@ -2874,9 +2960,17 @@ async function createCardEditor(config) {
     }
 
     // 2. 构造 modal HTML
+    let cardDirty = false;
     const body = document.createElement('div');
-    body.className = `card-editor card-editor-${config.prefix}`;
+    body.className = `card-editor card-editor-${config.prefix} story-module`;
+    if (config.description) {
+        const intro = domElement('div', 'story-module-intro');
+        intro.appendChild(domElement('p', '', config.description));
+        if (config.scopeLabel) intro.appendChild(domElement('span', 'story-scope-badge', config.scopeLabel));
+        body.appendChild(intro);
+    }
     const panel = domElement('div', 'cards-panel-inner');
+    if (!config.allowNew) panel.classList.add('is-single-card');
     if (config.allowNew) {
         const list = domElement('div', 'cards-list');
         list.id = 'ce-list';
@@ -2886,7 +2980,12 @@ async function createCardEditor(config) {
     cardForm.id = 'ce-form';
     panel.appendChild(cardForm);
     body.appendChild(panel);
-    showModal({ title: config.title, body });
+    showModal({
+        title: config.title,
+        body,
+        dialogClass: config.dialogClass || 'story-module-dialog card-editor-dialog',
+        onBeforeClose: () => !cardDirty || confirm('当前内容尚未保存，确定关闭吗？'),
+    });
 
     const listEl = body.querySelector('#ce-list');
     const formEl = body.querySelector('#ce-form');
@@ -2895,6 +2994,12 @@ async function createCardEditor(config) {
     let cardPending = false;
     let cardStatusMessage = '';
     let cardStatusError = false;
+    let listQuery = '';
+
+    function allowCardSwitch() {
+        if (!cardDirty) return true;
+        return confirm('当前内容尚未保存，确定放弃并切换吗？');
+    }
 
     function updateCardStatus(message, error = false) {
         cardStatusMessage = String(message || '');
@@ -2941,7 +3046,20 @@ async function createCardEditor(config) {
     function renderList() {
         if (!listEl) return;
         listEl.replaceChildren();
-        const newButton = domElement('button', 'modal-btn new-card-btn', '＋ 新建');
+        const listHeading = domElement('div', 'card-list-heading');
+        listHeading.appendChild(domElement('h3', '', config.listTitle || '角色'));
+        listHeading.appendChild(domElement('span', 'story-status-badge', `${items.length} 个`));
+        listEl.appendChild(listHeading);
+        const search = document.createElement('input');
+        search.type = 'search';
+        search.className = 'card-list-search';
+        search.id = `${config.prefix}-card-search`;
+        search.value = listQuery;
+        search.placeholder = config.searchPlaceholder || '搜索名称或简介';
+        const searchLabel = domElement('label', 'sr-only', search.placeholder);
+        searchLabel.htmlFor = search.id;
+        listEl.append(searchLabel, search);
+        const newButton = domElement('button', 'modal-btn primary new-card-btn', config.newLabel || '新建角色');
         newButton.type = 'button';
         newButton.id = 'ce-new';
         listEl.appendChild(newButton);
@@ -2955,19 +3073,37 @@ async function createCardEditor(config) {
                 Boolean(currentItem && currentItem[config.idField] === it[config.idField]),
             );
             row.dataset.id = id;
+            row.dataset.search = `${name} ${String(config.itemMeta ? config.itemMeta(it) : '')}`.toLocaleLowerCase('zh-CN');
             row.setAttribute('aria-label', `编辑卡片 ${name}`);
             row.appendChild(domElement('span', 'card-row-name', name));
+            const meta = config.itemMeta ? String(config.itemMeta(it) || '') : '';
+            if (meta) row.appendChild(domElement('span', 'card-row-meta', meta));
             listEl.appendChild(row);
         });
+        const applyListFilter = () => {
+            listQuery = search.value;
+            const query = listQuery.trim().toLocaleLowerCase('zh-CN');
+            listEl.querySelectorAll('.card-row').forEach(row => {
+                row.hidden = Boolean(query && !row.dataset.search.includes(query));
+            });
+        };
+        search.addEventListener('input', applyListFilter);
+        applyListFilter();
         syncCardListSelection();
         listEl.querySelector('#ce-new').addEventListener('click', () => {
+            if (currentItem !== null && !allowCardSwitch()) return;
             currentItem = null;
+            cardDirty = false;
+            cardStatusMessage = '';
             syncCardListSelection();
             renderForm();
         });
         listEl.querySelectorAll('.card-row').forEach(row => {
             row.addEventListener('click', () => {
+                if (currentItem && currentItem[config.idField] !== row.dataset.id && !allowCardSwitch()) return;
                 currentItem = items.find(it => it[config.idField] === row.dataset.id) || null;
+                cardDirty = false;
+                cardStatusMessage = '';
                 syncCardListSelection();
                 renderForm();
             });
@@ -2981,6 +3117,7 @@ async function createCardEditor(config) {
         row.dataset.key = fd.key;
         row.dataset.type = fd.type;
         row.dataset.label = fd.label || fd.key || '字段';
+        if (fd.hidden) row.hidden = true;
         if (fd.array) row.dataset.array = '1';
         if (fd.required) row.dataset.required = '1';
         const integerField = fd.type === 'integer' || fd.integer === true || fd.key === 'chattiness';
@@ -2991,7 +3128,7 @@ async function createCardEditor(config) {
 
         const handle = document.createElement('span');
         handle.className = 'fld-handle';
-        handle.title = '拖拽排序'; handle.textContent = '⠿'; handle.draggable = true;
+        handle.title = '拖拽排序'; handle.appendChild(createIcon(document, 'grip', { size: 17 })); handle.draggable = true;
         row.appendChild(handle);
 
         const body = document.createElement('div'); body.className = 'fld-body';
@@ -3056,7 +3193,7 @@ async function createCardEditor(config) {
 
         const titleBar = document.createElement('div'); titleBar.className = 'grp-titlebar';
         const titleHandle = document.createElement('span'); titleHandle.className = 'grp-handle';
-        titleHandle.title = '拖拽整组排序'; titleHandle.textContent = '⠿'; titleHandle.draggable = true;
+        titleHandle.title = '拖拽整组排序'; titleHandle.appendChild(createIcon(document, 'grip', { size: 17 })); titleHandle.draggable = true;
         titleBar.appendChild(titleHandle);
         const titleLabel = document.createElement('span'); titleLabel.className = 'grp-label';
         titleLabel.textContent = g.label; titleBar.appendChild(titleLabel);
@@ -3075,6 +3212,7 @@ async function createCardEditor(config) {
 
         const addBtn = document.createElement('button'); addBtn.className = 'modal-btn fld-add-btn';
         addBtn.textContent = '＋ 添加字段';
+        if (g.builtin && config.secondaryGroupKeys && config.secondaryGroupKeys.length) addBtn.hidden = true;
         addBtn.addEventListener('click', () => {
             const row = makeFieldRow({ key: '', label: '', value: '', type: 'custom', builtin: false });
             fieldList.appendChild(row);
@@ -3139,13 +3277,22 @@ async function createCardEditor(config) {
 
         const titleText = !config.allowNew
             ? config.title.replace(/^[^—]+—/, '').trim()  // 单条模式不显示"新建/编辑"
-            : (isNew ? '新建' : `编辑：${currentItem.name || currentItem[config.idField]}`);
+            : (isNew ? (config.newFormTitle || '新建') : `编辑：${currentItem.name || currentItem[config.idField]}`);
 
         formEl.replaceChildren();
+        body.classList.remove('is-advanced-editing');
         formEl.appendChild(domElement('h4', 'form-title', titleText));
         const groupsRoot = domElement('div', 'ce-groups');
         formEl.appendChild(groupsRoot);
-        const groupAdd = domElement('button', 'modal-btn ce-group-add', '＋ 添加分组');
+        const advancedToggle = config.secondaryGroupKeys && config.secondaryGroupKeys.length
+            ? domElement('button', 'modal-btn ce-advanced-toggle', config.fullSettingsLabel || '显示完整设置')
+            : null;
+        if (advancedToggle) {
+            advancedToggle.type = 'button';
+            advancedToggle.setAttribute('aria-expanded', 'false');
+            formEl.appendChild(advancedToggle);
+        }
+        const groupAdd = domElement('button', 'modal-btn ce-group-add', '添加自定义分组');
         groupAdd.type = 'button';
         groupAdd.style.marginTop = '8px';
         groupAdd.style.width = '100%';
@@ -3178,8 +3325,38 @@ async function createCardEditor(config) {
         const groupsEl = formEl.querySelector('.ce-groups');
         const statusEl = formEl.querySelector('.ce-status');
 
-        groups.forEach((g, i) => groupsEl.appendChild(makeGroup(g, i)));
+        const secondaryGroups = new Set(config.secondaryGroupKeys || []);
+        groups.forEach((g, i) => {
+            const group = makeGroup(g, i);
+            if (secondaryGroups.has(g.key) || (!g.builtin && secondaryGroups.size)) {
+                group.classList.add('ce-secondary-group');
+                group.hidden = true;
+            }
+            groupsEl.appendChild(group);
+        });
+        if (advancedToggle) {
+            groupAdd.hidden = true;
+            advancedToggle.addEventListener('click', () => {
+                const expanded = advancedToggle.getAttribute('aria-expanded') !== 'true';
+                advancedToggle.setAttribute('aria-expanded', String(expanded));
+                body.classList.toggle('is-advanced-editing', expanded);
+                advancedToggle.textContent = expanded
+                    ? '收起完整设置'
+                    : (config.fullSettingsLabel || '显示完整设置');
+                groupsEl.querySelectorAll('.ce-secondary-group').forEach(group => { group.hidden = !expanded; });
+                groupsEl.querySelectorAll('.fld-add-btn').forEach(button => { button.hidden = !expanded; });
+                groupAdd.hidden = !expanded;
+            });
+        }
         applyCardDisabled();
+
+        const markCardDirty = () => {
+            if (cardPending) return;
+            cardDirty = true;
+            updateCardStatus('未保存修改');
+        };
+        groupsEl.addEventListener('input', markCardDirty);
+        groupsEl.addEventListener('change', markCardDirty);
 
         groupsEl.addEventListener('dragend', () => {
             clearDragState(groupsEl);
@@ -3212,7 +3389,11 @@ async function createCardEditor(config) {
             try {
                 const collected = collectCardEditorData(groupsEl, { idField: config.idField });
                 const data = mergeCardEditorData(currentItem || extraData || {}, collected.data);
-                const idVal = collected.idValue;
+                let idVal = collected.idValue;
+                if (config.idField && !idVal && config.autoId) {
+                    idVal = generatedEntityId(config.idPrefix || config.prefix, items, config.idField);
+                    data[config.idField] = idVal;
+                }
                 if (config.idField && !idVal) throw new Error(`请填 ${config.idLabel || 'ID'}`);
                 const saveUrl = config.saveApi ? config.saveApi(idVal || 'user') : null;
                 if (!saveUrl) throw new Error('缺少保存 API');
@@ -3220,6 +3401,7 @@ async function createCardEditor(config) {
                 if (!isCurrentSessionRef(editorRef)) return;
                 cardStatusMessage = '已保存';
                 cardStatusError = false;
+                cardDirty = false;
                 // 刷新列表
                 if (config.allowNew) {
                     const fresh = await apiClient.get(config.listApi, {
@@ -3339,6 +3521,7 @@ async function createCardEditor(config) {
                     if (config.allowNew) {
                         if (refreshedItems !== null) items = refreshedItems;
                         currentItem = null;
+                        cardDirty = false;
                         renderList(); renderForm();
                     } else {
                         currentItem = null;
@@ -3389,7 +3572,15 @@ async function openCharactersEditor() {
     }
     if (!isCurrentSessionRef(editorRef)) return;
     await createCardEditor({
-        title: '角色卡 — 当前世界观的演员',
+        title: '角色',
+        description: '创建故事中的人物。先填写角色名、一句话定位和详细人设，外貌、说话方式与初始状态按需展开。',
+        scopeLabel: '整个世界共用',
+        dialogClass: 'story-module-dialog character-manager-dialog',
+        listTitle: '角色列表',
+        newLabel: '新建角色',
+        newFormTitle: '新建角色',
+        searchPlaceholder: '搜索角色名或定位',
+        itemMeta: item => item.tagline || (item.active === false ? '暂不参与场景' : '默认参与场景'),
         listApi: `${API.characters}?project=${encodeURIComponent(editorRef.project)}`,
         listKey: 'characters',
         saveApi: (id) => `${API.characterSave(id)}?project=${encodeURIComponent(editorRef.project)}`,
@@ -3401,12 +3592,21 @@ async function openCharactersEditor() {
         idField: 'id',
         idLabel: '唯一 ID（文件名）',
         prefix: 'char',
+        idPrefix: 'character',
+        autoId: true,
+        secondaryGroupKeys: ['_looks', '_voice', '_init'],
+        fullSettingsLabel: '显示外貌、说话方式与初始状态',
         buildGroups: (c) => {
             c = c || {};
             const groups = schema.groups.map(g => ({
                 ...g,
                 fields: g.fields.map(f => ({
                     ...f,
+                    ...(f.key === 'id' ? { hidden: true } : {}),
+                    ...(f.key === 'aliases' ? { label: '别名（每行一个）' } : {}),
+                    ...(f.key === 'persona' ? { label: '性格、背景与动机' } : {}),
+                    ...(f.key === 'chattiness' ? { label: '发言倾向（0–100）' } : {}),
+                    ...(f.key === 'initial_stats.affinity' ? { label: '初始好感（0–100）' } : {}),
                     ...(f.key === 'chattiness' ? {
                         default: f.default === undefined ? 50 : f.default,
                         min: f.min === undefined ? 0 : f.min,
@@ -3422,15 +3622,15 @@ async function openCharactersEditor() {
     });
 }
 
-async function openWorldbookEditor() {
+async function buildWorldbookEditor({ selectedId = '' } = {}) {
     const editorRef = captureSessionRef();
     if (state.navigationBusy || !sessionBelongsToRef(state.session, editorRef)) {
         showToast('当前存档尚未加载完成');
-        return;
+        throw new Error('当前存档尚未加载完成');
     }
     if (!canPerformTurnAction('card_write', editorRef)) {
         showToast('当前存档正在生成，请先取消或等待完成');
-        return;
+        throw new Error('当前存档正在生成，请先取消或等待完成');
     }
     let entries;
     let diagnostics;
@@ -3442,15 +3642,15 @@ async function openWorldbookEditor() {
             loadLatestWorldbookDiagnostics(editorRef),
         ]);
     } catch (error) {
-        showToast(`加载世界书失败：${errorDetail(error)}`, 3500);
-        return;
+        throw error;
     }
-    if (!isCurrentSessionRef(editorRef) || !sessionBelongsToRef(state.session, editorRef)) return;
+    if (!isCurrentSessionRef(editorRef) || !sessionBelongsToRef(state.session, editorRef)) {
+        throw new Error('加载期间项目或存档已切换，请重新打开世界工作台');
+    }
     // 加载期间 turn 可能已启动；DOM 尚不存在时全局禁用器无法覆盖新控件，
     // 因此在构造编辑器前再次封闭竞态窗口。
     if (!canPerformTurnAction('card_write', editorRef)) {
-        showToast('加载世界书期间已开始生成，请等待完成后重试');
-        return;
+        throw new Error('加载世界设定期间已开始生成，请等待完成后重试');
     }
 
     const editor = createWorldbookEditor({
@@ -3459,16 +3659,22 @@ async function openWorldbookEditor() {
         entries,
         manualIds: state.session.manual_worldbook_ids || [],
         diagnostics,
+        selectedId,
+        characters: state.characters,
         disabled: false,
         onPendingChange: pending => modalController.setPending(pending),
-        confirmDelete: entryId => confirm(`确定删除世界书条目「${entryId}」吗？删除后将移入回收区，可以恢复。`),
+        confirmDelete: entryId => {
+            const entry = entries.find(item => item.id === entryId);
+            return confirm(`确定删除世界设定「${entry && entry.title ? entry.title : '未命名设定'}」吗？删除后将移入回收区，可以恢复。`);
+        },
+        confirmDiscard: () => confirm('当前设定有未保存内容，确定放弃并切换吗？'),
         onSaveEntry: async (data, context) => {
             if (!isCurrentSessionRef(editorRef)) throw new Error('当前项目或存档已切换，请重新打开编辑器');
             if (!canPerformTurnAction('card_write', editorRef)) {
                 throw new Error('当前存档正在生成，请先取消或等待完成');
             }
             if (!context.isNew && context.originalId !== data.id) {
-                throw new Error('已有世界书 ID 不可直接修改');
+                throw new Error('已有世界设定的内部标识不能直接修改');
             }
             await worldbookService.save(editorRef.project, data.id, data);
             if (!isCurrentSessionRef(editorRef)) throw new Error('保存完成，但当前存档已切换');
@@ -3492,13 +3698,36 @@ async function openWorldbookEditor() {
             return worldbookService.saveManual(editorRef, entryIds);
         },
     });
-    showModal({ title: '世界书 — 触发与预算', body: editor.root });
+    return editor;
+}
+
+async function openWorldbookEditor(options = {}) {
+    try {
+        const editor = await buildWorldbookEditor(options);
+        showModal({
+            title: '世界设定',
+            body: editor.root,
+            dialogClass: 'world-workspace-dialog',
+            onBeforeClose: () => {
+                const editorState = editor.state();
+                return !(editorState.entryDirty || editorState.manualDirty)
+                    || confirm('世界设定有未保存内容，确定关闭吗？');
+            },
+        });
+    } catch (error) {
+        showToast(`加载世界设定失败：${errorDetail(error)}`, 3500);
+    }
 }
 
 async function openUserEditor() {
     const editorRef = captureSessionRef();
     await createCardEditor({
-        title: '用户档案 — 当前世界的观众设定',
+        title: '我的角色',
+        description: '告诉 AI 你在故事中是谁。身份与当前状态会持续生效；默认开场只在新建或重置故事时使用。',
+        scopeLabel: '整个世界共用',
+        dialogClass: 'story-module-dialog user-profile-dialog',
+        secondaryGroupKeys: ['_scene'],
+        fullSettingsLabel: '显示默认开场和自定义内容',
         listApi: null,
         allowNew: false,
         idField: null,
@@ -3513,14 +3742,14 @@ async function openUserEditor() {
             ud = ud || {};
             const groups = [
                 { key: '_identity', label: '身份', builtin: true, fields: [
-                    { key: 'name', label: '用户名', type: 'text', builtin: true },
-                    { key: 'identity', label: '身份设定', type: 'textarea', builtin: true, rows: 5 },
+                    { key: 'name', label: '名字或称呼', type: 'text', builtin: true },
+                    { key: 'identity', label: '身份与背景', type: 'textarea', builtin: true, rows: 5 },
                 ]},
                 { key: '_status', label: '当前状态', builtin: true, fields: [
                     { key: 'status.condition', label: '身体状态', type: 'text', builtin: true },
                     { key: 'status.abilities', label: '能力（每行一个）', type: 'textarea', builtin: true, rows: 2, array: true },
                 ]},
-                { key: '_scene', label: '初始场景', builtin: true, fields: [
+                { key: '_scene', label: '默认开场（仅新建或重置时使用）', builtin: true, fields: [
                     { key: 'scene_meta.location', label: '地点', type: 'text', builtin: true },
                     { key: 'scene_meta.time', label: '时间/天气', type: 'text', builtin: true },
                     { key: 'scene_meta.main_quest', label: '主线任务', type: 'text', builtin: true },
@@ -3530,7 +3759,7 @@ async function openUserEditor() {
             ];
             return groupsWithCustomFields(groups, ud, { key: '_custom', label: '自定义字段' });
         },
-        postSave: async () => { showToast('用户档案已保存，点「重置」生效'); },
+        postSave: async () => { showToast('我的角色已保存；重置故事后默认开场才会生效'); },
     });
 }
 
@@ -3992,7 +4221,11 @@ function showRelationshipsEditor() {
             modalToken,
         ),
     });
-    if (!showModal({ title: '角色关系图谱', body: editor.root })) return;
+    if (!showModal({
+        title: '人物关系',
+        body: editor.root,
+        dialogClass: 'story-module-dialog relationship-manager-dialog',
+    })) return;
     relationshipModalSerial = modalToken;
     state.relationshipEditor = editor;
     editor.setDisabled(
@@ -4409,39 +4642,16 @@ function bindUI() {
     });
     document.getElementById('tab-world').addEventListener('click', () => {
         hideAllDropdowns();
-        openWorldbookEditor();  // v3: 独立 modal
+        void worldContextController.showWorkbench('library');
     });
     document.getElementById('tab-user').addEventListener('click', () => {
         hideAllDropdowns();
         openUserEditor();  // v3: 独立 modal
     });
-    const saveTab = document.getElementById('tab-saves');
-    const saveDropdown = document.getElementById('save-dropdown');
-    saveListboxController = createListboxController({
-        documentRef: document,
-        trigger: saveTab,
-        panel: saveDropdown,
-        listbox: document.getElementById('save-list'),
-        optionSelector: '.dropdown-item[data-save]',
-        isSelected: option => option.dataset.save === state.currentSave,
-        canOpen: () => !state.navigationBusy && !isTurnActiveForRef(committedSessionRef),
-        onBlocked: () => showToast('当前正在切换或生成，请稍候'),
-        beforeOpen: hideAllDropdowns,
-        position: positionDropdown,
-        onSelect: option => { void switchSave(option.dataset.save); },
-    });
-
-    // 存档下拉内的 5 个操作按钮
-    const runSaveDropdownAction = action => {
-        saveListboxController.close({ restoreFocus: true });
+    document.getElementById('tab-saves').addEventListener('click', () => {
         hideAllDropdowns();
-        action();
-    };
-    document.getElementById('save-new-inline').addEventListener('click', () => runSaveDropdownAction(promptForNewSave));
-    document.getElementById('save-rename-inline').addEventListener('click', () => runSaveDropdownAction(promptForRenameSave));
-    document.getElementById('save-delete-inline').addEventListener('click', () => runSaveDropdownAction(deleteCurrentSave));
-    document.getElementById('save-export-inline').addEventListener('click', () => runSaveDropdownAction(exportCurrentSave));
-    document.getElementById('save-import-inline').addEventListener('click', () => runSaveDropdownAction(promptForImportSave));
+        showSaveManager();
+    });
 
     // 点击空白处关闭所有下拉
     document.addEventListener('click', (e) => {

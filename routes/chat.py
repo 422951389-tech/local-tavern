@@ -132,6 +132,7 @@ def _assemble_generation_prompt_sync(
         num_predict=num_predict,
         manual_worldbook_ids=session.get("manual_worldbook_ids", []),
         roleplay_context=roleplay_context,
+        world_state=session.get("world_state"),
     )
     return assembly, characters, roleplay_context
 

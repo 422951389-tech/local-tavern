@@ -65,6 +65,8 @@ _RESULT_KEYS = {
     "refresh_verified",
     "save_switch_verified",
     "layout_verified",
+    "scroll_verified",
+    "scroll_frame_samples",
     "persistence_verified",
     "message_count",
     "screenshot_saved",
@@ -73,6 +75,7 @@ _RESULT_KEYS = {
     "scheme",
     "tcp_listener_started",
     "off_the_record",
+    "desktop_renderer",
     "error",
 }
 
@@ -186,6 +189,7 @@ def _validate_result(result: dict, *, pid: int, stage: str) -> None:
         "refresh_verified",
         "save_switch_verified",
         "layout_verified",
+        "scroll_verified",
         "screenshot_saved",
         "off_the_record",
     ):
@@ -196,6 +200,8 @@ def _validate_result(result: dict, *, pid: int, stage: str) -> None:
         raise DesktopJourneySmokeError("桌面旅程重启持久化标记不符合阶段契约")
     if result.get("message_count", 0) < 2:
         raise DesktopJourneySmokeError("桌面旅程未保留完整的一轮对话")
+    if result.get("scroll_frame_samples", 0) < 30:
+        raise DesktopJourneySmokeError("桌面旅程滚动逐帧样本不足")
     expected_strings = {
         "runtime": "in_process_asgi",
         "transport": "qwebchannel",
@@ -205,6 +211,8 @@ def _validate_result(result: dict, *, pid: int, stage: str) -> None:
     for field, expected in expected_strings.items():
         if result.get(field) != expected:
             raise DesktopJourneySmokeError(f"桌面旅程字段不符合契约：{field}")
+    if result.get("desktop_renderer") != "software":
+        raise DesktopJourneySmokeError("桌面旅程未启用稳定软件渲染器")
     if result.get("tcp_listener_started") is not False:
         raise DesktopJourneySmokeError("桌面旅程报告启动了 TCP 监听器")
 
@@ -321,7 +329,10 @@ def _launch_stage(
             "refresh_verified": result["refresh_verified"],
             "save_switch_verified": result["save_switch_verified"],
             "layout_verified": result["layout_verified"],
+            "scroll_verified": result["scroll_verified"],
+            "scroll_frame_samples": result["scroll_frame_samples"],
             "persistence_verified": result["persistence_verified"],
+            "desktop_renderer": result["desktop_renderer"],
             "tcp_listener_samples": samples,
             "process_exited": True,
         }, screenshot_path
@@ -385,6 +396,10 @@ def run_journey(
             "tcp_listener_started": False,
             "isolated_user_data": True,
             "restart_persistence_verified": True,
+            "scroll_verified": all(
+                bool(stage["scroll_verified"]) for stage in stages
+            ),
+            "desktop_renderer": "software",
             "stages": stages,
             "screenshots": screenshots,
         }

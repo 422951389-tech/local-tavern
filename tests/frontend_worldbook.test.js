@@ -22,6 +22,10 @@ function worldbookSchema() {
             fields: [
                 { key: 'id', label: '稳定 ID', type: 'text', fixed: true, required: true },
                 { key: 'title', label: '标题', type: 'text' },
+                { key: 'summary', label: '摘要', type: 'text' },
+                { key: 'category', label: '分类', type: 'select', options: [
+                    { value: 'general', label: '通用' }, { value: 'location', label: '地点' },
+                ] },
                 { key: 'enabled', label: '启用', type: 'checkbox' },
                 {
                     key: 'activation',
@@ -31,6 +35,7 @@ function worldbookSchema() {
                         { value: 'always', label: '常驻' },
                         { value: 'keywords', label: '关键词' },
                         { value: 'manual', label: '手动' },
+                        { value: 'scene', label: '场景联动' },
                     ],
                 },
                 {
@@ -49,11 +54,21 @@ function worldbookSchema() {
                     min: -1000000,
                     max: 1000000,
                 },
+                { key: 'visibility', label: '可见性', type: 'select', options: [
+                    { value: 'public', label: '公开' }, { value: 'discovered', label: '发现' }, { value: 'hidden', label: '隐藏' },
+                ] },
+                { key: 'knowledge_scope', label: '知识边界', type: 'select', options: [
+                    { value: 'global', label: '全局' }, { value: 'narrator', label: '叙述者' }, { value: 'characters', label: '指定角色' },
+                ] },
+                { key: 'known_by_character_ids', label: '知情角色', type: 'textarea', array: true },
+                { key: 'linked_character_ids', label: '关联角色', type: 'textarea', array: true },
+                { key: 'linked_entry_ids', label: '关联条目', type: 'textarea', array: true },
+                { key: 'location_aliases', label: '地点别名', type: 'textarea', array: true },
                 { key: 'content', label: '内容', type: 'textarea', rows: 8 },
             ],
         }],
         customGroup: { key: '_custom', label: '自定义字段' },
-        activationValues: ['always', 'keywords', 'manual'],
+        activationValues: ['always', 'keywords', 'manual', 'scene'],
     };
 }
 
@@ -66,6 +81,14 @@ function entryFixture(overrides = {}) {
         keywords: [],
         priority: 8,
         content: '只在选中时注入',
+        summary: '手动设定摘要',
+        category: 'general',
+        visibility: 'public',
+        knowledge_scope: 'global',
+        known_by_character_ids: [],
+        linked_character_ids: [],
+        linked_entry_ids: [],
+        location_aliases: [],
         custom: { nested: { preserved: true } },
         keys: ['旧触发词'],
         constant: false,
@@ -91,6 +114,7 @@ test('worldbook schema and legacy entries normalize without losing the backend c
             { value: 'always', label: '常驻' },
             { value: 'keywords', label: '关键词' },
             { value: 'manual', label: '手动' },
+            { value: 'scene', label: '场景联动' },
         ],
     );
     assert.equal(normalized.fields.id.fixed, true);
@@ -122,6 +146,20 @@ test('worldbook schema and legacy entries normalize without losing the backend c
     assert.throws(() => normalizeWorldbookEntry({ id: 'bad', activation: 'random' }), /activation 无效/);
     assert.throws(() => normalizeWorldbookEntry({ id: 'bad', enabled: 'yes' }), /enabled 必须是布尔值/);
     assert.throws(() => normalizeWorldbookEntries([entryFixture(), entryFixture()]), /ID 重复/);
+
+    const linked = normalizeWorldbookEntry(entryFixture({
+        knowledge_scope: 'characters',
+        known_by_character_ids: ['alpha'],
+        linked_character_ids: ['beta'],
+        linked_entry_ids: ['palace'],
+        location_aliases: ['花园'],
+    }));
+    const normalizedTwice = normalizeWorldbookEntry(linked);
+    assert.equal(normalizedTwice.knowledgeScope, 'characters');
+    assert.deepEqual(normalizedTwice.knownByCharacterIds, ['alpha']);
+    assert.deepEqual(normalizedTwice.linkedCharacterIds, ['beta']);
+    assert.deepEqual(normalizedTwice.linkedEntryIds, ['palace']);
+    assert.deepEqual(normalizedTwice.locationAliases, ['花园']);
 });
 
 test('worldbook draft serialization validates limits and preserves untouched custom JSON values', async () => {
@@ -134,6 +172,14 @@ test('worldbook draft serialization validates limits and preserves untouched cus
         keywordsText: ' 龙 \nDRAGON\n龙\n',
         priority: '25',
         content: '龙类设定',
+        summary: '',
+        category: 'general',
+        visibility: 'public',
+        knowledge_scope: 'global',
+        known_by_character_ids: [],
+        linked_character_ids: [],
+        linked_entry_ids: [],
+        location_aliases: [],
         customRows: [{
             key: 'metadata',
             value: '{"preserved":true}',
@@ -150,6 +196,14 @@ test('worldbook draft serialization validates limits and preserves untouched cus
         activation: 'keywords',
         keywords: ['龙', 'DRAGON'],
         priority: 25,
+        summary: '',
+        category: 'general',
+        visibility: 'public',
+        knowledge_scope: 'global',
+        known_by_character_ids: [],
+        linked_character_ids: [],
+        linked_entry_ids: [],
+        location_aliases: [],
         content: '龙类设定',
         custom: { metadata: { preserved: true } },
     });
@@ -241,6 +295,11 @@ test('worldbook diagnostics whitelist display fields and never retain content or
     const diagnostics = sanitizeWorldbookDiagnostics({
         worldbook_matches: [{
             id: 'dragon-lore',
+            title: '龙类谱系',
+            category: 'history',
+            summary: '龙族历史',
+            visibility: 'discovered',
+            knowledge_scope: 'narrator',
             activation: 'keywords',
             enabled: true,
             priority: 16,
@@ -264,6 +323,11 @@ test('worldbook diagnostics whitelist display fields and never retain content or
 
     assert.deepEqual(diagnostics, [{
         id: 'dragon-lore',
+        title: '龙类谱系',
+        category: 'history',
+        summary: '龙族历史',
+        visibility: 'discovered',
+        knowledgeScope: 'narrator',
         activation: 'keywords',
         enabled: true,
         activated: true,
@@ -306,7 +370,7 @@ test('worldbook integration clears stale diagnostics, locks writes, and keeps ac
     assert.match(appSource, /state\.lastWorldbookDiagnostics = null;/);
     assert.match(appSource, /'#project-btn', '#tab-world', '#tab-relations', '#tab-saves'/);
     assert.match(appSource, /if \(!canPerformTurnAction\('card_write', editorRef\)\) \{/);
-    assert.match(appSource, /加载世界书期间已开始生成，请等待完成后重试/);
+    assert.match(appSource, /加载世界设定期间已开始生成，请等待完成后重试/);
     assert.match(appSource, /'\.worldbook-write-control'/);
     assert.match(appSource, /worldbookService\.saveManual/);
     assert.match(moduleSource, /createElement\(documentRef, 'button'/);

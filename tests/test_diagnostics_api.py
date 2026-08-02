@@ -58,6 +58,21 @@ def test_turn_store_summary_exposes_counts_without_turn_identity(tmp_path):
     assert "11111111" not in json.dumps(result)
 
 
+def test_local_diagnostics_exposes_safe_desktop_renderer_metadata(monkeypatch):
+    monkeypatch.setenv("TAVERN_DESKTOP_RENDERER_ACTIVE", "software")
+    monkeypatch.setenv("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --secret-flag")
+
+    result = diagnostics.local_diagnostics()
+
+    assert result["desktop_rendering"] == {
+        "mode": "software",
+        "gpu_acceleration": False,
+        "restart_required_after_change": True,
+    }
+    assert "chromium" not in json.dumps(result).casefold()
+    assert "secret-flag" not in json.dumps(result)
+
+
 def test_frozen_release_manifest_is_resolved_next_to_distribution(
     tmp_path,
     monkeypatch,
@@ -99,6 +114,7 @@ async def test_support_bundle_api_is_attachment_and_uses_strict_allowlist(
         "health",
         "providers",
         "backups",
+        "desktop_rendering",
     }
     serialized = json.dumps(payload, ensure_ascii=False).casefold()
     for forbidden in (

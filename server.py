@@ -49,6 +49,7 @@ from routes import (
     characters,
     user,
     worldbook,
+    world_state,
     roleplay,
     relationships,
     settings,
@@ -377,6 +378,7 @@ app.include_router(projects.router)
 app.include_router(characters.router)
 app.include_router(user.router)
 app.include_router(worldbook.router)
+app.include_router(world_state.router)
 app.include_router(roleplay.router)
 app.include_router(relationships.router)
 app.include_router(settings.router)

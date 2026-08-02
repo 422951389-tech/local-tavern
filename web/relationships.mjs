@@ -52,8 +52,15 @@ function messageChoiceLabel(message, index) {
     const time = message.createdAt
         ? message.createdAt.slice(0, 16).replace('T', ' ')
         : '时间未记录';
-    const shortId = `${message.id.slice(0, 8)}…${message.id.slice(-4)}`;
-    return `${role} · #${index + 1} · ${time} · ${shortId}：${messagePreview(message)}`;
+    return `${role} · 第 ${index + 1} 条 · ${time}：${messagePreview(message)}`;
+}
+
+export function relationshipStrengthLabel(value) {
+    const strength = Number(value);
+    if (!Number.isFinite(strength) || strength < 25) return '疏远';
+    if (strength < 50) return '普通';
+    if (strength < 75) return '亲近';
+    return '深厚';
 }
 
 export function normalizeRelationshipSession(session) {
@@ -280,7 +287,10 @@ function svgElement(documentRef, tag, attributes = {}) {
 
 function characterName(model, id) {
     const character = model.characters.find(item => item.id === id);
-    return character ? character.name : id;
+    if (!character) return '未知角色';
+    const sameName = model.characters.filter(item => item.name === character.name);
+    if (sameName.length < 2) return character.name;
+    return `${character.name}（同名角色 ${sameName.findIndex(item => item.id === id) + 1}）`;
 }
 
 export function renderRelationshipGraph(documentRef, host, model) {
@@ -348,7 +358,7 @@ export function renderRelationshipGraph(documentRef, host, model) {
             class: 'relationship-edge-label',
             'text-anchor': 'middle',
         });
-        label.textContent = `${edge.relationType} · ${edge.strength}/100`;
+        label.textContent = `${edge.relationType} · ${relationshipStrengthLabel(edge.strength)}`;
         svg.appendChild(label);
     }
     for (const character of nodes) {
@@ -407,8 +417,8 @@ export function renderRelationshipList(documentRef, host, model, callbacks = {})
         ));
         const details = element(documentRef, 'dl', 'relationship-details');
         appendDefinition(documentRef, details, '关系类型', edge.relationType);
-        appendDefinition(documentRef, details, '强度', `${edge.strength}/100`);
-        appendDefinition(documentRef, details, '证据', `${edge.evidenceMessageIds.length} 条`);
+        appendDefinition(documentRef, details, '亲近程度', `${relationshipStrengthLabel(edge.strength)} · ${edge.strength}/100`);
+        appendDefinition(documentRef, details, '对话依据', `${edge.evidenceMessageIds.length} 条`);
         appendDefinition(documentRef, details, '更新时间', displayUpdatedAt(edge.updatedAt));
         item.appendChild(details);
 
@@ -568,10 +578,7 @@ export function createRelationshipEditor({
         const select = register(element(documentRef, 'select', 'relationship-select'));
         select.id = id;
         for (const character of currentModel.characters) {
-            const label = character.name === character.id
-                ? character.name
-                : `${character.name}（${character.id}）`;
-            const option = element(documentRef, 'option', '', label);
+            const option = element(documentRef, 'option', '', characterName(currentModel, character.id));
             option.value = character.id;
             option.selected = character.id === value;
             select.appendChild(option);
@@ -600,13 +607,15 @@ export function createRelationshipEditor({
         for (const message of visible) {
             const row = element(documentRef, 'label', 'relationship-evidence-option');
             const checkbox = register(element(documentRef, 'input', 'relationship-evidence-checkbox'));
+            const messageIndex = currentModel.messages.findIndex(item => item.id === message.id);
+            checkbox.id = `relationship-evidence-${messageIndex}`;
             checkbox.type = 'checkbox';
             checkbox.value = message.id;
             checkbox.checked = selectedIds.has(message.id);
+            row.htmlFor = checkbox.id;
             row.appendChild(checkbox);
-            const messageIndex = currentModel.messages.findIndex(item => item.id === message.id);
             const choice = element(documentRef, 'span', '', messageChoiceLabel(message, messageIndex));
-            checkbox.setAttribute('aria-label', `${choice.textContent} · 完整 UUID ${message.id}`);
+            checkbox.setAttribute('aria-label', choice.textContent);
             row.appendChild(choice);
             host.appendChild(row);
         }
@@ -626,8 +635,8 @@ export function createRelationshipEditor({
         }
         const form = element(documentRef, 'form', 'relationship-form');
         form.noValidate = true;
-        const sourceField = buildCharacterSelect('relationship-source', '来源角色', draft.source_character_id);
-        const targetField = buildCharacterSelect('relationship-target', '目标角色', draft.target_character_id);
+        const sourceField = buildCharacterSelect('relationship-source', '谁的态度', draft.source_character_id);
+        const targetField = buildCharacterSelect('relationship-target', '看待谁', draft.target_character_id);
         form.appendChild(sourceField.wrapper);
         form.appendChild(targetField.wrapper);
 
@@ -639,34 +648,47 @@ export function createRelationshipEditor({
         typeInput.type = 'text';
         typeInput.maxLength = MAX_RELATION_TYPE;
         typeInput.value = draft.relation_type;
+        typeInput.placeholder = '例如：信任、戒备、依赖';
         typeInput.autocomplete = 'off';
         typeField.appendChild(typeLabel);
         typeField.appendChild(typeInput);
         form.appendChild(typeField);
 
         const strengthField = element(documentRef, 'div', 'relationship-field');
-        const strengthLabel = element(documentRef, 'label', '', '关系强度（0–100）');
+        const strengthHeader = element(documentRef, 'div', 'relationship-strength-header');
+        const strengthLabel = element(documentRef, 'label', '', '亲近程度');
         strengthLabel.htmlFor = 'relationship-strength';
+        const strengthOutput = element(
+            documentRef,
+            'output',
+            'relationship-strength-output',
+            `${relationshipStrengthLabel(draft.strength)} · ${draft.strength}/100`,
+        );
+        strengthOutput.setAttribute('for', 'relationship-strength');
+        strengthHeader.appendChild(strengthLabel);
+        strengthHeader.appendChild(strengthOutput);
         const strengthInput = register(element(documentRef, 'input', 'relationship-strength-input'));
         strengthInput.id = 'relationship-strength';
-        strengthInput.type = 'number';
+        strengthInput.type = 'range';
         strengthInput.min = '0';
         strengthInput.max = '100';
         strengthInput.step = '1';
-        strengthInput.inputMode = 'numeric';
         strengthInput.value = draft.strength;
-        strengthField.appendChild(strengthLabel);
+        strengthInput.addEventListener('input', () => {
+            strengthOutput.textContent = `${relationshipStrengthLabel(strengthInput.value)} · ${strengthInput.value}/100`;
+        });
+        strengthField.appendChild(strengthHeader);
         strengthField.appendChild(strengthInput);
         form.appendChild(strengthField);
 
         const fieldset = element(documentRef, 'fieldset', 'relationship-evidence-fieldset');
-        fieldset.appendChild(element(documentRef, 'legend', '', '证据消息（1–20 条）'));
-        const filterLabel = element(documentRef, 'label', 'relationship-evidence-filter-label', '筛选当前存档消息');
+        fieldset.appendChild(element(documentRef, 'legend', '', '从对话中选择依据（至少 1 条）'));
+        const filterLabel = element(documentRef, 'label', 'relationship-evidence-filter-label', '搜索对话内容');
         filterLabel.htmlFor = 'relationship-evidence-filter';
         const filter = register(element(documentRef, 'input', 'relationship-evidence-filter'));
         filter.id = 'relationship-evidence-filter';
         filter.type = 'search';
-        filter.placeholder = '输入消息内容或 UUID';
+        filter.placeholder = '输入对话中的关键词';
         const evidenceHost = element(documentRef, 'div', 'relationship-evidence-options');
         fieldset.appendChild(filterLabel);
         fieldset.appendChild(filter);
@@ -683,7 +705,7 @@ export function createRelationshipEditor({
         });
 
         const actions = element(documentRef, 'div', 'relationship-form-actions');
-        const save = register(element(documentRef, 'button', 'relationship-save-button', originalKey ? '保存修改' : '新增关系'));
+        const save = register(element(documentRef, 'button', 'relationship-save-button', originalKey ? '保存修改' : '保存关系'));
         save.type = 'submit';
         actions.appendChild(save);
         if (originalKey) {
@@ -746,7 +768,7 @@ export function createRelationshipEditor({
             documentRef,
             'p',
             'relationship-scope-note',
-            '只展示人工记录的结构化关系；不会从亲密度、心情或剧情总结推断关系。',
+            '这里记录人物彼此的看法，只影响当前存档。箭头表示“谁对谁”的态度，对话依据让关系变化可以回看。',
         );
         root.appendChild(note);
         renderRelationshipGraph(documentRef, root, currentModel);

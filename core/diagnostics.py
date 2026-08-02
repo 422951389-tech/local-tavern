@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 import json
+import os
 import platform
 import re
 import sys
@@ -139,6 +140,9 @@ def recent_error_codes(
 
 
 def local_diagnostics() -> dict[str, object]:
+    renderer = os.environ.get("TAVERN_DESKTOP_RENDERER_ACTIVE", "").casefold()
+    if renderer not in {"software", "hardware"}:
+        renderer = "not_applicable" if not DESKTOP_MODE else "software"
     return {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -152,6 +156,11 @@ def local_diagnostics() -> dict[str, object]:
             "system": platform.system(),
             "release": platform.release(),
             "machine": platform.machine(),
+        },
+        "desktop_rendering": {
+            "mode": renderer,
+            "gpu_acceleration": renderer == "hardware",
+            "restart_required_after_change": True,
         },
         "release": _release_manifest_summary(),
         "turns": turn_store_summary(),

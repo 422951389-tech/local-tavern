@@ -64,6 +64,10 @@ EXPECTED_WRITE_ROUTES = frozenset({
     ("DELETE", "/api/user"),
     ("PUT", "/api/worldbook/{entry_id}"),
     ("PATCH", "/api/session/worldbook/manual"),
+    ("PUT", "/api/session/world-state/discoveries"),
+    ("POST", "/api/session/world-state/changes"),
+    ("PATCH", "/api/session/world-state/changes/{change_id}"),
+    ("DELETE", "/api/session/world-state/changes/{change_id}"),
     ("DELETE", "/api/worldbook/{entry_id}"),
 })
 

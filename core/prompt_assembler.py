@@ -16,6 +16,7 @@ from core.worldbook_policy import (
     activate_worldbook_entries,
     worldbook_prompt_payload,
 )
+from core.world_state import normalize_world_state
 
 
 _TEMPLATE_TOKEN = re.compile(r"\{\{([a-z_][a-z0-9_]*)\}\}")
@@ -266,6 +267,7 @@ class PromptAssembler:
         num_predict: int,
         manual_worldbook_ids: list[str] | None = None,
         roleplay_context: dict | None = None,
+        world_state: dict | None = None,
         safety_margin: int = PROMPT_SAFETY_MARGIN,
     ) -> PromptAssembly:
         context_limit = int(context_limit)
@@ -295,7 +297,14 @@ class PromptAssembler:
             for key, value in (user_profile or {}).items()
             if key != "scene_meta" and value not in (None, "", [], {})
         }
-        scene_text = _compact_json(scene_meta or {})
+        scene_payload = deepcopy(scene_meta or {})
+        normalized_world_state = normalize_world_state(world_state)
+        if (
+            normalized_world_state["discovered_entry_ids"]
+            or normalized_world_state["changes"]
+        ):
+            scene_payload["world_state"] = normalized_world_state
+        scene_text = _compact_json(scene_payload)
         profile_text = _compact_json(profile_payload)
 
         eligible: list[tuple[int, dict]] = []

@@ -343,6 +343,26 @@ test('Modal 字符串正文仅作为纯文本呈现', async () => {
     assert.equal(elements.body.innerHTML, '');
 });
 
+test('Modal 支持工作台尺寸类并在未保存守卫拒绝时保持打开', async () => {
+    const { createModalController } = await loadModule('modal');
+    const { documentRef, elements } = modalFixture();
+    const controller = createModalController(elements, { documentRef });
+    let allowClose = false;
+    controller.show({
+        title: '世界工作台',
+        body: documentRef.createElement('section'),
+        dialogClass: 'world-workspace-dialog',
+        onBeforeClose: () => allowClose,
+    });
+
+    assert.equal(elements.dialog.classList.contains('world-workspace-dialog'), true);
+    assert.equal(controller.hide(), false);
+    assert.equal(elements.backdrop.classList.contains('hidden'), false);
+    allowClose = true;
+    assert.equal(controller.hide(), true);
+    assert.equal(elements.dialog.classList.contains('world-workspace-dialog'), false);
+});
+
 function fieldRow(documentRef, { key = '', type = '', array = false, value = '', checked = false, customKey }) {
     const row = documentRef.createElement('div');
     row.className = 'fld-row';

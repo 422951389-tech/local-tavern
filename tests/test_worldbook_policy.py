@@ -56,6 +56,14 @@ def test_legacy_normalization_defaults_to_always_without_mutating_input():
         "activation": "always",
         "keywords": [],
         "priority": 0,
+        "category": "general",
+        "summary": "",
+        "visibility": "public",
+        "knowledge_scope": "global",
+        "known_by_character_ids": [],
+        "linked_character_ids": [],
+        "linked_entry_ids": [],
+        "location_aliases": [],
     }
     candidate = _activate([legacy])[0]
     assert candidate.activated is True
@@ -318,3 +326,71 @@ def test_duplicate_entry_ids_are_rejected_and_control_fields_never_enter_payload
         "content": "事实正文",
         "custom": {"era": "未来"},
     }
+
+
+def test_worldbook_structured_fields_and_knowledge_boundary_are_normalized():
+    normalized = normalize_worldbook_entry({
+        "id": "glass_palace",
+        "title": "琉璃宫",
+        "summary": "帝都权力中心",
+        "category": "location",
+        "visibility": "discovered",
+        "knowledge_scope": "characters",
+        "known_by_character_ids": ["hero", "hero", "attendant"],
+        "linked_character_ids": ["hero"],
+        "linked_entry_ids": ["court_rules"],
+        "location_aliases": ["琉璃宫", "宫城"],
+        "activation": "scene",
+        "content": "琉璃宫由十二座悬桥连接。",
+    })
+
+    assert normalized["category"] == "location"
+    assert normalized["visibility"] == "discovered"
+    assert normalized["knowledge_scope"] == "characters"
+    assert normalized["known_by_character_ids"] == ["hero", "attendant"]
+    assert normalized["linked_entry_ids"] == ["court_rules"]
+    assert normalized["location_aliases"] == ["琉璃宫", "宫城"]
+
+    payload = worldbook_prompt_payload(normalized)
+    assert payload["knowledge_scope"] == "characters"
+    assert payload["known_by_character_ids"] == ["hero", "attendant"]
+    assert "activation" not in payload
+    assert "location_aliases" not in payload
+
+
+def test_scene_activation_uses_location_aliases_and_active_character_links():
+    entries = [
+        {
+            "id": "palace",
+            "title": "琉璃宫",
+            "activation": "scene",
+            "location_aliases": ["琉璃宫"],
+        },
+        {
+            "id": "hero_secret",
+            "title": "守门人的旧约",
+            "activation": "scene",
+            "linked_character_ids": ["hero"],
+        },
+        {
+            "id": "distant",
+            "activation": "scene",
+            "location_aliases": ["雪山"],
+        },
+    ]
+
+    candidates = _activate(
+        entries,
+        scene_meta={"location": "琉璃宫·花园"},
+        characters=[{"id": "hero", "name": "阿澜"}],
+        characters_state={"hero": {"name": "阿澜"}},
+    )
+
+    assert set(_active_ids(candidates)) == {"palace", "hero_secret"}
+    assert _candidate(candidates, "palace").trigger == "scene_link_match"
+    assert _candidate(candidates, "hero_secret").trigger == "scene_link_match"
+    assert _candidate(candidates, "distant").reason == "scene_link_not_matched"
+    diagnostic = _candidate(candidates, "palace").diagnostic()
+    assert diagnostic["title"] == "琉璃宫"
+    assert diagnostic["category"] == "general" or diagnostic["category"] == "location"
+    assert "content" not in diagnostic

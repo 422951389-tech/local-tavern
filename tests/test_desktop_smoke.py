@@ -190,6 +190,7 @@ def test_real_smoke_launch_contract_uses_isolated_paths_and_cleans_process(
         "runtime": "in_process_asgi",
         "transport": "qwebchannel",
         "scheme": "tavern://app",
+        "desktop_renderer": "software",
         "tcp_listener_samples": [[], [], []],
         "process_exited": True,
     }

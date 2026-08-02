@@ -220,6 +220,7 @@ export function normalizeDiagnosticsSnapshot(value) {
     const releaseSource = isRecord(release.source) ? release.source : {};
     const turns = isRecord(value.turns) ? value.turns : {};
     const backups = isRecord(value.backups) ? value.backups : {};
+    const desktopRendering = isRecord(value.desktop_rendering) ? value.desktop_rendering : {};
     const latest = isRecord(backups.latest) ? backups.latest : null;
     const recentErrors = Array.isArray(value.recent_errors)
         ? value.recent_errors.slice(0, 20).flatMap(item => isRecord(item) ? [Object.freeze({
@@ -242,6 +243,13 @@ export function normalizeDiagnosticsSnapshot(value) {
             system: text(runtime.system, 80),
             release: text(runtime.release, 120),
             machine: text(runtime.machine, 80),
+        }),
+        desktop_rendering: Object.freeze({
+            mode: ['software', 'hardware', 'not_applicable'].includes(text(desktopRendering.mode, 40))
+                ? text(desktopRendering.mode, 40)
+                : 'not_applicable',
+            gpu_acceleration: desktopRendering.gpu_acceleration === true,
+            restart_required_after_change: desktopRendering.restart_required_after_change === true,
         }),
         release: Object.freeze({
             status: text(release.status, 40),
@@ -291,6 +299,11 @@ export function createDiagnosticsService(client) {
         },
         async supportBundle() {
             return normalizeDiagnosticsSnapshot(await client.get('/api/diagnostics/support-bundle'));
+        },
+        async saveRenderer(mode) {
+            if (!['software', 'hardware'].includes(mode)) throw new TypeError('桌面渲染模式无效');
+            if (typeof client.put !== 'function') throw new TypeError('诊断服务缺少设置写入能力');
+            return client.put('/api/settings', { desktop_renderer: mode });
         },
     });
 }

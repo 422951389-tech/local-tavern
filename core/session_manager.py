@@ -123,6 +123,11 @@ def _empty_session(save_id: str = DEFAULT_SAVE, project: str = "默认项目") -
         "roleplay_policy": {"strict_muted_writeback": False},
         "relationship_edges": [],
         "manual_worldbook_ids": [],
+        "world_state": {
+            "schema_version": 1,
+            "discovered_entry_ids": [],
+            "changes": [],
+        },
         "message_history": [],
         "summaries": [],
         "summary_error": "",

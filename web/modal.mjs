@@ -63,6 +63,8 @@ export function createModalController(elements, options = {}) {
     let pending = false;
     let bound = false;
     let returnFocus = null;
+    let activeDialogClasses = [];
+    let beforeClose = null;
 
     function setError(message = '') {
         error.textContent = String(message || '');
@@ -83,11 +85,15 @@ export function createModalController(elements, options = {}) {
 
     function hide({ force = false, restoreFocus = true } = {}) {
         if (pending && !force) return false;
+        if (!force && typeof beforeClose === 'function' && beforeClose() === false) return false;
         backdrop.classList.add('hidden');
         backdrop.setAttribute('aria-hidden', 'true');
         body.replaceChildren();
         title.textContent = '';
         confirmHandler = null;
+        beforeClose = null;
+        for (const className of activeDialogClasses) dialog.classList.remove(className);
+        activeDialogClasses = [];
         setError('');
         setPending(false);
         if (restoreFocus && returnFocus && typeof returnFocus.focus === 'function') returnFocus.focus();
@@ -127,6 +133,11 @@ export function createModalController(elements, options = {}) {
             ? replacementReturnFocus
             : (documentRef && documentRef.activeElement ? documentRef.activeElement : null);
         title.textContent = String(config.title || '');
+        activeDialogClasses = String(config.dialogClass || '')
+            .split(/\s+/)
+            .filter(className => /^[A-Za-z_][A-Za-z0-9_-]*$/.test(className));
+        for (const className of activeDialogClasses) dialog.classList.add(className);
+        beforeClose = typeof config.onBeforeClose === 'function' ? config.onBeforeClose : null;
         body.replaceChildren();
         if (typeof config.body === 'string') body.textContent = config.body;
         else if (config.body) body.appendChild(config.body);

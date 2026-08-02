@@ -356,7 +356,7 @@ test('证据定位协调器仅让当前且同 revision 的精确消息产生副�
     );
 });
 
-test('同名角色与同正文证据显示稳定 ID、序号和时间', async () => {
+test('同名角色与同正文证据使用易懂序号区分且不暴露内部 ID', async () => {
     const { createRelationshipEditor } = await loadRelationships();
     const session = sessionFixture({
         characters_state: {
@@ -375,14 +375,14 @@ test('同名角色与同正文证据显示稳定 ID、序号和时间', async ()
         service: { save: async () => null, remove: async () => null },
     });
     const rendered = allText(editor.root);
-    assert.match(rendered, /同名角色（alpha）/);
-    assert.match(rendered, /同名角色（beta）/);
-    assert.match(rendered, /#1 · 2026-07-22 10:00 · 00000000…0001：相同正文/);
-    assert.match(rendered, /#2 · 2026-07-22 10:01 · 00000000…0002：相同正文/);
+    assert.match(rendered, /同名角色（同名角色 1）/);
+    assert.match(rendered, /同名角色（同名角色 2）/);
+    assert.match(rendered, /第 1 条 · 2026-07-22 10:00：相同正文/);
+    assert.match(rendered, /第 2 条 · 2026-07-22 10:01：相同正文/);
     const labels = editor.root.querySelectorAll('.relationship-evidence-checkbox')
         .map(input => input.getAttribute('aria-label'));
-    assert.match(labels[0], new RegExp(IDS[0]));
-    assert.match(labels[1], new RegExp(IDS[1]));
+    assert.doesNotMatch(labels[0], new RegExp(IDS[0]));
+    assert.doesNotMatch(labels[1], new RegExp(IDS[1]));
 });
 
 test('关系服务使用 sessionWrite，编辑携带原复合键且不提交 updated_at', async () => {
@@ -460,18 +460,20 @@ test('REL-1 顶栏、响应式与应用接线完整', () => {
     const root = path.resolve(__dirname, '..');
     const html = fs.readFileSync(path.join(root, 'web', 'index.html'), 'utf8');
     const css = fs.readFileSync(path.join(root, 'web', 'style.css'), 'utf8');
+    const moduleCss = fs.readFileSync(path.join(root, 'web', 'styles', 'story-modules.css'), 'utf8');
     const app = fs.readFileSync(path.join(root, 'web', 'app.mjs'), 'utf8');
     assert.match(html, /id="tab-relations"/);
-    assert.match(html, /aria-label="编辑角色关系"/);
+    assert.match(html, /aria-label="编辑人物关系"/);
     assert.match(html, /class="ico relation-tab-icon"/);
     assert.match(css, /\.relationship-list[\s\S]*grid-template-columns: repeat\(2/);
     assert.match(css, /@media \(max-width: 375px\)[\s\S]*\.relationship-editor/);
     assert.match(css, /min-height: 44px/);
+    assert.match(moduleCss, /\.relationship-editor[\s\S]*grid-template-columns/);
     assert.match(app, /createRelationshipEditor/);
     assert.match(app, /coordinateRelationshipEvidenceLocation/);
     assert.match(app, /findMessage: findMessageById/);
     assert.match(app, /relationshipModalSerial = modalToken/);
-    const showModalIndex = app.indexOf("if (!showModal({ title: '角色关系图谱'");
+    const showModalIndex = app.indexOf("title: '人物关系'");
     const commitSerialIndex = app.indexOf('relationshipModalSerial = modalToken');
     assert.equal(showModalIndex >= 0 && commitSerialIndex > showModalIndex, true);
 });

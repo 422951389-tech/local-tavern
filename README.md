@@ -70,8 +70,8 @@ build_desktop.bat
 
 - 程序：`release\LocalTavern\LocalTavern.exe`
 - 完整性清单：`release\release-manifest.json`
-- 当前目录：3,604 个文件，589,021,235 bytes（561.73 MiB）
-- EXE SHA-256：`FF4EE956A13EDFB1CDDA92C4D2BCE156DFD39CA561D2F94F5B197C2F3FD94BEA`
+- 当前目录：3,618 个文件，589,404,155 bytes（562.10 MiB）
+- EXE SHA-256：`FA89BFB50494DDF5B28E68A2B083CB8F76ABA74915FF0DE048673DC92B96A585`
 
 当前本地构建未做商业代码签名，Windows SmartScreen 可显示“未知发布者”。程序依赖 `_internal` 目录，不能只复制 EXE。
 
@@ -93,14 +93,15 @@ build_desktop.bat
   --timeout 120 --hold-ms 5000
 ```
 
-2026-07-28 当前发布基线：
+2026-08-02 当前发布基线：
 
-- release 质量门 43/43，通过并输出 `release_ready:true`
-- Python 702/702；Node 114/114
+- release 质量门 55/55，通过并输出 `release_ready:true`
+- Python 835/835；Node 144/144
 - branch coverage 85%
 - Ruff、compileall、依赖哈希、`pip check`、固定 Chromium、axe 与浏览器 E2E 全部通过
 - EXE 进程树连续三次 TCP LISTENING 采样均为空，退出后无残留进程
-- 真实首次迁移中，34 个数据文件、102 个既有备份、15 个 Prompt 均逐文件哈希一致；源目录指纹未改变
+- 桌面 seed/verify 两阶段旅程完成刷新、存档切换、72 帧滚动、重启恢复与无端口验证
+- 正式门前后 34 个数据文件、105 个备份与 1 个日志文件的聚合指纹完全一致
 
 ## 常见问题
 

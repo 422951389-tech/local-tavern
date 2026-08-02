@@ -54,6 +54,8 @@ def _assemble(
     worldbook_entries: list[dict] | None = None,
     manual_worldbook_ids: list[str] | None = None,
     roleplay_context: dict | None = None,
+    scene_meta: dict | None = None,
+    world_state: dict | None = None,
     history: list[dict] | None = None,
     summaries: list[dict] | None = None,
     user_input: str = "INPUT",
@@ -65,7 +67,7 @@ def _assemble(
         user_input=user_input,
         characters=characters or [],
         characters_state=characters_state or {},
-        scene_meta={"location": "SCENE"},
+        scene_meta=scene_meta or {"location": "SCENE"},
         user_profile={"name": "PROFILE"},
         worldbook_entries=worldbook_entries or [],
         history=history or [],
@@ -75,6 +77,7 @@ def _assemble(
         num_predict=num_predict,
         manual_worldbook_ids=manual_worldbook_ids,
         roleplay_context=roleplay_context,
+        world_state=world_state,
         safety_margin=safety_margin,
     )
 
@@ -277,7 +280,7 @@ def test_optional_growth_is_trimmed_with_body_free_diagnostics(tmp_path):
     baseline = _assemble(assembler)
     num_predict = 64
     safety_margin = 128
-    optional_allowance = 750
+    optional_allowance = 1_240
     input_budget = baseline.diagnostics["estimated_prompt_tokens"] + optional_allowance
 
     history = [
@@ -418,6 +421,35 @@ def test_worldbook_activation_controls_injection_and_body_free_diagnostics(tmp_p
         "DISABLED_BODY",
     ):
         assert marker not in serialized
+
+
+def test_world_state_changes_enter_scene_once(tmp_path):
+    assembler = _test_assembler(tmp_path)
+    change_id = "11111111-1111-4111-8111-111111111111"
+    assembly = _assemble(
+        assembler,
+        scene_meta={"location": "琉璃宫"},
+        world_state={
+            "schema_version": 1,
+            "discovered_entry_ids": ["glass_palace"],
+            "changes": [{
+                "id": change_id,
+                "category": "faction",
+                "title": "花园守卫转向",
+                "detail": "守卫开始协助主角。",
+                "status": "active",
+                "related_entry_ids": ["glass_palace"],
+                "evidence_message_ids": [],
+                "created_at": "2026-08-02T00:00:00+00:00",
+                "updated_at": "2026-08-02T00:00:00+00:00",
+            }],
+        },
+    )
+
+    rendered = json.dumps(assembly.messages, ensure_ascii=False)
+    assert rendered.count("花园守卫转向") == 1
+    assert rendered.count(change_id) == 1
+    assert "world_state" in rendered
 
 
 def test_ranked_large_worldbook_can_fail_then_smaller_candidate_uses_budget(tmp_path):

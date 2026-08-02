@@ -19,3 +19,50 @@
     grid-column: 1 / -1;
     color: var(--workspace-ink-faint);
 }
+
+.diagnostics-renderer-row,
+.fault-report-scope-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.diagnostics-renderer-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+}
+
+.fault-report-scope-card {
+    padding: 14px;
+    border: 1px solid var(--workspace-line);
+    border-radius: var(--workspace-radius-sm);
+    background: var(--workspace-panel-soft);
+}
+
+.fault-report-scope-card.included strong { color: var(--workspace-success); }
+.fault-report-scope-card.excluded strong { color: var(--workspace-gold); }
+.fault-report-scope-card p { margin: 8px 0 0; color: var(--workspace-ink-muted); }
+
+.fault-report-preview {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--workspace-line);
+}
+
+.fault-report-json {
+    max-height: 340px;
+    overflow: auto;
+    padding: 14px;
+    border: 1px solid var(--workspace-line);
+    border-radius: var(--workspace-radius-sm);
+    background: #0b0b0a;
+    color: var(--workspace-ink-muted);
+    font: 12px/1.6 ui-monospace, "Cascadia Code", Consolas, monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+    .diagnostics-renderer-row,
+    .fault-report-scope-grid { grid-template-columns: 1fr; }
+}

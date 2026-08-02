@@ -37,6 +37,7 @@ from core.recovery_store import (
 from core.roleplay_policy import normalize_silent_turns
 from core.relationship_edges import reconcile_relationship_evidence
 from core.worldbook_policy import MAX_MANUAL_WORLDBOOK_IDS
+from core.world_state import WorldStateValidationError, normalize_world_state
 
 
 T = TypeVar("T")
@@ -275,11 +276,18 @@ def _validate_session_shape(session: dict, project: str, save_id: str) -> None:
         "manual_worldbook_ids": list,
         "roleplay_policy": dict,
         "relationship_edges": list,
+        "world_state": dict,
     }
     for field, expected_type in container_types.items():
         if field in session and not isinstance(session[field], expected_type):
             label = "对象" if expected_type is dict else "数组"
             _shape_error(field, f"必须是{label}")
+
+    if "world_state" in session:
+        try:
+            normalize_world_state(session["world_state"], strict=True)
+        except WorldStateValidationError as exc:
+            _shape_error("world_state", ",".join(exc.violations))
 
     if "current_provider" in session:
         provider = session["current_provider"]
@@ -562,6 +570,7 @@ def normalize_session(session: dict, project: str, save_id: str) -> dict:
     session["manual_worldbook_ids"] = sorted(normalized_manual_ids)[
         :MAX_MANUAL_WORLDBOOK_IDS
     ]
+    session["world_state"] = normalize_world_state(session.get("world_state"))
     raw_policy = session.get("roleplay_policy")
     roleplay_policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
     roleplay_policy["strict_muted_writeback"] = (

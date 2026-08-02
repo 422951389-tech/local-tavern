@@ -1,7 +1,26 @@
-const ACTIVATIONS = Object.freeze(['always', 'keywords', 'manual']);
+const ACTIVATIONS = Object.freeze(['always', 'keywords', 'manual', 'scene']);
 const ACTIVATION_SET = new Set(ACTIVATIONS);
+const CATEGORIES = Object.freeze(['general', 'location', 'faction', 'rule', 'history', 'culture', 'item', 'secret']);
+const VISIBILITIES = Object.freeze(['public', 'discovered', 'hidden']);
+const KNOWLEDGE_SCOPES = Object.freeze(['global', 'narrator', 'characters']);
+const CATEGORY_LABELS = Object.freeze({
+    general: '通用', location: '地点', faction: '势力', rule: '规则', history: '历史',
+    culture: '文化', item: '物品', secret: '秘密',
+});
+const VISIBILITY_LABELS = Object.freeze({ public: '玩家可以知道', discovered: '发现后玩家才知道', hidden: '不向玩家展示' });
+const KNOWLEDGE_LABELS = Object.freeze({ global: '所有角色都知道', narrator: '只有叙述者知道', characters: '只有指定角色知道' });
+const ACTIVATION_LABELS = Object.freeze({
+    always: '每轮都参考',
+    keywords: '提到它时参考',
+    manual: '只在我启用时参考',
+    scene: '相关场景出现时参考',
+});
 const CANONICAL_ENTRY_FIELDS = new Set([
-    'id', 'title', 'enabled', 'activation', 'keywords', 'priority', 'content', 'custom',
+    'id', 'title', 'summary', 'category', 'enabled', 'activation', 'keywords', 'priority',
+    'visibility', 'knowledge_scope', 'known_by_character_ids', 'linked_character_ids',
+    'linked_entry_ids', 'location_aliases', 'content', 'custom',
+    'knowledgeScope', 'knownByCharacterIds', 'linkedCharacterIds', 'linkedEntryIds',
+    'locationAliases',
 ]);
 const PRESERVED_ENTRY_FIELDS = Symbol('worldbook-preserved-entry-fields');
 
@@ -83,6 +102,28 @@ function normalizeKeywords(value, { strict = false } = {}) {
     return result;
 }
 
+function normalizeStringArray(value, label, { strict = false } = {}) {
+    if (value === undefined || value === null) return [];
+    if (!Array.isArray(value)) {
+        if (strict) throw new TypeError(`${label}必须是字符串数组`);
+        return [];
+    }
+    const result = [];
+    const seen = new Set();
+    for (const item of value) {
+        if (typeof item !== 'string') {
+            if (strict) throw new TypeError(`${label}必须全部是字符串`);
+            continue;
+        }
+        const text = item.trim();
+        const canonical = text.normalize('NFKC').toLocaleLowerCase();
+        if (!text || seen.has(canonical)) continue;
+        seen.add(canonical);
+        result.push(text);
+    }
+    return result;
+}
+
 function normalizeCustom(value, { strict = false } = {}) {
     if (value === undefined || value === null) return {};
     if (!isObject(value)) {
@@ -126,14 +167,23 @@ const DEFAULT_SCHEMA = Object.freeze({
     groups: Object.freeze([{ fields: Object.freeze([
         { key: 'id', label: '稳定 ID（文件名）', type: 'text', required: true, fixed: true },
         { key: 'title', label: '标题', type: 'text' },
+        { key: 'summary', label: '一句话摘要', type: 'text' },
+        { key: 'category', label: '设定分类', type: 'select', options: CATEGORIES.map(value => ({ value, label: value })) },
         { key: 'enabled', label: '启用此条目', type: 'checkbox' },
         { key: 'activation', label: '触发方式', type: 'select', options: [
             { value: 'always', label: '常驻（always）' },
             { value: 'keywords', label: '关键词（keywords）' },
             { value: 'manual', label: '手动（manual）' },
+            { value: 'scene', label: '场景联动（scene）' },
         ] },
         { key: 'keywords', label: '触发关键词（每行一个）', type: 'textarea', rows: 4, maxItems: 64 },
         { key: 'priority', label: '优先级', type: 'number', min: -1_000_000, max: 1_000_000 },
+        { key: 'visibility', label: '玩家可见性', type: 'select', options: VISIBILITIES.map(value => ({ value, label: value })) },
+        { key: 'knowledge_scope', label: '知识边界', type: 'select', options: KNOWLEDGE_SCOPES.map(value => ({ value, label: value })) },
+        { key: 'known_by_character_ids', label: '知情角色 ID', type: 'textarea', rows: 3, array: true },
+        { key: 'linked_character_ids', label: '关联角色 ID', type: 'textarea', rows: 3, array: true },
+        { key: 'linked_entry_ids', label: '关联世界条目 ID', type: 'textarea', rows: 3, array: true },
+        { key: 'location_aliases', label: '地点别名', type: 'textarea', rows: 3, array: true },
         { key: 'content', label: '设定内容', type: 'textarea', rows: 8 },
     ]) }]),
     customGroup: Object.freeze({ key: '_custom', label: '自定义字段' }),
@@ -212,6 +262,18 @@ export function normalizeWorldbookEntry(value) {
     if (value.title !== undefined && typeof value.title !== 'string') {
         throw new TypeError(`世界书「${id}」的 title 必须是字符串`);
     }
+    if (value.summary !== undefined && typeof value.summary !== 'string') {
+        throw new TypeError(`世界书「${id}」的 summary 必须是字符串`);
+    }
+    const category = value.category === undefined ? 'general' : requireString(value.category, '设定分类', { allowEmpty: false });
+    const visibility = value.visibility === undefined ? 'public' : requireString(value.visibility, '玩家可见性', { allowEmpty: false });
+    const knowledgeScopeValue = value.knowledge_scope ?? value.knowledgeScope;
+    const knowledgeScope = knowledgeScopeValue === undefined
+        ? 'global'
+        : requireString(knowledgeScopeValue, '知识边界', { allowEmpty: false });
+    if (!CATEGORIES.includes(category)) throw new TypeError(`世界书「${id}」的 category 无效`);
+    if (!VISIBILITIES.includes(visibility)) throw new TypeError(`世界书「${id}」的 visibility 无效`);
+    if (!KNOWLEDGE_SCOPES.includes(knowledgeScope)) throw new TypeError(`世界书「${id}」的 knowledge_scope 无效`);
     const normalized = {
         id,
         enabled: value.enabled !== false,
@@ -219,6 +281,30 @@ export function normalizeWorldbookEntry(value) {
         keywords: Object.freeze(normalizeKeywords(value.keywords, { strict: true })),
         priority: priorityValue(value.priority, { strict: true }),
         title: value.title || '',
+        summary: value.summary || '',
+        category,
+        visibility,
+        knowledgeScope,
+        knownByCharacterIds: Object.freeze(normalizeStringArray(
+            value.known_by_character_ids ?? value.knownByCharacterIds,
+            '知情角色 ID',
+            { strict: true },
+        )),
+        linkedCharacterIds: Object.freeze(normalizeStringArray(
+            value.linked_character_ids ?? value.linkedCharacterIds,
+            '关联角色 ID',
+            { strict: true },
+        )),
+        linkedEntryIds: Object.freeze(normalizeStringArray(
+            value.linked_entry_ids ?? value.linkedEntryIds,
+            '关联世界条目 ID',
+            { strict: true },
+        )),
+        locationAliases: Object.freeze(normalizeStringArray(
+            value.location_aliases ?? value.locationAliases,
+            '地点别名',
+            { strict: true },
+        )),
         content: value.content || '',
         custom: Object.freeze(normalizeCustom(value.custom, { strict: true })),
     };
@@ -260,10 +346,18 @@ function draftFromEntry(entry) {
         originalId: entry ? entry.id : null,
         id: entry ? entry.id : '',
         enabled: entry ? entry.enabled : true,
-        activation: entry ? entry.activation : 'always',
+        activation: entry ? entry.activation : 'keywords',
         keywordsText: entry ? entry.keywords.join('\n') : '',
         priority: entry ? String(entry.priority) : '0',
         title: entry ? entry.title : '',
+        summary: entry ? entry.summary : '',
+        category: entry ? entry.category : 'general',
+        visibility: entry ? entry.visibility : 'public',
+        knowledgeScope: entry ? entry.knowledgeScope : 'global',
+        knownByCharacterIdsText: entry ? entry.knownByCharacterIds.join('\n') : '',
+        linkedCharacterIdsText: entry ? entry.linkedCharacterIds.join('\n') : '',
+        linkedEntryIdsText: entry ? entry.linkedEntryIds.join('\n') : '',
+        locationAliasesText: entry ? entry.locationAliases.join('\n') : '',
         content: entry ? entry.content : '',
         customRows: Object.entries(entry ? entry.custom : {}).map(([key, value]) => ({
             key,
@@ -310,7 +404,7 @@ export function serializeWorldbookDraft(draft, options = {}) {
     }
     const activation = String(draft.activation || '');
     if (!ACTIVATION_SET.has(activation)) {
-        throw new WorldbookValidationError('触发方式必须是 always、keywords 或 manual', 'activation');
+        throw new WorldbookValidationError('触发方式必须是 always、keywords、manual 或 scene', 'activation');
     }
     const schema = options.schema ? normalizeWorldbookSchema(options.schema) : defaultNormalizedSchema();
     let priority;
@@ -325,10 +419,27 @@ export function serializeWorldbookDraft(draft, options = {}) {
     if (typeof draft.title !== 'string') {
         throw new WorldbookValidationError('标题必须是字符串', 'title');
     }
+    if (typeof draft.summary !== 'string') throw new WorldbookValidationError('摘要必须是字符串', 'summary');
+    const category = String(draft.category || 'general');
+    const visibility = String(draft.visibility || 'public');
+    const knowledgeScope = String(draft.knowledgeScope || 'global');
+    if (!CATEGORIES.includes(category)) throw new WorldbookValidationError('设定分类无效', 'category');
+    if (!VISIBILITIES.includes(visibility)) throw new WorldbookValidationError('玩家可见性无效', 'visibility');
+    if (!KNOWLEDGE_SCOPES.includes(knowledgeScope)) throw new WorldbookValidationError('知识边界无效', 'knowledge_scope');
     const keywords = normalizeKeywords(String(draft.keywordsText || '').split(/\r?\n/), { strict: true });
+    const knownByCharacterIds = normalizeStringArray(String(draft.knownByCharacterIdsText || '').split(/\r?\n/), '知情角色 ID', { strict: true });
+    const linkedCharacterIds = normalizeStringArray(String(draft.linkedCharacterIdsText || '').split(/\r?\n/), '关联角色 ID', { strict: true });
+    const linkedEntryIds = normalizeStringArray(String(draft.linkedEntryIdsText || '').split(/\r?\n/), '关联世界条目 ID', { strict: true });
+    const locationAliases = normalizeStringArray(String(draft.locationAliasesText || '').split(/\r?\n/), '地点别名', { strict: true });
     const keywordField = schema.fields.keywords;
     if (activation === 'keywords' && keywords.length === 0) {
         throw new WorldbookValidationError('关键词触发方式至少需要一个关键词', 'keywords');
+    }
+    if (activation === 'scene' && linkedCharacterIds.length === 0 && locationAliases.length === 0) {
+        throw new WorldbookValidationError('场景联动至少需要地点别名或关联角色', 'location_aliases');
+    }
+    if (knowledgeScope === 'characters' && knownByCharacterIds.length === 0) {
+        throw new WorldbookValidationError('指定角色知识边界至少需要一个知情角色 ID', 'known_by_character_ids');
     }
     if (keywordField.maxItems !== undefined && keywords.length > keywordField.maxItems) {
         throw new WorldbookValidationError(`关键词不能超过 ${keywordField.maxItems} 条`, 'keywords');
@@ -353,6 +464,14 @@ export function serializeWorldbookDraft(draft, options = {}) {
         keywords,
         priority,
         title: draft.title,
+        summary: draft.summary,
+        category,
+        visibility,
+        knowledge_scope: knowledgeScope,
+        known_by_character_ids: knownByCharacterIds,
+        linked_character_ids: linkedCharacterIds,
+        linked_entry_ids: linkedEntryIds,
+        location_aliases: locationAliases,
         content: draft.content,
     });
     if (Object.keys(custom).length > 0) result.custom = custom;
@@ -413,6 +532,11 @@ export function sanitizeWorldbookDiagnostics(value) {
             : Number.isSafeInteger(raw.recency) && raw.recency >= 0 ? raw.recency : null;
         return [{
             id: raw.id.trim(),
+            title: typeof raw.title === 'string' ? raw.title.trim() : '',
+            category: CATEGORIES.includes(raw.category) ? raw.category : 'general',
+            summary: typeof raw.summary === 'string' ? raw.summary.trim() : '',
+            visibility: VISIBILITIES.includes(raw.visibility) ? raw.visibility : 'public',
+            knowledgeScope: KNOWLEDGE_SCOPES.includes(raw.knowledge_scope) ? raw.knowledge_scope : 'global',
             activation,
             enabled: raw.enabled !== false,
             activated: raw.activated === true,
@@ -515,23 +639,15 @@ function sameStringSet(left, right) {
 }
 
 function activationLabel(activation) {
-    if (activation === 'keywords') return '关键词';
-    if (activation === 'manual') return '手动';
-    return '常驻';
+    return ACTIVATION_LABELS[activation] || ACTIVATION_LABELS.always;
 }
 
 function diagnosticReason(record) {
     const parts = [];
-    if (record.activation) parts.push(activationLabel(record.activation));
-    if (record.matchedKeywords.length) parts.push(`命中：${record.matchedKeywords.join('、')}`);
-    if (record.matchedSources.length) parts.push(`来源：${record.matchedSources.join('、')}`);
-    parts.push(`优先级 ${record.priority}`);
-    if (record.matchCount) parts.push(`命中数 ${record.matchCount}`);
-    if (record.recency !== null) parts.push(`最近性 ${record.recency}`);
-    if (record.rank !== null) parts.push(`排序 ${record.rank}`);
-    if (record.trigger) parts.push(`触发 ${record.trigger}`);
-    if (record.reason) parts.push(record.reason);
-    return parts.join('；');
+    if (record.matchedKeywords.length) parts.push(`对话提到了“${record.matchedKeywords.join('、')}”`);
+    if (record.matchedSources.length) parts.push(`关联内容：${record.matchedSources.join('、')}`);
+    if (!parts.length && record.activation) parts.push(activationLabel(record.activation));
+    return parts.join('；') || '本轮没有符合使用条件';
 }
 
 export function createWorldbookEditor(options) {
@@ -546,9 +662,44 @@ export function createWorldbookEditor(options) {
     const fieldSchema = key => schema.fields[key];
 
     let entries = normalizeWorldbookEntries(options.entries || []);
-    let selectedId = entries.length ? entries[0].id : null;
+    const requestedSelectedId = typeof options.selectedId === 'string' ? options.selectedId : '';
+    let selectedId = entries.some(entry => entry.id === requestedSelectedId)
+        ? requestedSelectedId
+        : (entries.length ? entries[0].id : null);
     let newDraft = draftFromEntry(null);
     const drafts = new Map(entries.map(entry => [entry.id, draftFromEntry(entry)]));
+    const characterChoices = Array.isArray(options.characters) ? options.characters.flatMap(item => {
+        if (!isObject(item) || typeof item.id !== 'string' || !item.id.trim()) return [];
+        const id = item.id.trim();
+        const name = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : id;
+        return [{ id, label: name }];
+    }) : [];
+    let listQuery = '';
+    let categoryFilter = 'all';
+
+    function draftFingerprint(draft) {
+        return JSON.stringify({
+            id: draft.id,
+            enabled: draft.enabled,
+            activation: draft.activation,
+            keywordsText: draft.keywordsText,
+            priority: draft.priority,
+            title: draft.title,
+            summary: draft.summary,
+            category: draft.category,
+            visibility: draft.visibility,
+            knowledgeScope: draft.knowledgeScope,
+            knownByCharacterIdsText: draft.knownByCharacterIdsText,
+            linkedCharacterIdsText: draft.linkedCharacterIdsText,
+            linkedEntryIdsText: draft.linkedEntryIdsText,
+            locationAliasesText: draft.locationAliasesText,
+            content: draft.content,
+            customRows: draft.customRows.map(row => ({ key: row.key, value: row.value })),
+        });
+    }
+
+    const draftBaselines = new Map([...drafts].map(([id, draft]) => [id, draftFingerprint(draft)]));
+    let newDraftBaseline = draftFingerprint(newDraft);
     // 保留当前 Session 的完整选择集合。条目删除、禁用或改模式后 ID 会休眠，
     // 不能因编辑其他条目而被前端静默清除。
     let manualBaseline = new Set(normalizeManualWorldbookIds(options.manualIds));
@@ -560,25 +711,37 @@ export function createWorldbookEditor(options) {
     let customCounter = 0;
 
     const root = createElement(documentRef, 'section', 'worldbook-editor');
-    root.setAttribute('aria-label', '世界书编辑器');
+    root.setAttribute('aria-label', '世界设定编辑器');
     const intro = createElement(
         documentRef,
         'p',
         'worldbook-intro',
-        '条目配置对整个项目生效；“本档”选择只属于当前存档。实际注入仍受总 Prompt 预算约束。',
+        '世界设定在整个项目中共用。选择“只在我启用时参考”的设定，可以为每个存档分别开启。',
     );
     root.appendChild(intro);
 
     const diagnostics = sanitizeWorldbookDiagnostics(options.diagnostics);
-    const diagnosticsSection = createElement(documentRef, 'section', 'worldbook-diagnostics');
-    const diagnosticsTitle = createElement(documentRef, 'h3', 'worldbook-section-title', '上轮世界书命中');
+    const diagnosticsSection = createElement(documentRef, 'details', 'worldbook-diagnostics worldbook-inspector');
+    const diagnosticsTitle = createElement(documentRef, 'summary', 'worldbook-section-title', '使用情况');
     const diagnosticsId = `worldbook-diagnostics-${Date.now()}`;
     diagnosticsTitle.id = diagnosticsId;
     diagnosticsSection.setAttribute('aria-labelledby', diagnosticsId);
     diagnosticsSection.appendChild(diagnosticsTitle);
+    const selectionInspector = createElement(documentRef, 'dl', 'worldbook-selection-inspector');
+    const inspectorRows = Object.freeze({
+        scope: createElement(documentRef, 'dd'),
+        activation: createElement(documentRef, 'dd'),
+        knowledge: createElement(documentRef, 'dd'),
+        links: createElement(documentRef, 'dd'),
+    });
+    for (const [key, label] of [['scope', '保存位置'], ['activation', '参考时机'], ['knowledge', '故事人物中谁知道'], ['links', '关联内容']]) {
+        selectionInspector.append(createElement(documentRef, 'dt', '', label), inspectorRows[key]);
+    }
+    diagnosticsSection.appendChild(selectionInspector);
+    diagnosticsSection.appendChild(createElement(documentRef, 'h4', 'worldbook-inspector-subtitle', '最近一轮使用记录'));
     if (diagnostics.length === 0) {
         diagnosticsSection.appendChild(createElement(
-            documentRef, 'p', 'worldbook-diagnostics-empty', '当前没有可显示的上轮命中记录。',
+            documentRef, 'p', 'worldbook-diagnostics-empty', '当前没有上一轮使用记录。',
         ));
     } else {
         const activated = diagnostics.filter(item => item.activated).length;
@@ -587,7 +750,7 @@ export function createWorldbookEditor(options) {
             documentRef,
             'p',
             'worldbook-diagnostics-summary',
-            `检查 ${diagnostics.length} 条，触发 ${activated} 条，注入 ${kept} 条。诊断不包含世界书正文。`,
+            `检查了 ${diagnostics.length} 项设定，${activated} 项符合条件，${kept} 项在本轮使用。这里不展示设定正文。`,
         ));
         const list = createElement(documentRef, 'ul', 'worldbook-diagnostics-list');
         for (const record of diagnostics) {
@@ -597,9 +760,23 @@ export function createWorldbookEditor(options) {
                 documentRef,
                 'span',
                 `worldbook-diagnostic-state ${diagnosticState}`,
-                record.kept ? '已注入' : record.activated ? '已触发' : '未触发',
+                record.kept ? '本轮已使用' : record.activated ? '符合条件' : '本轮未使用',
             );
-            const id = createElement(documentRef, 'strong', 'worldbook-diagnostic-id', record.id);
+            const matchingEntry = entries.find(entry => entry.id === record.id);
+            const id = createElement(
+                documentRef,
+                'button',
+                'worldbook-diagnostic-id',
+                matchingEntry && matchingEntry.title ? matchingEntry.title : '未命名设定',
+            );
+            id.type = 'button';
+            id.addEventListener('click', () => {
+                if (!entries.some(entry => entry.id === record.id)) return;
+                if (!allowDraftSwitch()) return;
+                selectedId = record.id;
+                renderList(record.id);
+                renderForm();
+            });
             const reason = createElement(documentRef, 'span', 'worldbook-diagnostic-reason', diagnosticReason(record));
             item.appendChild(state);
             item.appendChild(id);
@@ -608,19 +785,34 @@ export function createWorldbookEditor(options) {
         }
         diagnosticsSection.appendChild(list);
     }
-    root.appendChild(diagnosticsSection);
-
     const layout = createElement(documentRef, 'div', 'worldbook-layout');
     const sidebar = createElement(documentRef, 'aside', 'worldbook-sidebar');
-    sidebar.setAttribute('aria-label', '世界书条目列表');
-    const sidebarTitle = createElement(documentRef, 'h3', 'worldbook-section-title', '项目共享条目');
-    const newButton = createElement(documentRef, 'button', 'modal-btn worldbook-new-button', '＋ 新建条目');
+    sidebar.setAttribute('aria-label', '世界设定列表');
+    const sidebarTitle = createElement(documentRef, 'h3', 'worldbook-section-title', '世界设定');
+    const newButton = createElement(documentRef, 'button', 'modal-btn primary worldbook-new-button', '新建设定');
     newButton.type = 'button';
+    const listTools = createElement(documentRef, 'div', 'worldbook-list-tools');
+    const searchLabel = createElement(documentRef, 'label', 'worldbook-visually-hidden', '搜索世界设定');
+    const searchInput = createElement(documentRef, 'input', 'worldbook-control worldbook-list-search');
+    searchInput.type = 'search';
+    searchInput.placeholder = '搜索标题、摘要或关键词';
+    searchInput.setAttribute('aria-label', '搜索世界设定');
+    const categorySelect = createElement(documentRef, 'select', 'worldbook-control worldbook-list-filter');
+    categorySelect.setAttribute('aria-label', '按设定类型筛选');
+    const allCategory = createElement(documentRef, 'option', '', '全部类型');
+    allCategory.value = 'all';
+    categorySelect.appendChild(allCategory);
+    for (const category of CATEGORIES) {
+        const option = createElement(documentRef, 'option', '', CATEGORY_LABELS[category] || category);
+        option.value = category;
+        categorySelect.appendChild(option);
+    }
+    listTools.append(searchLabel, searchInput, categorySelect);
     const listRoot = createElement(documentRef, 'div', 'worldbook-entry-list');
     listRoot.setAttribute('role', 'list');
     const manualActions = createElement(documentRef, 'div', 'worldbook-manual-actions');
     const manualSaveButton = createElement(
-        documentRef, 'button', 'modal-btn primary worldbook-manual-save worldbook-write-control', '保存本存档选择',
+        documentRef, 'button', 'modal-btn worldbook-manual-save worldbook-write-control', '保存当前存档设置',
     );
     manualSaveButton.type = 'button';
     const manualStatus = createElement(documentRef, 'p', 'worldbook-manual-status');
@@ -635,6 +827,7 @@ export function createWorldbookEditor(options) {
     manualActions.appendChild(manualError);
     sidebar.appendChild(sidebarTitle);
     sidebar.appendChild(newButton);
+    sidebar.appendChild(listTools);
     sidebar.appendChild(listRoot);
     sidebar.appendChild(manualActions);
 
@@ -642,6 +835,7 @@ export function createWorldbookEditor(options) {
     layout.appendChild(sidebar);
     layout.appendChild(formRoot);
     root.appendChild(layout);
+    root.appendChild(diagnosticsSection);
 
     function currentDraft() {
         return selectedId === null ? newDraft : drafts.get(selectedId);
@@ -649,6 +843,41 @@ export function createWorldbookEditor(options) {
 
     function manualDirty() {
         return !sameStringSet(manualBaseline, manualDraft);
+    }
+
+    function entryDirty() {
+        const draft = currentDraft();
+        const baseline = selectedId === null ? newDraftBaseline : draftBaselines.get(selectedId);
+        return Boolean(draft) && draftFingerprint(draft) !== baseline;
+    }
+
+    function allowDraftSwitch() {
+        if (!entryDirty()) return true;
+        if (typeof options.confirmDiscard === 'function') return options.confirmDiscard();
+        return globalThis.confirm ? globalThis.confirm('当前设定有未保存内容，确定放弃并切换吗？') : false;
+    }
+
+    function activationSentence(draft) {
+        if (!draft.enabled) return '已停用，不会进入任何存档的模型上下文。';
+        if (draft.activation === 'always') return '每轮作为候选设定参与上下文组装。';
+        if (draft.activation === 'manual') return manualDraft.has(draft.id)
+            ? '当前存档已手动启用。' : '需要在当前存档中手动启用。';
+        if (draft.activation === 'scene') {
+            const locations = String(draft.locationAliasesText || '').split(/\r?\n/).filter(Boolean);
+            const characters = String(draft.linkedCharacterIdsText || '').split(/\r?\n/).filter(Boolean);
+            return `场景出现${locations.length ? `地点“${locations.join('、')}”` : ''}${locations.length && characters.length ? '或' : ''}${characters.length ? `${characters.length} 位关联角色` : ''}时成为候选。`;
+        }
+        const keywords = String(draft.keywordsText || '').split(/\r?\n/).filter(Boolean);
+        return keywords.length ? `对话包含“${keywords.slice(0, 4).join('”或“')}”时成为候选。` : '尚未设置触发关键词。';
+    }
+
+    function updateInspector(draft) {
+        inspectorRows.scope.textContent = selectedId === null ? '项目设定 · 尚未保存' : '项目设定';
+        inspectorRows.activation.textContent = activationSentence(draft);
+        inspectorRows.knowledge.textContent = `${VISIBILITY_LABELS[draft.visibility] || draft.visibility} · ${KNOWLEDGE_LABELS[draft.knowledgeScope] || draft.knowledgeScope}`;
+        const characterCount = String(draft.linkedCharacterIdsText || '').split(/\r?\n/).filter(Boolean).length;
+        const entryCount = String(draft.linkedEntryIdsText || '').split(/\r?\n/).filter(Boolean).length;
+        inspectorRows.links.textContent = `角色 ${characterCount} · 世界设定 ${entryCount}`;
     }
 
     function setPendingState() {
@@ -670,16 +899,26 @@ export function createWorldbookEditor(options) {
         for (const checkbox of root.querySelectorAll('.worldbook-manual-checkbox')) {
             checkbox.disabled = writeDisabled || entryPending || manualPending;
         }
+        for (const checkbox of root.querySelectorAll('.worldbook-entity-choice input')) {
+            checkbox.disabled = writeDisabled || entryPending || manualPending;
+        }
         manualSaveButton.disabled = writeDisabled || entryPending || manualPending || !manualDirty();
         manualSaveButton.setAttribute('aria-busy', String(manualPending));
-        manualSaveButton.textContent = manualPending ? '保存中…' : '保存本存档选择';
+        manualSaveButton.textContent = manualPending ? '保存中…' : '保存当前存档设置';
     }
 
     function renderList(focusId = undefined) {
         listRoot.replaceChildren();
         newButton.classList.toggle('active', selectedId === null);
         newButton.setAttribute('aria-current', selectedId === null ? 'true' : 'false');
-        for (const entry of entries) {
+        const query = listQuery.trim().toLocaleLowerCase('zh-CN');
+        const visibleEntries = entries.filter(entry => {
+            if (categoryFilter !== 'all' && entry.category !== categoryFilter) return false;
+            if (!query) return true;
+            return [entry.title, entry.summary, entry.id, ...entry.keywords]
+                .some(value => String(value || '').toLocaleLowerCase('zh-CN').includes(query));
+        });
+        for (const entry of visibleEntries) {
             const item = createElement(documentRef, 'div', 'worldbook-entry-row');
             item.setAttribute('role', 'listitem');
             const selectButton = createElement(documentRef, 'button', 'worldbook-entry-select');
@@ -690,14 +929,14 @@ export function createWorldbookEditor(options) {
             selectButton.setAttribute('aria-current', selected ? 'true' : 'false');
             selectButton.setAttribute(
                 'aria-label',
-                `编辑世界书条目 ${entry.title ? `${entry.title}，` : ''}${entry.id}`,
+                `编辑世界设定 ${entry.title || '未命名设定'}`,
             );
-            if (entry.title) {
-                selectButton.appendChild(createElement(
-                    documentRef, 'span', 'worldbook-entry-title', entry.title,
-                ));
-            }
-            const name = createElement(documentRef, 'span', 'worldbook-entry-id', entry.id);
+            selectButton.appendChild(createElement(
+                documentRef, 'span', 'worldbook-entry-title', entry.title || '未命名设定',
+            ));
+            if (entry.summary) selectButton.appendChild(createElement(
+                documentRef, 'span', 'worldbook-entry-summary', entry.summary,
+            ));
             const badges = createElement(documentRef, 'span', 'worldbook-entry-badges');
             badges.appendChild(createElement(
                 documentRef,
@@ -705,17 +944,13 @@ export function createWorldbookEditor(options) {
                 `worldbook-badge ${entry.enabled ? '' : 'disabled'}`,
                 entry.enabled ? activationLabel(entry.activation) : '全局关闭',
             ));
-            if (entry.activation === 'keywords') {
-                badges.appendChild(createElement(
-                    documentRef, 'span', 'worldbook-badge', `关键词 ${entry.keywords.length}`,
-                ));
-            }
             badges.appendChild(createElement(
-                documentRef, 'span', 'worldbook-badge', `优先级 ${entry.priority}`,
+                documentRef, 'span', `worldbook-badge worldbook-category-badge category-${entry.category}`,
+                CATEGORY_LABELS[entry.category] || entry.category,
             ));
-            selectButton.appendChild(name);
             selectButton.appendChild(badges);
             selectButton.addEventListener('click', () => {
+                if (selectedId !== entry.id && !allowDraftSwitch()) return;
                 selectedId = entry.id;
                 renderList(entry.id);
                 renderForm();
@@ -727,22 +962,22 @@ export function createWorldbookEditor(options) {
                 const checkbox = createElement(documentRef, 'input', 'worldbook-manual-checkbox worldbook-write-control');
                 checkbox.type = 'checkbox';
                 checkbox.checked = manualDraft.has(entry.id);
-                checkbox.setAttribute('aria-label', `当前存档${checkbox.checked ? '取消选择' : '选择'}世界书 ${entry.id}`);
+                checkbox.setAttribute('aria-label', `当前存档${checkbox.checked ? '停用' : '启用'}设定 ${entry.title || '未命名设定'}`);
                 const text = createElement(
                     documentRef,
                     'span',
                     'worldbook-manual-label',
-                    checkbox.checked ? '本档已选' : '本档未选',
+                    checkbox.checked ? '当前存档已启用' : '当前存档未启用',
                 );
                 checkbox.addEventListener('change', () => {
                     if (checkbox.checked) manualDraft.add(entry.id);
                     else manualDraft.delete(entry.id);
-                    text.textContent = checkbox.checked ? '本档已选' : '本档未选';
+                    text.textContent = checkbox.checked ? '当前存档已启用' : '当前存档未启用';
                     checkbox.setAttribute(
                         'aria-label',
-                        `当前存档${checkbox.checked ? '取消选择' : '选择'}世界书 ${entry.id}`,
+                        `当前存档${checkbox.checked ? '停用' : '启用'}设定 ${entry.title || '未命名设定'}`,
                     );
-                    setLiveMessage(manualStatus, manualDirty() ? '本存档选择尚未保存。' : '');
+                    setLiveMessage(manualStatus, manualDirty() ? '当前存档设置尚未保存。' : '');
                     setLiveMessage(manualError, '');
                     setPendingState();
                 });
@@ -751,6 +986,9 @@ export function createWorldbookEditor(options) {
                 item.appendChild(label);
             }
             listRoot.appendChild(item);
+        }
+        if (visibleEntries.length === 0) {
+            listRoot.appendChild(createElement(documentRef, 'p', 'worldbook-list-empty', '没有符合筛选条件的设定。'));
         }
         setPendingState();
         if (focusId !== undefined) {
@@ -790,6 +1028,78 @@ export function createWorldbookEditor(options) {
         }
         form.appendChild(row);
         return { row, control };
+    }
+
+    function createFormSection(title, description = '') {
+        const section = createElement(documentRef, 'fieldset', 'worldbook-form-section');
+        section.appendChild(createElement(documentRef, 'legend', 'worldbook-form-section-title', title));
+        if (description) section.appendChild(createElement(documentRef, 'p', 'worldbook-form-section-description', description));
+        return section;
+    }
+
+    function createCollapsibleFormSection(title, description = '') {
+        const section = createElement(documentRef, 'details', 'worldbook-form-section worldbook-collapsible-section');
+        section.appendChild(createElement(documentRef, 'summary', 'worldbook-form-section-title', title));
+        if (description) section.appendChild(createElement(documentRef, 'p', 'worldbook-form-section-description', description));
+        return section;
+    }
+
+    function appendEntityPicker(host, config) {
+        const row = createElement(documentRef, 'div', `worldbook-field worldbook-entity-field worldbook-field-${config.field}`);
+        const label = createElement(documentRef, 'span', 'worldbook-field-label', config.label);
+        const search = createElement(documentRef, 'input', 'worldbook-control worldbook-entity-search');
+        search.type = 'search';
+        search.placeholder = config.placeholder || `搜索${config.label}`;
+        search.setAttribute('aria-label', `搜索${config.label}`);
+        search.dataset.field = config.field;
+        const choicesHost = createElement(documentRef, 'div', 'worldbook-entity-choices');
+        const selected = new Set(config.selected || []);
+        const available = new Map((config.choices || []).map(choice => [choice.id, choice]));
+        for (const id of selected) {
+            if (!available.has(id)) available.set(id, { id, label: `已缺失对象（${id}）`, missing: true });
+        }
+
+        function renderChoices() {
+            choicesHost.replaceChildren();
+            const query = search.value.trim().toLocaleLowerCase('zh-CN');
+            const visible = [...available.values()].filter(choice => (
+                !query || choice.label.toLocaleLowerCase('zh-CN').includes(query)
+                || choice.id.toLocaleLowerCase('zh-CN').includes(query)
+            ));
+            for (const choice of visible) {
+                const option = createElement(documentRef, 'label', `worldbook-entity-choice${choice.missing ? ' is-missing' : ''}`);
+                const checkbox = createElement(documentRef, 'input', 'worldbook-write-control');
+                checkbox.type = 'checkbox';
+                checkbox.value = choice.id;
+                checkbox.checked = selected.has(choice.id);
+                checkbox.addEventListener('change', () => {
+                    if (checkbox.checked) selected.add(choice.id);
+                    else selected.delete(choice.id);
+                    config.onChange([...selected]);
+                    updateInspector(currentDraft());
+                });
+                option.append(checkbox, createElement(documentRef, 'span', '', choice.label));
+                choicesHost.appendChild(option);
+            }
+            if (visible.length === 0) choicesHost.appendChild(createElement(documentRef, 'p', 'worldbook-list-empty', '没有匹配对象。'));
+        }
+        search.addEventListener('input', renderChoices);
+        row.append(label, search, choicesHost);
+        if (typeof config.onCreate === 'function') {
+            const createButton = createElement(
+                documentRef,
+                'button',
+                'modal-btn worldbook-entity-create',
+                config.createLabel || '＋ 新建设定',
+            );
+            createButton.type = 'button';
+            createButton.addEventListener('click', config.onCreate);
+            row.appendChild(createButton);
+        }
+        if (config.hint) row.appendChild(createElement(documentRef, 'p', 'worldbook-field-hint', config.hint));
+        host.appendChild(row);
+        renderChoices();
+        return { row, control: search };
     }
 
     function renderCustomRows(container, draft) {
@@ -851,10 +1161,21 @@ export function createWorldbookEditor(options) {
         entries = normalizeWorldbookEntries(nextEntries);
         const ids = new Set(entries.map(entry => entry.id));
         for (const key of [...drafts.keys()]) {
-            if (!ids.has(key)) drafts.delete(key);
+            if (!ids.has(key)) {
+                drafts.delete(key);
+                draftBaselines.delete(key);
+            }
         }
         for (const entry of entries) {
-            if (!drafts.has(entry.id) || entry.id === savedId) drafts.set(entry.id, draftFromEntry(entry));
+            if (!drafts.has(entry.id) || entry.id === savedId) {
+                const draft = draftFromEntry(entry);
+                drafts.set(entry.id, draft);
+                draftBaselines.set(entry.id, draftFingerprint(draft));
+            }
+        }
+        if (savedId) {
+            newDraft = draftFromEntry(null);
+            newDraftBaseline = draftFingerprint(newDraft);
         }
         if (savedId && ids.has(savedId)) selectedId = savedId;
         else if (!ids.has(selectedId)) selectedId = entries.length ? entries[0].id : null;
@@ -870,6 +1191,23 @@ export function createWorldbookEditor(options) {
         draft.status = '';
         let data;
         try {
+            if (!String(draft.title || '').trim()) {
+                throw new WorldbookValidationError('请填写设定名称', 'title');
+            }
+            if (!String(draft.content || '').trim()) {
+                throw new WorldbookValidationError('请填写详细内容', 'content');
+            }
+            if (selectedId === null && !String(draft.id || '').trim()) {
+                const usedIds = new Set(entries.map(entry => entry.id));
+                const base = `setting_${Date.now().toString(36)}`;
+                let candidate = base;
+                let suffix = 2;
+                while (usedIds.has(candidate)) candidate = `${base}_${suffix++}`;
+                draft.id = candidate;
+            }
+            if (draft.activation === 'keywords' && !String(draft.keywordsText || '').trim()) {
+                draft.keywordsText = String(draft.title || '').trim();
+            }
             data = serializeWorldbookDraft(draft, { schema: options.schema || DEFAULT_SCHEMA });
         } catch (error) {
             draft.error = errorText(error);
@@ -887,7 +1225,7 @@ export function createWorldbookEditor(options) {
             });
             replaceEntries(fresh, { savedId: data.id });
             const savedDraft = drafts.get(data.id);
-            savedDraft.status = '✓ 项目共享条目已保存';
+            savedDraft.status = '设定已保存';
             renderForm();
             return true;
         } catch (error) {
@@ -897,7 +1235,7 @@ export function createWorldbookEditor(options) {
             return false;
         } finally {
             entryPending = false;
-            if (currentFormRefs) currentFormRefs.saveButton.textContent = '保存条目';
+            if (currentFormRefs) currentFormRefs.saveButton.textContent = '保存设定';
             setPendingState();
         }
     }
@@ -938,7 +1276,7 @@ export function createWorldbookEditor(options) {
         try {
             await options.onSaveManual([...manualDraft].sort());
             manualBaseline = new Set(manualDraft);
-            setLiveMessage(manualStatus, '✓ 当前存档的手动选择已保存');
+            setLiveMessage(manualStatus, '当前存档设置已保存');
             return true;
         } catch (error) {
             setLiveMessage(manualStatus, '');
@@ -960,7 +1298,7 @@ export function createWorldbookEditor(options) {
             documentRef,
             'h3',
             'worldbook-form-title',
-            selectedId === null ? '新建项目共享条目' : `编辑：${selectedId}`,
+            selectedId === null ? '新建设定' : `编辑：${draft.title || '未命名设定'}`,
         );
         form.appendChild(title);
 
@@ -976,22 +1314,49 @@ export function createWorldbookEditor(options) {
         form.appendChild(error);
         form.appendChild(status);
 
+        const basicSection = createFormSection('基本内容', '名称、类型和一句话介绍会显示在设定列表中。');
+        const contentSection = createFormSection('详细设定', '写清楚 AI 在故事中需要遵守的事实和规则。');
+        const activationSection = createFormSection('什么时候参考', '选择 AI 在什么情况下需要读取这项设定。');
+        const knowledgeSection = createFormSection('谁知道这件事', '分别控制玩家和故事人物能否知道。');
+        const relationSection = createCollapsibleFormSection('关联角色与其他设定', '需要建立联系时再展开选择。');
+        const advancedSection = createCollapsibleFormSection('专业设置', '内部标识、冲突顺序和自定义字段。');
+        form.append(basicSection, contentSection, activationSection, knowledgeSection, relationSection, advancedSection);
+
         const idConfig = fieldSchema('id');
-        const idField = appendLabeledControl(form, {
-            field: 'id', label: idConfig.label, value: draft.id, readOnly: selectedId !== null,
+        const idField = appendLabeledControl(advancedSection, {
+            field: 'id', label: '内部标识', value: draft.id, readOnly: selectedId !== null,
             hint: selectedId === null
-                ? '新条目保存后 ID 不可直接修改。'
-                : '已有条目的 ID 已锁定，防止产生重复条目或悬空的存档选择。',
+                ? '保存时自动生成，无需填写。'
+                : '用于保持已有存档和设定关联，保存后不能修改。',
         });
-        idField.control.required = true;
         idField.control.addEventListener('input', () => { draft.id = idField.control.value; });
 
         const titleConfig = fieldSchema('title');
-        const titleField = appendLabeledControl(form, {
-            field: 'title', label: titleConfig.label, value: draft.title,
-            hint: titleConfig.hint || '用于列表辨识；稳定 ID 仍是服务端关联依据。',
+        const titleField = appendLabeledControl(basicSection, {
+            field: 'title', label: '设定名称', value: draft.title,
+            hint: titleConfig.hint || '例如“琉璃宫”“共鸣规则”“今州边庭”。',
         });
+        titleField.control.required = true;
         titleField.control.addEventListener('input', () => { draft.title = titleField.control.value; });
+
+        const summaryConfig = fieldSchema('summary');
+        const summaryField = appendLabeledControl(basicSection, {
+            field: 'summary', label: '一句话介绍（可选）', value: draft.summary,
+            hint: summaryConfig.hint || '用一句话概括，方便之后快速查找。',
+        });
+        summaryField.control.addEventListener('input', () => { draft.summary = summaryField.control.value; });
+
+        const categoryConfig = fieldSchema('category');
+        const categoryField = appendLabeledControl(basicSection, {
+            field: 'category', label: '设定类型', tag: 'select', hint: '类型只用于整理，不影响内容。',
+        });
+        for (const config of categoryConfig.options) {
+            const option = createElement(documentRef, 'option', '', config.label);
+            option.value = config.value;
+            categoryField.control.appendChild(option);
+        }
+        categoryField.control.value = draft.category;
+        categoryField.control.addEventListener('change', () => { draft.category = categoryField.control.value; });
 
         const enabledConfig = fieldSchema('enabled');
         const enabledRow = createElement(documentRef, 'div', 'worldbook-field worldbook-checkbox-field');
@@ -1001,33 +1366,32 @@ export function createWorldbookEditor(options) {
         enabledInput.checked = draft.enabled;
         const enabledText = createElement(documentRef, 'span', '', enabledConfig.label);
         const enabledHint = createElement(
-            documentRef, 'span', 'worldbook-field-hint', '关闭后所有存档都不会注入此条目。',
+            documentRef, 'span', 'worldbook-field-hint', '关闭后所有存档都不会参考这项设定。',
         );
         enabledInput.addEventListener('change', () => { draft.enabled = enabledInput.checked; });
         enabledLabel.appendChild(enabledInput);
         enabledLabel.appendChild(enabledText);
         enabledLabel.appendChild(enabledHint);
         enabledRow.appendChild(enabledLabel);
-        form.appendChild(enabledRow);
+        basicSection.appendChild(enabledRow);
 
         const activationConfig = fieldSchema('activation');
-        const activationField = appendLabeledControl(form, {
-            field: 'activation', label: activationConfig.label, tag: 'select',
-            hint: activationConfig.hint
-                || '常驻每轮成为候选；关键词命中明确上下文时成为候选；手动仅在当前存档选中时成为候选。',
+        const activationField = appendLabeledControl(activationSection, {
+            field: 'activation', label: '参考时机', tag: 'select',
+            hint: '“提到它时参考”适合大多数地点、势力、物品和人物背景。',
         });
         for (const config of activationConfig.options) {
-            const option = createElement(documentRef, 'option', '', config.label);
+            const option = createElement(documentRef, 'option', '', ACTIVATION_LABELS[config.value] || config.label);
             option.value = config.value;
             activationField.control.appendChild(option);
         }
         activationField.control.value = draft.activation;
 
         const keywordsConfig = fieldSchema('keywords');
-        const keywordsField = appendLabeledControl(form, {
-            field: 'keywords', label: keywordsConfig.label, tag: 'textarea', rows: keywordsConfig.rows || 4,
+        const keywordsField = appendLabeledControl(activationSection, {
+            field: 'keywords', label: '相关名称（每行一个）', tag: 'textarea', rows: keywordsConfig.rows || 4,
             value: draft.keywordsText,
-            hint: `${keywordsConfig.hint ? `${keywordsConfig.hint}；` : ''}空行和重复项在保存时移除；切换触发方式不会清空草稿。`,
+            hint: '留空时自动使用设定名称。还可以填写别名、简称或旧称。',
         });
         keywordsField.row.classList.add('worldbook-keywords-field');
         keywordsField.control.addEventListener('input', () => { draft.keywordsText = keywordsField.control.value; });
@@ -1036,9 +1400,9 @@ export function createWorldbookEditor(options) {
             documentRef,
             'p',
             'worldbook-manual-entry-hint',
-            '保存为 manual 后，可在左侧用“本档已选/未选”单独控制当前存档。',
+            '保存后，可在左侧为当前存档单独启用或停用。',
         );
-        form.appendChild(manualHint);
+        activationSection.appendChild(manualHint);
 
         function syncActivationFields() {
             draft.activation = activationField.control.value;
@@ -1050,17 +1414,107 @@ export function createWorldbookEditor(options) {
         syncActivationFields();
 
         const priorityConfig = fieldSchema('priority');
-        const priorityField = appendLabeledControl(form, {
-            field: 'priority', label: priorityConfig.label, type: 'number', step: '1', value: draft.priority,
+        const priorityField = appendLabeledControl(advancedSection, {
+            field: 'priority', label: '冲突时优先顺序', type: 'number', step: '1', value: draft.priority,
             min: priorityConfig.min, max: priorityConfig.max,
-            hint: '整数越大越先进入候选排序；是否最终注入仍由命中与总预算决定。',
+            hint: '数值越大越优先。没有设定冲突时保持 0 即可。',
         });
         priorityField.control.addEventListener('input', () => { draft.priority = priorityField.control.value; });
 
+        const visibilityConfig = fieldSchema('visibility');
+        const visibilityField = appendLabeledControl(knowledgeSection, {
+            field: 'visibility', label: '玩家什么时候知道', tag: 'select',
+            hint: '选择“发现后”时，会结合当前存档的发现记录显示。',
+        });
+        for (const config of visibilityConfig.options) {
+            const option = createElement(documentRef, 'option', '', VISIBILITY_LABELS[config.value] || config.label);
+            option.value = config.value;
+            visibilityField.control.appendChild(option);
+        }
+        visibilityField.control.value = draft.visibility;
+        visibilityField.control.addEventListener('change', () => { draft.visibility = visibilityField.control.value; });
+
+        const knowledgeConfig = fieldSchema('knowledge_scope');
+        const knowledgeField = appendLabeledControl(knowledgeSection, {
+            field: 'knowledge_scope', label: '故事人物中谁知道', tag: 'select',
+            hint: '用于避免角色提前说出自己不应该知道的秘密。',
+        });
+        for (const config of knowledgeConfig.options) {
+            const option = createElement(documentRef, 'option', '', KNOWLEDGE_LABELS[config.value] || config.label);
+            option.value = config.value;
+            knowledgeField.control.appendChild(option);
+        }
+        knowledgeField.control.value = draft.knowledgeScope;
+
+        const knownConfig = fieldSchema('known_by_character_ids');
+        const knownField = appendEntityPicker(knowledgeSection, {
+            field: 'known_by_character_ids', label: '知情角色', choices: characterChoices,
+            selected: draft.knownByCharacterIdsText.split(/\r?\n/).filter(Boolean),
+            hint: knownConfig.hint || '只有选中的角色可以使用这条设定中的知识。',
+            onChange(ids) { draft.knownByCharacterIdsText = ids.join('\n'); },
+        });
+
+        const linkedCharacterConfig = fieldSchema('linked_character_ids');
+        const linkedCharacterField = appendEntityPicker(relationSection, {
+            field: 'linked_character_ids', label: '关联角色', choices: characterChoices,
+            selected: draft.linkedCharacterIdsText.split(/\r?\n/).filter(Boolean),
+            hint: linkedCharacterConfig.hint || '用于场景联动和关系浏览。',
+            onChange(ids) { draft.linkedCharacterIdsText = ids.join('\n'); },
+        });
+
+        const locationConfig = fieldSchema('location_aliases');
+        const locationField = appendLabeledControl(relationSection, {
+            field: 'location_aliases', label: locationConfig.label, tag: 'textarea', rows: locationConfig.rows || 3,
+            value: draft.locationAliasesText, hint: locationConfig.hint || '每行一个地点名称或常用别名，不需要填写内部 ID。',
+        });
+        locationField.control.addEventListener('input', () => { draft.locationAliasesText = locationField.control.value; });
+
+        const linkedEntryConfig = fieldSchema('linked_entry_ids');
+        const linkedEntryField = appendEntityPicker(relationSection, {
+            field: 'linked_entry_ids', label: '关联世界设定',
+            choices: entries.filter(entry => entry.id !== draft.id).map(entry => ({
+                id: entry.id,
+                label: `${entry.title || entry.id} · ${CATEGORY_LABELS[entry.category] || entry.category}`,
+            })),
+            selected: draft.linkedEntryIdsText.split(/\r?\n/).filter(Boolean),
+            hint: linkedEntryConfig.hint || '关联会直接进入“关系图”，点击即可互相跳转。',
+            onChange(ids) { draft.linkedEntryIdsText = ids.join('\n'); },
+            createLabel: '＋ 新建关联设定',
+            onCreate() {
+                if (selectedId === null) {
+                    idField.control.focus();
+                    return;
+                }
+                if (!allowDraftSwitch()) return;
+                selectedId = null;
+                renderList(null);
+                renderForm();
+            },
+        });
+
+        function syncKnowledgeFields() {
+            draft.knowledgeScope = knowledgeField.control.value;
+            knownField.row.hidden = draft.knowledgeScope !== 'characters';
+            knownField.row.setAttribute('aria-hidden', String(knownField.row.hidden));
+        }
+        knowledgeField.control.addEventListener('change', syncKnowledgeFields);
+        syncKnowledgeFields();
+
+        const originalSyncActivationFields = syncActivationFields;
+        function syncWorldLinkFields() {
+            originalSyncActivationFields();
+            const sceneMode = draft.activation === 'scene';
+            linkedCharacterField.row.classList.toggle('worldbook-scene-link-active', sceneMode);
+            locationField.row.classList.toggle('worldbook-scene-link-active', sceneMode);
+        }
+        activationField.control.removeEventListener('change', syncActivationFields);
+        activationField.control.addEventListener('change', syncWorldLinkFields);
+        syncWorldLinkFields();
+
         const contentConfig = fieldSchema('content');
-        const contentField = appendLabeledControl(form, {
-            field: 'content', label: contentConfig.label, tag: 'textarea', rows: contentConfig.rows || 8, value: draft.content,
-            hint: '正文只进入模型上下文，不会写入前端命中诊断。',
+        const contentField = appendLabeledControl(contentSection, {
+            field: 'content', label: '详细内容', tag: 'textarea', rows: contentConfig.rows || 8, value: draft.content,
+            hint: '直接写事实和规则即可，不需要写提示词格式。',
         });
         contentField.row.classList.add('worldbook-content-field');
         contentField.control.addEventListener('input', () => { draft.content = contentField.control.value; });
@@ -1085,20 +1539,20 @@ export function createWorldbookEditor(options) {
         customFieldset.appendChild(customLegend);
         customFieldset.appendChild(customRows);
         customFieldset.appendChild(addCustomButton);
-        form.appendChild(customFieldset);
+        advancedSection.appendChild(customFieldset);
 
         const actions = createElement(documentRef, 'div', 'worldbook-entry-actions');
         let deleteButton = null;
         if (selectedId !== null) {
             deleteButton = createElement(
-                documentRef, 'button', 'modal-btn danger worldbook-entry-delete worldbook-write-control', '删除条目',
+                documentRef, 'button', 'modal-btn danger worldbook-entry-delete worldbook-write-control', '删除设定',
             );
             deleteButton.type = 'button';
             deleteButton.addEventListener('click', () => { void deleteEntry(); });
             actions.appendChild(deleteButton);
         }
         const saveButton = createElement(
-            documentRef, 'button', 'modal-btn primary worldbook-entry-save worldbook-write-control', '保存条目',
+            documentRef, 'button', 'modal-btn primary worldbook-entry-save worldbook-write-control', '保存设定',
         );
         saveButton.type = 'submit';
         actions.appendChild(saveButton);
@@ -1111,10 +1565,18 @@ export function createWorldbookEditor(options) {
         const fieldMap = new Map([
             ['id', idField.control],
             ['title', titleField.control],
+            ['summary', summaryField.control],
+            ['category', categoryField.control],
             ['enabled', enabledInput],
             ['activation', activationField.control],
             ['keywords', keywordsField.control],
             ['priority', priorityField.control],
+            ['visibility', visibilityField.control],
+            ['knowledge_scope', knowledgeField.control],
+            ['known_by_character_ids', knownField.control],
+            ['linked_character_ids', linkedCharacterField.control],
+            ['linked_entry_ids', linkedEntryField.control],
+            ['location_aliases', locationField.control],
             ['content', contentField.control],
             ['custom', addCustomButton],
         ]);
@@ -1129,15 +1591,37 @@ export function createWorldbookEditor(options) {
             controls: [
                 idField.control,
                 titleField.control,
+                summaryField.control,
+                categoryField.control,
                 enabledInput,
                 activationField.control,
                 keywordsField.control,
                 priorityField.control,
+                visibilityField.control,
+                knowledgeField.control,
+                knownField.control,
+                linkedCharacterField.control,
+                linkedEntryField.control,
+                locationField.control,
                 contentField.control,
                 addCustomButton,
             ],
         };
+        function markDraftDirty(event) {
+            if (event.target && event.target.classList.contains('worldbook-entity-search')) return;
+            draft.status = '未保存修改';
+            setLiveMessage(status, draft.status);
+            updateInspector(draft);
+        }
+        form.addEventListener('input', markDraftDirty);
+        form.addEventListener('change', markDraftDirty);
+        form.addEventListener('click', event => {
+            if (event.target && event.target.matches('.worldbook-custom-add, .worldbook-custom-remove')) {
+                markDraftDirty(event);
+            }
+        });
         formRoot.appendChild(form);
+        updateInspector(draft);
         if (draft.errorField) {
             const target = fieldMap.get(draft.errorField);
             if (target) target.setAttribute('aria-invalid', 'true');
@@ -1146,11 +1630,30 @@ export function createWorldbookEditor(options) {
     }
 
     newButton.addEventListener('click', () => {
+        if (selectedId !== null && !allowDraftSwitch()) return;
         selectedId = null;
         renderList(null);
         renderForm();
     });
+    searchInput.addEventListener('input', () => {
+        listQuery = searchInput.value;
+        renderList();
+    });
+    categorySelect.addEventListener('change', () => {
+        categoryFilter = categorySelect.value;
+        renderList();
+    });
     manualSaveButton.addEventListener('click', () => { void commitManualSelection(); });
+    root.addEventListener('keydown', event => {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase('zh-CN') === 's') {
+            event.preventDefault();
+            void saveEntry();
+        }
+        if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase('zh-CN') === 'k') {
+            event.preventDefault();
+            searchInput.focus();
+        }
+    });
 
     renderList();
     renderForm();
@@ -1166,6 +1669,7 @@ export function createWorldbookEditor(options) {
                 selectedId,
                 manualIds: Object.freeze([...manualDraft].sort()),
                 manualDirty: manualDirty(),
+                entryDirty: entryDirty(),
                 entryPending,
                 manualPending,
             });

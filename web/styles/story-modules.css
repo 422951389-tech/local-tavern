@@ -1,0 +1,389 @@
+/* 世界构成五个独立模块的共享设计语言。
+ * 只复用视觉令牌和基础交互，不建立统一的可见外层工作台。
+ */
+
+.modal.story-module-dialog {
+    width: min(1080px, calc(100vw - 48px));
+    max-width: min(1080px, calc(100vw - 48px));
+    max-height: calc(100dvh - 48px);
+    border-color: var(--workspace-line-strong);
+    background: var(--workspace-panel-raised);
+    box-shadow: var(--workspace-shadow);
+}
+
+.character-manager-dialog { --module-accent: #d1ad67; }
+.relationship-manager-dialog { --module-accent: #c69ab2; }
+.user-profile-dialog { --module-accent: #8eb2c9; }
+.save-manager-dialog { --module-accent: #c9966a; }
+
+.story-module {
+    min-width: 0;
+    color: var(--workspace-ink);
+}
+
+.story-module-intro,
+.story-module-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    margin: 0 0 16px;
+    padding: 14px 16px;
+    border: 1px solid var(--workspace-line);
+    border-left: 3px solid var(--module-accent, var(--workspace-gold));
+    border-radius: var(--workspace-radius);
+    background: var(--workspace-panel-soft);
+}
+
+.story-module-intro p,
+.story-module-heading p,
+.story-module-heading h2 {
+    margin: 0;
+}
+
+.story-module-intro p,
+.story-module-heading p {
+    max-width: 70ch;
+    color: var(--workspace-ink-muted);
+    font-size: 13px;
+    line-height: 1.65;
+}
+
+.story-module-heading h2 {
+    color: var(--workspace-ink);
+    font-size: 20px;
+    line-height: 1.35;
+}
+
+.story-module-kicker {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--module-accent, var(--workspace-gold));
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: .14em;
+}
+
+.story-scope-badge,
+.story-status-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 28px;
+    flex: 0 0 auto;
+    padding: 3px 9px;
+    color: var(--workspace-ink-muted);
+    border: 1px solid var(--workspace-line-strong);
+    border-radius: 999px;
+    background: var(--workspace-panel);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.story-status-badge.is-active {
+    color: #d8eddd;
+    border-color: rgba(121, 178, 138, .55);
+    background: rgba(121, 178, 138, .09);
+}
+
+.story-module-status {
+    min-height: 24px;
+    margin: 12px 0 0;
+    color: var(--workspace-success);
+    font-size: 12px;
+}
+
+.story-module-status.is-error { color: #f2aaa1; }
+.story-empty-state { margin: 0; padding: 28px; color: var(--workspace-ink-muted); text-align: center; }
+
+/* 角色与“我的角色”：同一设计语言，两套独立内容。 */
+.story-module .cards-panel-inner {
+    display: grid;
+    grid-template-columns: minmax(220px, 260px) minmax(0, 1fr);
+    gap: 0;
+    min-height: min(640px, 68dvh);
+    margin: 0;
+    overflow: hidden;
+    border: 1px solid var(--workspace-line);
+    border-radius: var(--workspace-radius-lg);
+    background: var(--workspace-panel);
+}
+
+.story-module .cards-panel-inner.is-single-card { grid-template-columns: minmax(0, 1fr); }
+
+.story-module .cards-list {
+    width: auto;
+    max-height: min(640px, 68dvh);
+    box-sizing: border-box;
+    gap: 8px;
+    padding: 14px;
+    border-right: 1px solid var(--workspace-line);
+    background: #13110f;
+}
+
+.card-list-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.card-list-heading h3 { margin: 0; color: var(--workspace-ink); font-size: 14px; }
+.card-list-search,
+.save-manager-control {
+    width: 100%;
+    min-width: 0;
+    min-height: 44px;
+    box-sizing: border-box;
+    padding: 9px 11px;
+    color: var(--workspace-ink);
+    background: var(--workspace-panel-soft);
+    border: 1px solid var(--workspace-line-strong);
+    border-radius: var(--workspace-radius-sm);
+}
+
+.story-module .new-card-btn { min-height: 44px; border-color: var(--module-accent, var(--workspace-gold)); }
+
+.story-module .card-row {
+    display: grid;
+    justify-content: stretch;
+    gap: 2px;
+    min-height: 58px;
+    padding: 9px 11px;
+    border-color: var(--workspace-line);
+    border-radius: 8px;
+    background: var(--workspace-panel-soft);
+}
+
+.story-module .card-row:hover { border-color: var(--module-accent, var(--workspace-gold)); }
+.story-module .card-row.active {
+    color: var(--workspace-ink);
+    border-color: var(--module-accent, var(--workspace-gold));
+    background: color-mix(in srgb, var(--module-accent, var(--workspace-gold)) 10%, var(--workspace-panel-soft));
+    box-shadow: inset 3px 0 0 var(--module-accent, var(--workspace-gold));
+}
+
+.card-row-name { font-size: 13px; font-weight: 700; }
+.card-row-meta {
+    overflow: hidden;
+    color: var(--workspace-ink-faint);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.story-module .cards-form {
+    max-height: min(640px, 68dvh);
+    box-sizing: border-box;
+    padding: 18px clamp(18px, 3vw, 34px) 0;
+    overscroll-behavior: contain;
+}
+
+.story-module .form-title {
+    margin-bottom: 14px;
+    color: var(--module-accent, var(--workspace-gold));
+    font-size: 18px;
+}
+
+.story-module .grp-container {
+    margin-bottom: 12px;
+    border-color: var(--workspace-line);
+    border-radius: 9px;
+    background: var(--workspace-panel-soft);
+}
+
+.story-module .grp-container:hover { border-color: var(--workspace-line-strong); }
+.story-module .grp-titlebar {
+    min-height: 44px;
+    box-sizing: border-box;
+    padding: 9px 12px;
+    background: rgba(255, 255, 255, .018);
+    border-bottom-color: var(--workspace-line);
+}
+
+.story-module .grp-label { color: var(--workspace-ink); font-size: 13px; }
+.story-module .grp-handle,
+.story-module .fld-handle { display: none; place-items: center; color: var(--workspace-ink-faint); }
+.story-module.is-advanced-editing .grp-handle,
+.story-module.is-advanced-editing .fld-handle { display: grid; }
+.story-module .fld-row[hidden],
+.story-module .grp-container[hidden],
+.story-module .fld-add-btn[hidden],
+.story-module .ce-group-add[hidden] { display: none !important; }
+.story-module .fld-list { padding: 4px 12px; }
+.story-module .fld-row { min-height: 44px; }
+.story-module .fld-label,
+.story-module .fld-cell label { color: var(--workspace-ink-muted); font-size: 12px; }
+.story-module .ce-field-val,
+.story-module .ce-field-key {
+    min-height: 44px;
+    box-sizing: border-box;
+    color: var(--workspace-ink);
+    background: #171512;
+    border-color: var(--workspace-line-strong);
+    border-radius: var(--workspace-radius-sm);
+}
+
+.story-module textarea.ce-field-val { min-height: 96px; line-height: 1.6; resize: vertical; }
+.story-module .ce-advanced-toggle,
+.story-module .ce-group-add { width: 100%; min-height: 44px; margin: 8px 0 0 !important; }
+.story-module .ce-advanced-toggle { color: var(--workspace-ink-muted); border-style: dashed; }
+.story-module .form-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    min-height: 62px;
+    margin-top: 16px !important;
+    padding: 10px 0 12px;
+    background: linear-gradient(to bottom, transparent, var(--workspace-panel) 24%);
+}
+.story-module .ce-save { min-width: 120px; }
+
+/* 人物关系：图谱、文字列表、编辑区保持独立模块的信息结构。 */
+.relationship-manager-dialog { width: min(1180px, calc(100vw - 48px)) !important; max-width: min(1180px, calc(100vw - 48px)) !important; }
+.relationship-editor {
+    width: 100%;
+    grid-template-columns: minmax(0, 1.25fr) minmax(340px, .75fr);
+    gap: 16px;
+}
+.relationship-scope-note { grid-column: 1 / -1; margin: 0; border-left: 3px solid var(--module-accent); background: var(--workspace-panel-soft); }
+.relationship-graph-section { grid-column: 1; }
+.relationship-list-section { grid-column: 1; }
+.relationship-form-section { grid-column: 2; grid-row: 2 / span 2; min-width: 0; padding: 16px; border: 1px solid var(--workspace-line); border-radius: var(--workspace-radius); background: var(--workspace-panel-soft); }
+.relationship-status { grid-column: 1 / -1; }
+.relationship-list { grid-template-columns: 1fr; }
+.relationship-graph { background: var(--workspace-panel-soft); border-color: var(--workspace-line); }
+.relationship-form { grid-template-columns: 1fr; }
+.relationship-evidence-fieldset,
+.relationship-form-actions { grid-column: 1; }
+.relationship-strength-header { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.relationship-strength-output { color: var(--module-accent); font-size: 12px; font-weight: 700; }
+.relationship-strength-input { min-height: 28px; padding: 0; accent-color: var(--module-accent); }
+.relationship-evidence-option { background: #171512; border-color: var(--workspace-line); }
+.relationship-save-button { background: var(--module-accent); border-color: var(--module-accent); }
+
+/* 世界设定：两栏编辑，使用情况与专业设置按需展开。 */
+.world-workspace-dialog .worldbook-editor {
+    grid-template-rows: auto minmax(0, 1fr) auto;
+}
+.world-workspace-dialog .worldbook-layout {
+    grid-template-columns: minmax(240px, 290px) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+}
+.world-workspace-dialog .worldbook-sidebar { grid-row: 1; }
+.world-workspace-dialog .worldbook-form-panel { grid-column: 2; grid-row: 1; }
+.world-workspace-dialog .worldbook-inspector {
+    grid-column: auto;
+    grid-row: auto;
+    max-height: min(260px, 32dvh);
+    margin: 10px 14px 14px;
+    padding: 0;
+    overflow-y: auto;
+    border: 1px solid var(--workspace-line);
+    border-radius: 9px;
+    background: var(--workspace-panel-soft);
+}
+.worldbook-diagnostics > summary {
+    min-height: 44px;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 11px 14px;
+    cursor: pointer;
+}
+.worldbook-diagnostics[open] > summary { border-bottom: 1px solid var(--workspace-line); }
+.worldbook-diagnostics > :not(summary) { margin-inline: 14px; }
+.worldbook-diagnostics > :last-child { margin-bottom: 14px; }
+.worldbook-selection-inspector { margin-top: 12px !important; }
+.worldbook-entry-title { overflow: hidden; font-size: 13px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+.worldbook-entry-summary { display: -webkit-box; overflow: hidden; color: var(--workspace-ink-faint); font-size: 11px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.worldbook-form-title { font-size: 18px; }
+.worldbook-form-section { background: var(--workspace-panel-soft); }
+.worldbook-collapsible-section { display: block; }
+.worldbook-collapsible-section > summary {
+    min-height: 44px;
+    box-sizing: border-box;
+    margin: -14px;
+    padding: 13px 14px;
+    cursor: pointer;
+}
+.worldbook-collapsible-section[open] > summary { margin-bottom: 12px; border-bottom: 1px solid var(--workspace-line); }
+.worldbook-collapsible-section > .worldbook-form-section-description { margin-top: 0; }
+.worldbook-entry-actions { padding-bottom: 10px; }
+
+/* 独立存档管理器。 */
+.save-manager-heading { margin-bottom: 14px; }
+.save-manager-tools {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 12px;
+    align-items: end;
+    margin-bottom: 14px;
+}
+.save-manager-create-form,
+.save-manager-rename-form {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: end;
+}
+.save-manager-create-form label,
+.save-manager-rename-form label {
+    grid-column: 1 / -1;
+    color: var(--workspace-ink-muted);
+    font-size: 12px;
+}
+.save-manager-import { position: relative; }
+.save-manager-import-label { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; box-sizing: border-box; cursor: pointer; }
+.save-manager-import-input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+.save-manager-list { display: grid; gap: 10px; max-height: min(56dvh, 600px); overflow-y: auto; overscroll-behavior: contain; }
+.save-manager-card { display: grid; gap: 12px; padding: 15px; border: 1px solid var(--workspace-line); border-radius: var(--workspace-radius); background: var(--workspace-panel-soft); }
+.save-manager-card.is-current { border-color: color-mix(in srgb, var(--module-accent) 70%, var(--workspace-line)); box-shadow: inset 3px 0 0 var(--module-accent); }
+.save-manager-card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.save-manager-card-title h3 { margin: 0; color: var(--workspace-ink); font-size: 15px; }
+.save-manager-card-title p,
+.save-manager-model { margin: 3px 0 0; color: var(--workspace-ink-faint); font-size: 11px; }
+.save-manager-current-details { display: grid; gap: 12px; }
+.save-manager-card-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.save-manager-switch { justify-self: start; }
+
+@media (max-width: 900px) {
+    .relationship-editor { grid-template-columns: 1fr; }
+    .relationship-graph-section,
+    .relationship-list-section,
+    .relationship-form-section { grid-column: 1; grid-row: auto; }
+}
+
+@media (max-width: 720px) {
+    .modal-backdrop:has(.story-module-dialog) { padding: 0; }
+    .modal.story-module-dialog {
+        width: 100vw !important;
+        height: 100dvh;
+        max-width: 100vw !important;
+        max-height: 100dvh;
+        border: 0;
+        border-radius: 0;
+    }
+    .story-module-intro,
+    .story-module-heading { align-items: flex-start; flex-direction: column; gap: 10px; }
+    .story-module .cards-panel-inner { display: flex; min-height: 0; overflow: visible; }
+    .story-module .cards-list { width: 100%; max-height: min(32dvh, 260px); border-right: 0; border-bottom: 1px solid var(--workspace-line); }
+    .story-module .cards-form { max-height: none; overflow: visible; padding: 16px 12px 0; }
+    .world-workspace-dialog .worldbook-editor { display: block; overflow-y: auto; padding: 10px; }
+    .world-workspace-dialog .worldbook-layout { display: block; height: auto; }
+    .world-workspace-dialog .worldbook-sidebar,
+    .world-workspace-dialog .worldbook-form-panel { padding: 10px; border: 0; }
+    .world-workspace-dialog .worldbook-inspector { margin: 10px; }
+    .save-manager-tools,
+    .save-manager-create-form,
+    .save-manager-rename-form { grid-template-columns: 1fr; }
+    .save-manager-create-form label,
+    .save-manager-rename-form label { grid-column: 1; }
+    .save-manager-import-label,
+    .save-manager-card-actions button,
+    .save-manager-switch { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .story-module *,
+    .relationship-editor *,
+    .save-manager * { scroll-behavior: auto !important; transition: none !important; }
+}

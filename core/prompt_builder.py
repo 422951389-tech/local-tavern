@@ -21,6 +21,7 @@ def build_messages(
     summaries: Optional[list] = None,
     manual_worldbook_ids: Optional[list[str]] = None,
     roleplay_context: Optional[dict] = None,
+    world_state: Optional[dict] = None,
 ) -> list[dict]:
     """保留原公开函数，按数量窗口组装但不施加运行时模型预算。
 
@@ -42,6 +43,7 @@ def build_messages(
         num_predict=0,
         manual_worldbook_ids=manual_worldbook_ids,
         roleplay_context=roleplay_context,
+        world_state=world_state,
         safety_margin=0,
     ).messages
 

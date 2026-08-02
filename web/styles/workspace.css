@@ -373,7 +373,7 @@ textarea:disabled {
     z-index: 10;
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto auto minmax(0, 1fr) auto auto 0 0;
+    grid-template-rows: auto auto auto minmax(0, 1fr) auto auto 0 0;
     min-width: 0;
     min-height: 0;
     overflow: hidden;
@@ -703,6 +703,11 @@ textarea:disabled {
     padding: 32px clamp(26px, 5vw, 48px) 48px;
     overflow-x: hidden;
     overflow-y: auto;
+    contain: layout paint;
+    isolation: isolate;
+    scroll-behavior: auto;
+    text-rendering: auto;
+    overflow-anchor: none;
     overscroll-behavior: contain;
     scrollbar-color: #4c4336 transparent;
     scrollbar-width: thin;

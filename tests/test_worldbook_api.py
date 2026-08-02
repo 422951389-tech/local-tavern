@@ -63,6 +63,14 @@ async def test_schema_and_legacy_get_are_normalized_without_disk_write(
             "activation": "always",
             "keywords": [],
             "priority": 0,
+            "category": "general",
+            "summary": "",
+            "visibility": "public",
+            "knowledge_scope": "global",
+            "known_by_character_ids": [],
+            "linked_character_ids": [],
+            "linked_entry_ids": [],
+            "location_aliases": [],
         }],
     }
     assert path.read_bytes() == before
@@ -77,10 +85,13 @@ async def test_schema_and_legacy_get_are_normalized_without_disk_write(
         for field in group["fields"]
     }
     assert set(fields) == {
-        "id", "title", "enabled", "activation", "keywords", "priority", "content",
+        "id", "title", "summary", "category", "enabled", "activation",
+        "keywords", "priority", "visibility", "knowledge_scope",
+        "known_by_character_ids", "linked_character_ids", "linked_entry_ids",
+        "location_aliases", "content",
     }
     assert [item["value"] for item in fields["activation"]["options"]] == [
-        "always", "keywords", "manual",
+        "always", "keywords", "manual", "scene",
     ]
     assert fields["priority"]["min"] == -1_000_000
     assert fields["priority"]["max"] == 1_000_000

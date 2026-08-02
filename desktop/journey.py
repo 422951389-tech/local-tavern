@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-JOURNEY_SCHEMA_VERSION = 2
+JOURNEY_SCHEMA_VERSION = 3
 JOURNEY_TIMEOUT_MS = 90_000
 JOURNEY_TITLE_PREFIX = "__LOCAL_TAVERN_JOURNEY_V1__"
 JOURNEY_ENVIRONMENT_FLAG = "TAVERN_DESKTOP_JOURNEY_TEST"
@@ -278,6 +278,8 @@ def base_journey_result(stage: str) -> dict[str, Any]:
         "refresh_verified": False,
         "save_switch_verified": False,
         "layout_verified": False,
+        "scroll_verified": False,
+        "scroll_frame_samples": 0,
         "persistence_verified": False,
         "message_count": 0,
         "screenshot_saved": False,
@@ -286,6 +288,7 @@ def base_journey_result(stage: str) -> dict[str, Any]:
         "scheme": "tavern://app",
         "tcp_listener_started": False,
         "off_the_record": False,
+        "desktop_renderer": "",
         "error": "",
     }
 
@@ -412,15 +415,21 @@ def journey_probe_script(stage: str) -> str:
             const selectSaveInUi = async save => {{
                 const tab = await waitUntil(() => document.getElementById('tab-saves'), 'save_tab_missing');
                 tab.click();
-                const option = await waitUntil(
-                    () => document.querySelector(`#save-list [data-save="${{CSS.escape(save)}}"]`),
+                const card = await waitUntil(
+                    () => [...document.querySelectorAll('.save-manager-card')].find(item => (
+                        item.querySelector('h3')?.textContent.trim() === save
+                    )),
                     `save_option_missing_${{save}}`,
                 );
+                const option = card.querySelector('.save-manager-switch');
+                if (!option) throw new Error(`save_switch_action_missing_${{save}}`);
                 option.click();
                 await waitUntil(() => {{
                     const label = document.getElementById('current-session-label');
                     return label && label.textContent.includes(save);
                 }}, `save_switch_failed_${{save}}`);
+                document.getElementById('modal-close')?.click();
+                await waitUntil(() => document.getElementById('modal-backdrop')?.classList.contains('hidden'), 'save_modal_close_failed');
             }};
             const completeOnboarding = async () => {{
                 const onboarding = await waitUntil(() => {{
@@ -502,6 +511,54 @@ def journey_probe_script(stage: str) -> str:
                 }}
                 return true;
             }};
+            const verifyScrollStability = async () => {{
+                const stream = document.getElementById('chat-stream');
+                const center = document.querySelector('.workspace-center');
+                const scrollingElement = document.scrollingElement;
+                if (!stream || !center || !scrollingElement) {{
+                    throw new Error('scroll_probe_missing');
+                }}
+                const originalTop = stream.scrollTop;
+                const documentTop = scrollingElement.scrollTop;
+                const centerRect = center.getBoundingClientRect();
+                const probe = document.createElement('div');
+                probe.setAttribute('aria-hidden', 'true');
+                probe.dataset.journeyScrollProbe = 'true';
+                probe.style.cssText = 'height:2600px;min-height:2600px;pointer-events:none;opacity:0';
+                stream.append(probe);
+                try {{
+                    await new Promise(resolve => requestAnimationFrame(resolve));
+                    const maxScroll = stream.scrollHeight - stream.clientHeight;
+                    if (maxScroll < 1200) throw new Error('scroll_range_too_small');
+                    const frameCount = 36;
+                    for (let index = 0; index < frameCount; index += 1) {{
+                        const phase = index % 12;
+                        const ratio = phase <= 6 ? phase / 6 : (12 - phase) / 6;
+                        const target = Math.round(maxScroll * ratio);
+                        stream.scrollTop = target;
+                        await new Promise(resolve => requestAnimationFrame(resolve));
+                        const currentRect = center.getBoundingClientRect();
+                        const geometryShift = Math.max(
+                            Math.abs(currentRect.left - centerRect.left),
+                            Math.abs(currentRect.top - centerRect.top),
+                            Math.abs(currentRect.right - centerRect.right),
+                            Math.abs(currentRect.bottom - centerRect.bottom),
+                        );
+                        if (
+                            Math.abs(stream.scrollTop - target) > 2
+                            || scrollingElement.scrollTop !== documentTop
+                            || geometryShift > 1
+                        ) {{
+                            throw new Error(`scroll_geometry_unstable_${{index}}`);
+                        }}
+                    }}
+                    return {{ verified: true, frameCount }};
+                }} finally {{
+                    probe.remove();
+                    stream.scrollTop = originalTop;
+                    await new Promise(resolve => requestAnimationFrame(resolve));
+                }}
+            }};
             const run = async () => {{
                 await waitUntil(
                     () => globalThis.TavernDesktopTransport
@@ -513,6 +570,9 @@ def journey_probe_script(stage: str) -> str:
                 await globalThis.TavernDesktopTransport.ready();
                 const live = await api('/health/live');
                 if (!live || live.status !== 'alive') throw new Error('api_live_failed');
+                const diagnostics = await api('/api/diagnostics');
+                const renderer = diagnostics?.desktop_rendering?.mode || '';
+                if (renderer !== 'software') throw new Error(`renderer_not_stable_${{renderer}}`);
 
                 const marker = sessionStorage.getItem(stateKey);
                 if (cfg.stage === 'seed' && marker !== 'seeded') {{
@@ -537,6 +597,7 @@ def journey_probe_script(stage: str) -> str:
                 ));
                 await sleep(100);
                 const layoutVerified = verifyLayout();
+                const scrollResult = await verifyScrollStability();
                 report({{
                     ok: true,
                     api_live: true,
@@ -546,8 +607,11 @@ def journey_probe_script(stage: str) -> str:
                     refresh_verified: true,
                     save_switch_verified: true,
                     layout_verified: layoutVerified,
+                    scroll_verified: scrollResult.verified,
+                    scroll_frame_samples: scrollResult.frameCount,
                     persistence_verified: cfg.stage === 'verify',
                     message_count: messageCount,
+                    desktop_renderer: renderer,
                     error: '',
                 }});
             }};
@@ -644,10 +708,15 @@ class JourneyController:
             "refresh_verified": bool(page_result.get("refresh_verified")),
             "save_switch_verified": bool(page_result.get("save_switch_verified")),
             "layout_verified": bool(page_result.get("layout_verified")),
+            "scroll_verified": bool(page_result.get("scroll_verified")),
+            "scroll_frame_samples": int(
+                page_result.get("scroll_frame_samples", 0) or 0
+            ),
             "persistence_verified": bool(page_result.get("persistence_verified")),
             "message_count": int(page_result.get("message_count", 0) or 0),
             "screenshot_saved": screenshot_saved,
             "off_the_record": bool(self._window.is_off_the_record),
+            "desktop_renderer": str(page_result.get("desktop_renderer") or ""),
             "error": error,
         })
         _atomic_write_json(self._result_path, result)

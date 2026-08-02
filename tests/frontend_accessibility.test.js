@@ -47,10 +47,9 @@ test('静态顶栏、下拉、输入和 Thinking 控件具有稳定可访问名�
     assertAttribute(projectButton, 'aria-expanded', 'false');
 
     const saveButton = tagById('tab-saves');
-    assertAttribute(saveButton, 'aria-label', '切换存档');
-    assertAttribute(saveButton, 'aria-haspopup', 'listbox');
-    assertAttribute(saveButton, 'aria-controls', 'save-list');
-    assertAttribute(saveButton, 'aria-expanded', 'false');
+    assertAttribute(saveButton, 'aria-label', '打开故事存档管理器');
+    assertAttribute(saveButton, 'aria-haspopup', 'dialog');
+    assertAttribute(saveButton, 'aria-controls', 'modal');
 
     for (const [id, label] of [
         ['reset-btn', '重置当前存档内容'],
@@ -67,7 +66,6 @@ test('静态顶栏、下拉、输入和 Thinking 控件具有稳定可访问名�
     assertAttribute(tagById('model-select'), 'aria-label', '对话模型');
     assertAttribute(tagById('user-input'), 'aria-label', '对话输入');
     assertAttribute(tagById('project-list'), 'role', 'listbox');
-    assertAttribute(tagById('save-list'), 'role', 'listbox');
     assertAttribute(tagById('thinking-panel'), 'role', 'region');
     assertAttribute(tagById('modal'), 'tabindex', '-1');
     assertAttribute(tagById('search-btn'), 'aria-haspopup', 'dialog');

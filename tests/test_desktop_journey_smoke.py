@@ -34,7 +34,7 @@ def _isolated_root() -> tempfile.TemporaryDirectory[str]:
 
 def _valid_result(pid: int, stage: str) -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "pid": pid,
         "stage": stage,
         "ready": True,
@@ -46,6 +46,8 @@ def _valid_result(pid: int, stage: str) -> dict:
         "refresh_verified": True,
         "save_switch_verified": True,
         "layout_verified": True,
+        "scroll_verified": True,
+        "scroll_frame_samples": 36,
         "persistence_verified": stage == "verify",
         "message_count": 2,
         "screenshot_saved": True,
@@ -54,6 +56,7 @@ def _valid_result(pid: int, stage: str) -> dict:
         "scheme": "tavern://app",
         "tcp_listener_started": False,
         "off_the_record": True,
+        "desktop_renderer": "software",
         "error": "",
     }
 
@@ -192,10 +195,15 @@ def test_injected_script_drives_formal_api_refresh_and_ui_save_switch():
         "location.reload()",
         "save_switch_verified",
         "current-session-label",
+        ".save-manager-card",
+        ".save-manager-switch",
         "onboarding-card.recommended .primary-btn",
         "local-tavern.onboarding.v1",
         "composer_layout_clipped",
         "elementFromPoint",
+        "verifyScrollStability",
+        "scroll_geometry_unstable",
+        "desktop_rendering",
     ):
         assert required in source
     assert "http://" not in source
@@ -230,7 +238,10 @@ def test_two_stage_runner_reuses_one_isolated_root_and_preserves_screenshots(
             "refresh_verified": True,
             "save_switch_verified": True,
             "layout_verified": True,
+            "scroll_verified": True,
+            "scroll_frame_samples": 36,
             "persistence_verified": stage == "verify",
+            "desktop_renderer": "software",
             "tcp_listener_samples": [[], []],
             "process_exited": True,
         }, screenshot

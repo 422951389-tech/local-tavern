@@ -12,7 +12,19 @@ from core.config import MAX_TURNS_IN_PROMPT
 from core.path_policy import PathPolicyError, validate_file_id
 
 
-ACTIVATIONS = frozenset({"always", "keywords", "manual"})
+ACTIVATIONS = frozenset({"always", "keywords", "manual", "scene"})
+WORLDBOOK_CATEGORIES = frozenset({
+    "general",
+    "location",
+    "faction",
+    "rule",
+    "history",
+    "culture",
+    "item",
+    "secret",
+})
+WORLDBOOK_VISIBILITIES = frozenset({"public", "discovered", "hidden"})
+WORLDBOOK_KNOWLEDGE_SCOPES = frozenset({"global", "narrator", "characters"})
 MAX_WORLDBOOK_KEYWORDS = 64
 MAX_WORLDBOOK_KEYWORD_LENGTH = 128
 MIN_WORLDBOOK_PRIORITY = -1_000_000
@@ -20,11 +32,17 @@ MAX_WORLDBOOK_PRIORITY = 1_000_000
 MAX_MANUAL_WORLDBOOK_IDS = 500
 MAX_WORLDBOOK_TITLE_LENGTH = 2_000
 MAX_WORLDBOOK_CONTENT_LENGTH = 200_000
+MAX_WORLDBOOK_SUMMARY_LENGTH = 2_000
+MAX_WORLDBOOK_LINKS = 100
+MAX_WORLDBOOK_ALIAS_LENGTH = 256
 WORLDBOOK_CONTROL_FIELDS = frozenset({
     "enabled",
     "activation",
     "keywords",
     "priority",
+    "linked_character_ids",
+    "linked_entry_ids",
+    "location_aliases",
     # WORLD-1 前的旧控制字段只为无损兼容保留，不再影响触发或进入 Prompt。
     "keys",
     "constant",
@@ -67,6 +85,11 @@ class WorldbookCandidate:
     recency_distance: int
     rank: int | None
     reason: str
+    title: str
+    category: str
+    summary: str
+    visibility: str
+    knowledge_scope: str
 
     def diagnostic(self) -> dict:
         return {
@@ -83,6 +106,11 @@ class WorldbookCandidate:
             "activated": self.activated,
             "kept": False,
             "reason": self.reason,
+            "title": self.title,
+            "category": self.category,
+            "summary": self.summary,
+            "visibility": self.visibility,
+            "knowledge_scope": self.knowledge_scope,
         }
 
 
@@ -118,6 +146,59 @@ def _safe_entry_id(value: object) -> str | None:
 
 def _has_control_character(value: str) -> bool:
     return any(unicodedata.category(character) == "Cc" for character in value)
+
+
+def _normalized_id_list(
+    value: object,
+    *,
+    field: str,
+    violations: list[str],
+) -> list[str]:
+    if not isinstance(value, list):
+        violations.append(f"{field}:expected_array")
+        return []
+    if len(value) > MAX_WORLDBOOK_LINKS:
+        violations.append(f"{field}:too_many")
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        safe = _safe_entry_id(item)
+        if safe is None:
+            violations.append(f"{field}:item_invalid")
+            continue
+        if safe in seen:
+            continue
+        seen.add(safe)
+        result.append(safe)
+    return result
+
+
+def _normalized_aliases(value: object, violations: list[str]) -> list[str]:
+    if not isinstance(value, list):
+        violations.append("location_aliases:expected_array")
+        return []
+    if len(value) > MAX_WORLDBOOK_LINKS:
+        violations.append("location_aliases:too_many")
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            violations.append("location_aliases:item_expected_string")
+            continue
+        alias = item.strip()
+        canonical = normalize_match_text(alias)
+        if not alias:
+            violations.append("location_aliases:item_empty")
+        elif len(alias) > MAX_WORLDBOOK_ALIAS_LENGTH:
+            violations.append("location_aliases:item_too_long")
+        elif _has_control_character(alias):
+            violations.append("location_aliases:item_control_character")
+        elif canonical not in seen:
+            seen.add(canonical)
+            result.append(alias)
+    return result
 
 
 def normalize_worldbook_entry(
@@ -201,8 +282,51 @@ def normalize_worldbook_entry(
     if raw_activation == "keywords" and not cleaned_keywords:
         violations.append("keywords:required_for_activation")
 
+    raw_category = normalized.get("category", "general")
+    if not isinstance(raw_category, str) or raw_category not in WORLDBOOK_CATEGORIES:
+        violations.append("category:invalid")
+    raw_visibility = normalized.get("visibility", "public")
+    if (
+        not isinstance(raw_visibility, str)
+        or raw_visibility not in WORLDBOOK_VISIBILITIES
+    ):
+        violations.append("visibility:invalid")
+    raw_knowledge_scope = normalized.get("knowledge_scope", "global")
+    if (
+        not isinstance(raw_knowledge_scope, str)
+        or raw_knowledge_scope not in WORLDBOOK_KNOWLEDGE_SCOPES
+    ):
+        violations.append("knowledge_scope:invalid")
+
+    known_by_character_ids = _normalized_id_list(
+        normalized.get("known_by_character_ids", []),
+        field="known_by_character_ids",
+        violations=violations,
+    )
+    linked_character_ids = _normalized_id_list(
+        normalized.get("linked_character_ids", []),
+        field="linked_character_ids",
+        violations=violations,
+    )
+    linked_entry_ids = _normalized_id_list(
+        normalized.get("linked_entry_ids", []),
+        field="linked_entry_ids",
+        violations=violations,
+    )
+    location_aliases = _normalized_aliases(
+        normalized.get("location_aliases", []),
+        violations,
+    )
+    if raw_knowledge_scope == "characters" and not known_by_character_ids:
+        violations.append("known_by_character_ids:required_for_scope")
+    if raw_activation == "scene" and not (
+        linked_character_ids or location_aliases
+    ):
+        violations.append("scene_links:required_for_activation")
+
     for field, maximum in (
         ("title", MAX_WORLDBOOK_TITLE_LENGTH),
+        ("summary", MAX_WORLDBOOK_SUMMARY_LENGTH),
         ("content", MAX_WORLDBOOK_CONTENT_LENGTH),
     ):
         value = normalized.get(field)
@@ -221,6 +345,14 @@ def normalize_worldbook_entry(
     normalized["activation"] = raw_activation
     normalized["keywords"] = cleaned_keywords
     normalized["priority"] = raw_priority
+    normalized["category"] = raw_category
+    normalized["summary"] = str(normalized.get("summary") or "")
+    normalized["visibility"] = raw_visibility
+    normalized["knowledge_scope"] = raw_knowledge_scope
+    normalized["known_by_character_ids"] = known_by_character_ids
+    normalized["linked_character_ids"] = linked_character_ids
+    normalized["linked_entry_ids"] = linked_entry_ids
+    normalized["location_aliases"] = location_aliases
     return normalized
 
 
@@ -425,13 +557,25 @@ def activate_worldbook_entries(
         )
     ]
     match_sources.extend(_history_sources(history, max_turns=max_turns))
-    match_sources.extend(_scene_sources(scene_meta, recency=static_recency))
+    scene_sources = _scene_sources(scene_meta, recency=static_recency)
+    match_sources.extend(scene_sources)
     match_sources.extend(_character_sources(
         characters,
         characters_state,
         recency=static_recency,
     ))
     match_sources = [source for source in match_sources if source.text]
+    active_character_ids: set[str] = set()
+    for card in characters if isinstance(characters, list) else []:
+        if isinstance(card, dict):
+            safe_id = _safe_entry_id(card.get("id"))
+            if safe_id is not None:
+                active_character_ids.add(safe_id)
+    if isinstance(characters_state, dict):
+        for character_id in characters_state:
+            safe_id = _safe_entry_id(character_id)
+            if safe_id is not None:
+                active_character_ids.add(safe_id)
 
     unresolved: list[dict] = []
     for entry, legacy_activation in normalized_entries:
@@ -453,6 +597,32 @@ def activate_worldbook_entries(
                     matched_source_map[
                         (source.scope, source.ref, source.turn_distance)
                     ] = source
+        elif enabled and activation == "scene":
+            for alias in entry["location_aliases"]:
+                canonical = normalize_match_text(alias)
+                alias_sources = [
+                    source for source in scene_sources if canonical in source.text
+                ]
+                if not alias_sources:
+                    continue
+                matched_keywords.append(alias)
+                for source in alias_sources:
+                    matched_source_map[
+                        (source.scope, source.ref, source.turn_distance)
+                    ] = source
+            for character_id in entry["linked_character_ids"]:
+                if character_id not in active_character_ids:
+                    continue
+                matched_keywords.append(f"character:{character_id}")
+                source = _MatchSource(
+                    "character",
+                    f"character:{character_id}",
+                    normalize_match_text(character_id),
+                    static_recency,
+                )
+                matched_source_map[
+                    (source.scope, source.ref, source.turn_distance)
+                ] = source
 
         matched_sources = tuple(
             source.diagnostic()
@@ -484,6 +654,10 @@ def activate_worldbook_entries(
             activated = entry_id in manual_ids
             trigger = "manual_selected" if activated else "manual_not_selected"
             reason = "activated" if activated else "manual_not_selected"
+        elif activation == "scene":
+            activated = hit_count > 0
+            trigger = "scene_link_match" if activated else "scene_link_not_matched"
+            reason = "activated" if activated else "scene_link_not_matched"
         else:
             activated = hit_count > 0
             trigger = "keyword_match" if activated else "keyword_not_matched"
@@ -502,6 +676,11 @@ def activate_worldbook_entries(
             "hit_count": hit_count,
             "recency_distance": recency_distance,
             "reason": reason,
+            "title": str(entry.get("title") or entry_id),
+            "category": entry["category"],
+            "summary": entry["summary"],
+            "visibility": entry["visibility"],
+            "knowledge_scope": entry["knowledge_scope"],
         })
 
     active = sorted(
@@ -533,8 +712,12 @@ __all__ = [
     "MAX_WORLDBOOK_KEYWORDS",
     "MAX_WORLDBOOK_PRIORITY",
     "MAX_WORLDBOOK_TITLE_LENGTH",
+    "MAX_WORLDBOOK_SUMMARY_LENGTH",
     "MIN_WORLDBOOK_PRIORITY",
     "WORLDBOOK_CONTROL_FIELDS",
+    "WORLDBOOK_CATEGORIES",
+    "WORLDBOOK_KNOWLEDGE_SCOPES",
+    "WORLDBOOK_VISIBILITIES",
     "WorldbookCandidate",
     "WorldbookValidationError",
     "activate_worldbook_entries",

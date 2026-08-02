@@ -9,6 +9,8 @@
     <link rel="stylesheet" href="/static/styles/workspace.css?v=workspace-20260729-split1">
     <link rel="stylesheet" href="/static/styles/backup.css?v=workspace-20260729-split1">
     <link rel="stylesheet" href="/static/styles/diagnostics.css?v=workspace-20260729-split1">
+    <link rel="stylesheet" href="/static/styles/world-context.css?v=workspace-20260802-world3">
+    <link rel="stylesheet" href="/static/styles/story-modules.css?v=workspace-20260802-modules1">
     <link rel="stylesheet" href="/static/styles/memory.css?v=workspace-20260729-split1">
     <link rel="stylesheet" href="/static/styles/onboarding.css?v=workspace-20260729-split1">
 </head>
@@ -44,27 +46,26 @@
                             <span class="ico" data-icon="users" aria-hidden="true"></span><span class="lbl">角色</span>
                         </button>
                         <button class="tab-btn" data-tab="relations" id="tab-relations" type="button"
-                            title="角色关系（当前存档的人工关系记录）" aria-label="编辑角色关系"
+                            title="人物关系（当前存档中的关系记录）" aria-label="编辑人物关系"
                             aria-haspopup="dialog" aria-controls="modal">
                             <span class="ico relation-tab-icon" data-icon="network" aria-hidden="true"></span><span class="lbl">关系</span>
                         </button>
                         <button class="tab-btn" data-tab="world" id="tab-world" type="button"
-                            title="世界书（当前世界观的设定）" aria-label="编辑世界书"
+                            title="世界设定（设定、当前变化与设定关联）" aria-label="打开世界设定"
                             aria-haspopup="dialog" aria-controls="modal">
-                            <span class="ico" data-icon="book" aria-hidden="true"></span><span class="lbl">世界书</span>
+                            <span class="ico" data-icon="book" aria-hidden="true"></span><span class="lbl">世界设定</span>
                         </button>
                         <button class="tab-btn" data-tab="user" id="tab-user" type="button"
-                            title="用户档案（当前世界的观众设定）" aria-label="编辑用户档案"
+                            title="我的角色（AI 如何理解你）" aria-label="编辑我的角色"
                             aria-haspopup="dialog" aria-controls="modal">
-                            <span class="ico" data-icon="user" aria-hidden="true"></span><span class="lbl">用户档案</span>
+                            <span class="ico" data-icon="user" aria-hidden="true"></span><span class="lbl">我的角色</span>
                         </button>
                     </div>
                     <button class="tab-btn save-tab" data-tab="saves" id="tab-saves" type="button"
-                        title="存档（当前世界观下的演出记录）" aria-label="切换存档"
-                        aria-haspopup="listbox" aria-controls="save-list" aria-expanded="false">
+                        title="故事存档（管理独立故事进度）" aria-label="打开故事存档管理器"
+                        aria-haspopup="dialog" aria-controls="modal">
                         <span class="ico" data-icon="archive" aria-hidden="true"></span><span class="lbl">存档</span>
                         <span class="badge" id="save-count">0</span>
-                        <span class="caret" data-icon="chevronDown" aria-hidden="true"></span>
                     </button>
                     <button id="nav-more-btn" class="nav-more-btn" type="button"
                         aria-label="更多世界观工具" aria-controls="nav-more-menu" aria-expanded="false">
@@ -86,16 +87,6 @@
                 </div>
             </div>
 
-            <div id="save-dropdown" class="dropdown-panel hidden" aria-labelledby="tab-saves">
-                <div id="save-list" class="dropdown-list" role="listbox" aria-label="存档列表" tabindex="-1"></div>
-                <div class="dropdown-footer">
-                    <button id="save-new-inline" class="dropdown-action" type="button"><span data-icon="plus" aria-hidden="true"></span><span>新建存档</span></button>
-                    <button id="save-rename-inline" class="dropdown-action" type="button"><span data-icon="edit" aria-hidden="true"></span><span>重命名</span></button>
-                    <button id="save-delete-inline" class="dropdown-action" type="button"><span data-icon="trash" aria-hidden="true"></span><span>删除</span></button>
-                    <button id="save-export-inline" class="dropdown-action" type="button"><span data-icon="download" aria-hidden="true"></span><span>导出</span></button>
-                    <button id="save-import-inline" class="dropdown-action" type="button"><span data-icon="upload" aria-hidden="true"></span><span>导入</span></button>
-                </div>
-            </div>
         </aside>
 
         <section class="workspace-center" aria-label="叙事阅读与输入">
@@ -180,6 +171,14 @@
                     </div>
                 </div>
             </details>
+
+            <button id="world-context-bar" class="world-context-bar" type="button"
+                aria-label="打开世界脉络工作台" aria-haspopup="dialog" aria-controls="modal">
+                <span class="world-context-kicker">世界状态</span>
+                <span id="world-context-summary" class="world-context-summary">正在读取当前世界…</span>
+                <span id="world-context-count" class="world-context-count">生效 0 · 变化 0</span>
+                <span class="world-context-open">打开工作台 ›</span>
+            </button>
 
             <main id="main">
                 <section id="chat-stream" class="chat-stream" aria-label="对话记录" tabindex="-1">
@@ -277,6 +276,6 @@
     <script src="/static/api-client.js?v=fe1-20260715"></script>
     <script src="/static/session-ref.js?v=fe1-20260715"></script>
     <script src="/static/turn-client.js?v=fe1-20260715"></script>
-    <script type="module" src="/static/app.mjs?v=workspace-20260728-h2"></script>
+    <script type="module" src="/static/app.mjs?v=workspace-20260802-world3"></script>
 </body>
 </html>

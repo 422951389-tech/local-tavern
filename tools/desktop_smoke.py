@@ -23,6 +23,7 @@ EXPECTED_RESULT = {
     "scheme": "tavern://app",
     "tcp_listener_started": False,
     "off_the_record": True,
+    "desktop_renderer": "software",
     "error": "",
 }
 
@@ -235,6 +236,7 @@ def run_smoke(executable: Path, *, timeout_seconds: float, hold_ms: int) -> dict
                 "runtime": result["runtime"],
                 "transport": result["transport"],
                 "scheme": result["scheme"],
+                "desktop_renderer": result["desktop_renderer"],
                 "tcp_listener_samples": samples,
                 "process_exited": True,
             }

@@ -182,3 +182,54 @@ def test_cleanup_releases_single_instance_even_when_runtime_shutdown_fails():
         raise AssertionError("runtime 关闭失败必须继续上抛")
 
     assert instance.released is True
+
+
+def test_desktop_renderer_defaults_to_software_and_preserves_existing_flags(
+    monkeypatch,
+    tmp_path,
+):
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.delenv("TAVERN_DESKTOP_RENDERER", raising=False)
+    monkeypatch.setenv("QTWEBENGINE_CHROMIUM_FLAGS", "--lang=zh-CN --disable-gpu")
+
+    mode = desktop_main._configure_desktop_renderer(settings_path)
+
+    assert mode == "software"
+    assert desktop_main.os.environ["TAVERN_DESKTOP_RENDERER_ACTIVE"] == "software"
+    flags = desktop_main.os.environ["QTWEBENGINE_CHROMIUM_FLAGS"].split()
+    assert flags.count("--disable-gpu") == 1
+    assert "--lang=zh-CN" in flags
+
+
+def test_desktop_renderer_reads_hardware_setting_and_environment_override(
+    monkeypatch,
+    tmp_path,
+):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({"desktop_renderer": "hardware"}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TAVERN_DESKTOP_RENDERER", raising=False)
+    monkeypatch.setenv("QTWEBENGINE_CHROMIUM_FLAGS", "--lang=zh-CN")
+
+    assert desktop_main._configure_desktop_renderer(settings_path) == "hardware"
+    assert "--disable-gpu" not in desktop_main.os.environ["QTWEBENGINE_CHROMIUM_FLAGS"]
+
+    monkeypatch.setenv("TAVERN_DESKTOP_RENDERER", "software")
+    assert desktop_main._configure_desktop_renderer(settings_path) == "software"
+    assert "--disable-gpu" in desktop_main.os.environ["QTWEBENGINE_CHROMIUM_FLAGS"]
+
+
+def test_desktop_renderer_invalid_or_corrupt_settings_fail_closed_to_software(
+    monkeypatch,
+    tmp_path,
+):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text('{"desktop_renderer":"invalid"}', encoding="utf-8")
+    monkeypatch.delenv("TAVERN_DESKTOP_RENDERER", raising=False)
+    monkeypatch.delenv("QTWEBENGINE_CHROMIUM_FLAGS", raising=False)
+
+    assert desktop_main._resolve_desktop_renderer(settings_path) == "software"
+    settings_path.write_text("{broken", encoding="utf-8")
+    assert desktop_main._resolve_desktop_renderer(settings_path) == "software"
