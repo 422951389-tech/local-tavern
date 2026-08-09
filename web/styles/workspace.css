@@ -479,13 +479,19 @@ textarea:disabled {
 
 .model-select-wrap {
     display: block;
-    min-width: 0;
+    flex: 0 1 138px;
+    width: 138px;
+    min-width: 96px;
+    overflow: hidden;
 }
 
 #model-select {
-    width: 138px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
     min-height: 44px;
     padding: 7px 30px 7px 10px;
+    box-sizing: border-box;
     overflow: hidden;
     color: var(--workspace-ink);
     background-color: var(--workspace-panel-raised);
@@ -523,6 +529,73 @@ textarea:disabled {
     color: var(--workspace-gold-strong);
     background: var(--workspace-panel-raised);
     border-color: var(--workspace-line);
+}
+
+/* 1440px 附近中央工作区只有约 812px，完整工具组会压缩模型容器。
+ * 保留完整三栏导航，只把次要工具收进菜单，避免单像素断点布局突变。 */
+@media (min-width: 1440px) and (max-width: 1599px) {
+    .topbar-tools {
+        width: 100%;
+        overflow: visible;
+    }
+
+    .provider-entry {
+        margin-right: auto;
+    }
+
+    .topbar-more-btn {
+        display: inline-flex;
+        min-width: 70px;
+        min-height: 44px;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 0 9px;
+        color: var(--workspace-ink-muted);
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: var(--workspace-radius-sm);
+        font-size: 12px;
+    }
+
+    .topbar-more-btn[aria-expanded="true"] {
+        color: var(--workspace-gold-strong);
+        background: var(--workspace-panel-raised);
+        border-color: var(--workspace-line);
+    }
+
+    .topbar-more-menu {
+        position: absolute;
+        z-index: 180;
+        top: calc(100% + 8px);
+        right: 0;
+        display: none;
+        width: 240px;
+        gap: 4px;
+        padding: 8px;
+        color: var(--workspace-ink);
+        background: var(--workspace-panel-raised);
+        border: 1px solid var(--workspace-line-strong);
+        border-radius: var(--workspace-radius);
+        box-shadow: var(--workspace-shadow);
+    }
+
+    .topbar-more-menu.open {
+        display: grid;
+    }
+
+    .topbar-more-menu .icon-btn {
+        display: grid;
+        grid-template-columns: 20px minmax(0, 1fr);
+        width: 100%;
+        min-width: 0;
+        padding: 0 10px;
+        text-align: left;
+    }
+
+    .topbar-tool-label {
+        display: inline;
+    }
 }
 
 .scene-meta {
@@ -2801,7 +2874,8 @@ textarea:disabled {
         margin-right: auto;
     }
 
-    #model-select {
+    .model-select-wrap {
+        flex-basis: 128px;
         width: 128px;
     }
 
@@ -2970,9 +3044,9 @@ textarea:disabled {
         display: none;
     }
 
-    #model-select {
+    .model-select-wrap {
+        flex-basis: min(128px, 33vw);
         width: min(128px, 33vw);
-        min-width: 0;
     }
 
     .scene-summary {

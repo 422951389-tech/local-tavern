@@ -56,6 +56,7 @@ test('沉浸式工作台保留三栏、抽屉、响应式与无障碍契约', ()
     assert.match(css, /\.workspace-shell\.inspector-collapsed\s*\{[\s\S]*grid-template-columns:\s*248px minmax\(720px, 1fr\) 0/);
     assert.match(css, /\.chat-stream > \.msg\s*\{[\s\S]*max-width:\s*800px/);
     assert.match(css, /@media \(min-width: 900px\) and \(max-width: 1439px\)/);
+    assert.match(css, /@media \(min-width: 1440px\) and \(max-width: 1599px\)[\s\S]*\.topbar-more-menu\s*\{[\s\S]*display:\s*none/);
     assert.match(css, /@media \(max-width: 899px\)/);
     assert.match(css, /@media \(max-width: 600px\)/);
     assert.match(css, /@media \(hover: none\), \(pointer: coarse\)[\s\S]*\.msg-action-btn\s*\{[\s\S]*min-width:\s*44px[\s\S]*min-height:\s*44px/);
@@ -64,6 +65,8 @@ test('沉浸式工作台保留三栏、抽屉、响应式与无障碍契约', ()
     assert.match(css, /prefers-reduced-motion:\s*reduce/);
     assert.match(css, /\.provider-entry\[data-status="missing-provider"\]/);
     assert.match(css, /#model-select\[data-status="missing-model"\]/);
+    assert.match(css, /\.model-select-wrap\s*\{[\s\S]*flex:\s*0 1 138px[\s\S]*width:\s*138px[\s\S]*min-width:\s*96px[\s\S]*overflow:\s*hidden/);
+    assert.match(css, /#model-select\s*\{[\s\S]*width:\s*100%[\s\S]*min-width:\s*0[\s\S]*max-width:\s*100%[\s\S]*box-sizing:\s*border-box/);
     assert.match(css, /\.provider-recovery-note\s*\{/);
     assert.match(css, /\.story-module\s*\{[\s\S]*border-left:\s*3px solid var\(--workspace-story\)/);
     assert.match(css, /\.characters-module\s*\{[\s\S]*border-left:\s*3px solid var\(--workspace-character\)/);
@@ -143,8 +146,11 @@ test('浏览器 E2E 输出 performance_budget 可直接校验的三类性能样�
     assert.match(browserE2e, /message_count:\s*1000/);
     assert.match(browserE2e, /for \(let index = 0; index < 4; index \+= 1\)/);
     assert.match(browserE2e, /createMessageElement, mountMessageHistory/);
-    assert.match(browserE2e, /\[375, 768, 899, 1024, 1366, 1424, 1440\]/);
+    assert.match(browserE2e, /\[375, 768, 899, 1024, 1280, 1366, 1424, 1440, 1600\]/);
     assert.match(browserE2e, /composerSendClipped/);
+    assert.match(browserE2e, /nomic-embed-text:latest/);
+    assert.match(browserE2e, /topbarOverlaps/);
+    assert.match(browserE2e, /modelContainmentOverflow/);
     assert.match(browserE2e, /screenshotSibling\(`main-\$\{width\}`\)/);
     assert.match(browserE2e, /environment:\s*\{[\s\S]*os:[\s\S]*python:[\s\S]*node:[\s\S]*browser:[\s\S]*source_commit:/);
 });

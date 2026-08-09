@@ -39,6 +39,7 @@ function screenshotSibling(suffix) {
 const EXPECTED_PLAYWRIGHT_VERSION = '1.61.1';
 const EXPECTED_AXE_VERSION = '4.12.1';
 const EXPECTED_BROWSER_VERSION = '149.0.7827.55';
+const LONG_MODEL_NAME = 'nomic-embed-text:latest';
 const moduleOverrideKeys = ['TAVERN_PLAYWRIGHT_MODULE', 'TAVERN_AXE_MODULE'];
 if (releaseMode) {
     const configuredOverrides = moduleOverrideKeys.filter(key => process.env[key]);
@@ -813,10 +814,24 @@ async function measureBrowserPerformance(browserInstance, browserVersion) {
     }
 }
 
+async function selectLongModelForLayout(page) {
+    await page.locator('#model-select').evaluate((select, model) => {
+        let option = [...select.options].find(item => item.value === model);
+        if (!option) {
+            option = document.createElement('option');
+            option.value = model;
+            option.textContent = model;
+            select.appendChild(option);
+        }
+        select.value = model;
+    }, LONG_MODEL_NAME);
+}
+
 async function auditViewports(page) {
     const failures = [];
     const layouts = [];
-    for (const width of [375, 768, 899, 1024, 1366, 1424, 1440]) {
+    await selectLongModelForLayout(page);
+    for (const width of [375, 768, 899, 1024, 1280, 1366, 1424, 1440, 1600]) {
         await page.setViewportSize({ width, height: width === 375 ? 812 : 900 });
         const expectedShellMode = width >= 1440 ? 'full' : (width >= 900 ? 'rail' : 'single');
         await page.waitForFunction(expectedMode => {
@@ -893,6 +908,48 @@ async function auditViewports(page) {
                     width: Math.round(rect.width * 10) / 10,
                 } : null;
             };
+            const visibleTopbarControls = [...document.querySelectorAll(
+                '.topbar-tools button, .topbar-tools select',
+            )].map(element => {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return {
+                    selector: element.id ? `#${element.id}` : element.tagName.toLowerCase(),
+                    left: rect.left,
+                    right: rect.right,
+                    top: rect.top,
+                    bottom: rect.bottom,
+                    visible: style.display !== 'none' && style.visibility !== 'hidden'
+                        && rect.width > 0 && rect.height > 0,
+                };
+            }).filter(control => control.visible);
+            const topbarOverlaps = [];
+            for (let first = 0; first < visibleTopbarControls.length; first += 1) {
+                for (let second = first + 1; second < visibleTopbarControls.length; second += 1) {
+                    const left = visibleTopbarControls[first];
+                    const right = visibleTopbarControls[second];
+                    const horizontalIntersection = Math.min(left.right, right.right)
+                        - Math.max(left.left, right.left);
+                    const verticalIntersection = Math.min(left.bottom, right.bottom)
+                        - Math.max(left.top, right.top);
+                    if (horizontalIntersection > 0.5 && verticalIntersection > 0.5) {
+                        topbarOverlaps.push({
+                            controls: [left.selector, right.selector],
+                            horizontalIntersection: Math.round(horizontalIntersection * 10) / 10,
+                            verticalIntersection: Math.round(verticalIntersection * 10) / 10,
+                        });
+                    }
+                }
+            }
+            const modelSelectRect = document.querySelector('#model-select')?.getBoundingClientRect();
+            const modelWrapRect = document.querySelector('.model-select-wrap')?.getBoundingClientRect();
+            const modelContainmentOverflow = !modelSelectRect || !modelWrapRect
+                ? null
+                : Math.max(
+                    0,
+                    modelWrapRect.left - modelSelectRect.left,
+                    modelSelectRect.right - modelWrapRect.right,
+                );
             return {
                 width: viewportWidth,
                 horizontalOverflow: document.documentElement.scrollWidth - viewportWidth,
@@ -908,6 +965,11 @@ async function auditViewports(page) {
                 } : null,
                 reducedMotionMaxMs: Math.max(...transitionDurations),
                 composerSendAudit,
+                selectedModel: document.querySelector('#model-select')?.value || '',
+                topbarOverlaps,
+                modelContainmentOverflow: modelContainmentOverflow === null
+                    ? null
+                    : Math.round(modelContainmentOverflow * 10) / 10,
                 composerGeometry: {
                     shellColumns: getComputedStyle(document.querySelector('.workspace-shell'))
                         .gridTemplateColumns,
@@ -935,6 +997,13 @@ async function auditViewports(page) {
         ), true, JSON.stringify(layout));
         assert.equal(layout.reducedMotionMaxMs <= 0.02, true, JSON.stringify(layout));
         assert.equal(layout.composerSendClipped, false, JSON.stringify(layout));
+        assert.equal(layout.selectedModel, LONG_MODEL_NAME, JSON.stringify(layout));
+        assert.deepEqual(layout.topbarOverlaps, [], JSON.stringify(layout));
+        assert.equal(
+            layout.modelContainmentOverflow !== null && layout.modelContainmentOverflow <= 0.5,
+            true,
+            JSON.stringify(layout),
+        );
         if (width <= 899) {
             for (const [buttonSelector, menuSelector] of [
                 ['#nav-more-btn', '#nav-more-menu'],
@@ -1248,6 +1317,7 @@ try {
     await closeModalAfterAudit(page);
 
     if (screenshotPath) {
+        await selectLongModelForLayout(page);
         for (const width of [375, 768, 1024, 1440]) {
             await page.setViewportSize({ width, height: width === 375 ? 812 : 900 });
             await page.locator('.story-module').last().locator('.response-module-header').scrollIntoViewIfNeeded();
