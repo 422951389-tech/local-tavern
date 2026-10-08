@@ -47,6 +47,10 @@ build_desktop.bat        # 产出 release\LocalTavern\LocalTavern.exe
 └── provider-secrets.json    DPAPI 加密的 API Key
 ```
 
+## 📚 完整技术文档
+
+架构、数据、Provider、安全、迁移、构建、验收全记录见 [docs/PROJECT.md](docs/PROJECT.md)。
+
 ## ⚖️ 许可
 
 GPL-3.0。地图不收费，但按本地图改的图也得开源。
