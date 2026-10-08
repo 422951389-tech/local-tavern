@@ -1,70 +1,80 @@
 # LocalTavern 本地酒馆
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-
-在电脑上开一间自己的酒馆：一群 AI 角色同场陪你演戏——他们互相接话、抢话、各怀心思，你推门进场就是戏里的人。不是跟一个机器人一问一答，是进一间酒馆。
+[![Platform](https://img.shields.io/badge/platform-Windows-blue)](https://github.com)
+[![Release](https://img.shields.io/badge/release-v1.0.1-green)](https://github.com)
 
 **English below ↓**
 
-## 这玩意儿干嘛的
+LocalTavern 是一个 Windows 桌面端的多角色 AI 叙事应用。在一个场景里，多个 AI 角色同时在场、互相回应，剧情持续推进；你以固定身份参与其中。角色卡、世界书、存档全部保存在本机，模型来源可以是本机 Ollama，也可以是 DeepSeek、Anthropic 等云端 API。
 
-- **一台戏，不是一对一** —— 一场景里多个 AI 角色同时在场：剧情往前走、角色轮流回应、状态细节、行动建议，一条流水线全给你
-- **双击就能玩** —— 下载解压双击 `LocalTavern.exe` 就完事。不用装 Python、不开浏览器、不占端口，就是个正经桌面软件
-- **你的东西全在你电脑上** —— 角色卡、世界书、存档、备份全是本地文件，不经过任何服务器。你的故事就是你的
-- **脑子自己挑** —— 本机跑 Ollama 也行，接 DeepSeek、SiliconFlow 这类云端 API 也行，Anthropic 原生接口也行——有钱云端没钱本地，随你
-- **安全感给足** —— API Key 用 Windows 自带的 DPAPI 加密存；断网也能玩本地模型；浏览器内核不留 Cookie
-- **长线剧情不断片** —— 好感度量化追踪、剧情摘要、钉选名场面、随时存档读档
+## 功能
 
-## 三分钟上手
+- 多角色同场：剧情推进、角色回应、状态细节与行动建议按统一结构输出
+- 桌面应用：PySide6 + QtWebEngine，无需安装 Python，不占用端口，不依赖浏览器
+- 数据本地存储：项目、角色卡、世界书、提示词、存档与备份均为本机文件
+- 模型来源可选：本机 Ollama / OpenAI 兼容 API（DeepSeek、SiliconFlow 等）/ Anthropic Messages
+- 安全设计：API Key 经 Windows DPAPI 加密存储；云端根地址强制公网 HTTPS；浏览器内核不保留 Cookie；进程内通信（QWebChannel + ASGI），无监听端口
+- 长线剧情支持：结构化好感度追踪、剧情摘要、消息钉选、快照与恢复
 
-从 [Releases](../../releases) 下 `LocalTavern-win64.zip`，解压，双击 `LocalTavern.exe`。
+## 安装与使用
 
-- 整个文件夹一起拷，别只拷 EXE（它要靠旁边的 `_internal` 活）
-- 第一次开会自动在 `%LOCALAPPDATA%\LocalTavern` 建数据目录
-- 模型三选一：本地 Ollama / 云端 API / Anthropic——设置里填个 Key 就成
+从 [Releases](../../releases) 下载 `LocalTavern-win64.zip`，解压后运行 `LocalTavern.exe`。
 
-## 想自己构建的
+注意：
+
+- 请保留整个 `LocalTavern` 目录（EXE 依赖 `_internal`，不能单独拷贝）
+- 首次启动会在 `%LOCALAPPDATA%\LocalTavern` 建立数据目录
+- 在设置中选择模型来源并填入 API Key 即可开始使用
+
+## 从源码构建
 
 ```powershell
 git clone <this-repo>
 cd local-tavern
-setup_desktop.bat        # 装环境（要 Python 3.12 + Node 24）
+setup_desktop.bat        # 准备构建环境（Python 3.12 + Node 24）
 build_desktop.bat        # 产出 release\LocalTavern\LocalTavern.exe
 ```
 
-开发调试走浏览器版（端口 8765）：`setup.bat` + `start.bat`
+开发模式（浏览器版，端口 8765）：`setup.bat` + `start.bat`
 
-## 数据都在哪
+## 数据位置
 
 ```text
 %LOCALAPPDATA%\LocalTavern\
-├── data\projects\<项目>\    角色卡、世界书、存档
-├── prompts\                 提示词，随便改
+├── data\projects\<项目>\    项目、角色卡、世界书与存档
+├── prompts\                 用户可编辑的提示词
 ├── backups\                 全量备份
 └── provider-secrets.json    DPAPI 加密的 API Key
 ```
 
-## 技术细节
+## 文档
 
-架构、安全设计、验收报告全在 [docs/PROJECT.md](docs/PROJECT.md)，硬核玩家自取。
+架构、数据格式、Provider 接入、安全模型与验收报告的完整记录见 [docs/PROJECT.md](docs/PROJECT.md)。
 
 ## 许可
 
-GPL-3.0——地图不收费，但你拿它改的图也得开源。
+GPL-3.0。
 
 ---
 
 # LocalTavern (English)
 
-Run your own tavern on your PC: a whole cast of AI characters performing with you in one shared scene — they talk over each other, scheme, and react. You're not chatting with a bot; you're walking into a tavern.
+LocalTavern is a Windows desktop application for multi-character AI storytelling. Several AI characters share one scene and respond to each other while the narrative advances; you take part with a fixed identity. Character cards, worldbooks and saves live entirely on your machine, and the model backend can be a local Ollama instance or a cloud API such as DeepSeek or Anthropic.
 
-- **An ensemble, not a chatbot** — multiple AI characters per scene: story beats, character replies, status details, and suggested actions in one flow
-- **Double-click and play** — no Python, no browser, no open ports. A proper Windows desktop app
-- **Everything stays on your machine** — cards, worldbooks, saves, backups: local files only. Your stories are yours
-- **Bring your own brain** — local Ollama, OpenAI-compatible APIs (DeepSeek, SiliconFlow...), or native Anthropic
-- **Security baked in** — DPAPI-encrypted API keys, works offline with local models, no cookie trails
-- **Long campaigns welcome** — affinity tracking, arc summaries, pinned moments, save/restore anytime
+## Features
 
-Grab `LocalTavern-win64.zip` from [Releases](../../releases), unzip, double-click. Keep the whole folder together — the EXE needs its `_internal` buddy.
+- Multi-character scenes: story beats, character responses, status details and suggested actions in one structured output
+- Desktop app: PySide6 + QtWebEngine; no Python install, no open ports, no browser required
+- Local-first storage: projects, cards, worldbooks, prompts, saves and backups are plain local files
+- Pluggable backends: local Ollama, OpenAI-compatible APIs (DeepSeek, SiliconFlow, ...), or native Anthropic Messages
+- Security: DPAPI-encrypted API keys, HTTPS-only cloud endpoints, no retained cookies, in-process communication (QWebChannel + ASGI) with zero listening ports
+- Long campaigns: structured affinity tracking, arc summaries, pinned messages, snapshots and restore
 
-License: GPL-3.0.
+## Getting started
+
+Download `LocalTavern-win64.zip` from [Releases](../../releases), extract it and run `LocalTavern.exe`. Keep the whole directory together — the EXE depends on `_internal`. On first launch a data root is created at `%LOCALAPPDATA%\LocalTavern`; pick a model backend in settings and you're ready.
+
+## License
+
+GPL-3.0.
